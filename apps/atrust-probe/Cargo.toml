@@ -11,6 +11,7 @@ clap.workspace = true
 hermes-logging = { path = "../../crates/hermes-logging" }
 hermes-model = { path = "../../crates/hermes-model" }
 hermes-transport = { path = "../../crates/hermes-transport" }
+rand.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 

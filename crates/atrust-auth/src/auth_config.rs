@@ -6,7 +6,7 @@ pub struct AuthConfigOptions {
     pub need_ticket: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct AuthConfiguration {
     pub login_state: LoginState,
     pub methods: Vec<AuthInfo>,
@@ -14,6 +14,20 @@ pub struct AuthConfiguration {
     pub public_key: String,
     pub public_key_exponent: String,
     pub anti_replay_random: String,
+}
+
+impl std::fmt::Debug for AuthConfiguration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthConfiguration")
+            .field("login_state", &self.login_state)
+            .field("methods", &self.methods)
+            .field("csrf_token", &"[REDACTED]")
+            .field("public_key", &"[REDACTED]")
+            .field("public_key_exponent", &self.public_key_exponent)
+            .field("anti_replay_random", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

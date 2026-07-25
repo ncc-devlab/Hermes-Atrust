@@ -1,16 +1,22 @@
 use std::fmt;
 use std::sync::Arc;
 
+use atrust_protocol::to_wire_json;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use hermes_model::GatewayEndpoint;
-use hermes_transport::{HttpRequest, HttpTransport, HttpTransportError};
+use hermes_model::{DeviceId, GatewayEndpoint, SecretString};
+use hermes_transport::{HttpMethod, HttpRequest, HttpTransport, HttpTransportError};
 use rand::Rng as _;
+use serde::Serialize;
 use thiserror::Error;
 use tracing::debug;
 use url::Url;
 
 use crate::auth_config::{AuthConfigEnvelope, AuthConfigOptions, AuthConfiguration};
+use crate::cas::{CasChallenge, CasError};
+use crate::password::{
+    PasswordAuthOutcome, PasswordCredentials, PasswordEnvelope, PasswordError, PasswordRequest,
+};
 use crate::profile::AuthProtocolProfile;
 
 pub struct AuthClient {
@@ -56,11 +62,9 @@ impl AuthClient {
         options: AuthConfigOptions,
     ) -> Result<AuthConfiguration, AuthError> {
         let mut url = self.auth_config_url()?;
+        self.append_shared_query(&mut url);
         {
             let mut query = url.query_pairs_mut();
-            query.append_pair("clientType", self.profile.client_type);
-            query.append_pair("platform", self.profile.platform);
-            query.append_pair("lang", self.profile.language);
             if options.modified {
                 query.append_pair("mod", "1");
             }
@@ -100,12 +104,123 @@ impl AuthClient {
         Ok(configuration)
     }
 
+    /// Creates a CAS challenge without prescribing how a browser or UI obtains the callback.
+    pub fn prepare_cas(
+        &self,
+        configuration: &AuthConfiguration,
+        login_domain: &str,
+    ) -> Result<CasChallenge, AuthError> {
+        let method = configuration
+            .methods
+            .iter()
+            .find(|method| method.auth_type == "auth/cas" && method.login_domain == login_domain)
+            .ok_or(CasError::LoginDomainUnavailable)?;
+        CasChallenge::new(
+            &self.endpoint,
+            method.login_domain.clone(),
+            &method.login_url,
+        )
+        .map_err(AuthError::Cas)
+    }
+
+    /// Performs exactly one primary password attempt and never retries credentials or captchas.
+    pub async fn authenticate_password(
+        &self,
+        configuration: &AuthConfiguration,
+        credentials: &PasswordCredentials,
+        device_id: &DeviceId,
+        graph_check_code: Option<&str>,
+    ) -> Result<PasswordAuthOutcome, AuthError> {
+        if !configuration.methods.iter().any(|method| {
+            method.auth_type == "auth/psw" && method.login_domain == credentials.login_domain
+        }) {
+            return Err(AuthError::PasswordLoginDomainUnavailable);
+        }
+
+        let mut url = self.endpoint_url("/passport/v1/auth/psw")?;
+        self.append_shared_query(&mut url);
+        let body = PasswordRequest::build(configuration, credentials, graph_check_code)?;
+        let environment = to_wire_json(&DeviceEnvironment {
+            device_id: device_id.as_str(),
+        })?;
+        let mut request = HttpRequest {
+            method: HttpMethod::Post,
+            url,
+            headers: Vec::new(),
+            body,
+        };
+        request
+            .headers
+            .push(("user-agent".to_owned(), self.profile.user_agent.to_owned()));
+        request.headers.push((
+            "content-type".to_owned(),
+            "application/json;charset=utf-8".to_owned(),
+        ));
+        request
+            .headers
+            .push(("x-csrf-token".to_owned(), configuration.csrf_token.clone()));
+        request
+            .headers
+            .push(("x-sdp-env".to_owned(), BASE64.encode(environment)));
+        request
+            .headers
+            .push(("x-sdp-traceid".to_owned(), random_trace_id()));
+
+        debug!(
+            event = "atrust.password.request",
+            host = self.endpoint.host(),
+            login_domain = credentials.login_domain
+        );
+        let response = self.transport.execute(request).await?;
+        if !response.is_success() {
+            return Err(AuthError::UnexpectedStatus(response.status));
+        }
+        let envelope: PasswordEnvelope =
+            serde_json::from_slice(&response.body).map_err(AuthError::InvalidPasswordResponse)?;
+        let captcha_required = envelope.data.graph_check_code_enable != 0;
+        if envelope.code != 0 && !captcha_required {
+            return Err(AuthError::AuthenticationRejected {
+                code: envelope.code,
+                message: envelope.message,
+            });
+        }
+
+        let ticket = if envelope.data.ticket.is_empty() {
+            None
+        } else {
+            Some(SecretString::new(envelope.data.ticket).expect("ticket was checked as non-empty"))
+        };
+        if ticket.is_none() && !captcha_required {
+            return Err(AuthError::MissingTicket);
+        }
+        debug!(
+            event = "atrust.password.complete",
+            host = self.endpoint.host(),
+            captcha_required,
+            ticket_received = ticket.is_some()
+        );
+        Ok(PasswordAuthOutcome {
+            ticket,
+            captcha_required,
+        })
+    }
+
     fn auth_config_url(&self) -> Result<Url, AuthError> {
-        Url::parse(&format!(
-            "https://{}/passport/v1/public/authConfig",
-            self.auth_authority()
-        ))
-        .map_err(AuthError::InvalidUrl)
+        self.endpoint_url("/passport/v1/public/authConfig")
+    }
+
+    fn endpoint_url(&self, path: &str) -> Result<Url, AuthError> {
+        let mut url = Url::parse(&format!("https://{}/", self.auth_authority()))
+            .map_err(AuthError::InvalidUrl)?;
+        url.set_path(path);
+        Ok(url)
+    }
+
+    fn append_shared_query(&self, url: &mut Url) {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("clientType", self.profile.client_type);
+        query.append_pair("platform", self.profile.platform);
+        query.append_pair("lang", self.profile.language);
     }
 
     fn auth_authority(&self) -> String {
@@ -120,6 +235,12 @@ impl AuthClient {
             self.endpoint.to_string()
         }
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeviceEnvironment<'a> {
+    device_id: &'a str,
 }
 
 fn random_trace_id() -> String {
@@ -140,6 +261,20 @@ pub enum AuthError {
     UnexpectedStatus(u16),
     #[error("aTrust returned an invalid authConfig response: {0}")]
     InvalidResponse(#[source] serde_json::Error),
+    #[error("failed to build password request: {0}")]
+    Password(#[from] PasswordError),
+    #[error("failed to build device environment: {0}")]
+    ProtocolJson(#[from] atrust_protocol::ProtocolJsonError),
+    #[error("password login domain is unavailable")]
+    PasswordLoginDomainUnavailable,
+    #[error("authentication rejected with code {code}: {message}")]
+    AuthenticationRejected { code: i64, message: String },
+    #[error("password authentication succeeded without returning a ticket")]
+    MissingTicket,
+    #[error("aTrust returned an invalid password response: {0}")]
+    InvalidPasswordResponse(#[source] serde_json::Error),
+    #[error("failed to prepare CAS authentication: {0}")]
+    Cas(#[from] CasError),
 }
 
 #[cfg(test)]
@@ -148,6 +283,8 @@ mod tests {
 
     use async_trait::async_trait;
     use hermes_transport::{HttpResponse, HttpTransportError};
+    use rsa::traits::PublicKeyParts;
+    use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
 
     use super::*;
     use crate::{AuthConfigOptions, LoginState};
@@ -236,5 +373,101 @@ mod tests {
             client.auth_config(AuthConfigOptions::default()).await,
             Err(AuthError::InvalidResponse(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn password_request_encrypts_expected_anti_replay_plaintext() {
+        let private_key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 1024).unwrap();
+        let public_key = RsaPublicKey::from(&private_key);
+        let transport = Arc::new(MockTransport {
+            response: HttpResponse {
+                status: 200,
+                body: br#"{"code":0,"message":"","data":{"ticket":"ticket-value","graphCheckCodeEnable":0}}"#.to_vec(),
+            },
+            requests: Mutex::new(Vec::new()),
+        });
+        let endpoint = GatewayEndpoint::new("atrust.example.edu", 443).unwrap();
+        let client = AuthClient::new(endpoint, transport.clone());
+        let configuration = AuthConfiguration {
+            login_state: LoginState::LoggedOut,
+            methods: vec![crate::AuthInfo {
+                login_domain: "local".to_owned(),
+                auth_type: "auth/psw".to_owned(),
+                auth_name: "Local".to_owned(),
+                login_url: String::new(),
+            }],
+            csrf_token: "csrf".to_owned(),
+            public_key: format!("{:X}", public_key.n()),
+            public_key_exponent: public_key.e().to_string(),
+            anti_replay_random: "anti-replay".to_owned(),
+        };
+        let credentials =
+            PasswordCredentials::new("account", SecretString::new("password").unwrap(), "local")
+                .unwrap();
+        let device_id = DeviceId::new("device-id").unwrap();
+
+        let outcome = client
+            .authenticate_password(&configuration, &credentials, &device_id, None)
+            .await
+            .unwrap();
+        assert!(outcome.ticket.is_some());
+        assert!(!outcome.captcha_required);
+
+        let requests = transport.requests.lock().unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let query: std::collections::HashMap<_, _> = requests[0].url.query_pairs().collect();
+        assert_eq!(query.get("clientType").unwrap(), "SDPClient");
+        assert_eq!(query.get("platform").unwrap(), "Linux");
+        assert_eq!(query.get("lang").unwrap(), "en-US");
+        assert_eq!(body["username"], "account@local");
+        assert_eq!(body["rememberPwd"], "0");
+        let ciphertext = hex::decode(body["password"].as_str().unwrap()).unwrap();
+        let plaintext = private_key.decrypt(Pkcs1v15Encrypt, &ciphertext).unwrap();
+        assert_eq!(plaintext, b"password_anti-replay");
+    }
+
+    #[tokio::test]
+    async fn password_response_can_request_captcha_with_nonzero_code() {
+        let private_key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 1024).unwrap();
+        let public_key = RsaPublicKey::from(&private_key);
+        let transport = Arc::new(MockTransport {
+            response: HttpResponse {
+                status: 200,
+                body: br#"{"code":75500000,"message":"challenge required","data":{"ticket":"","graphCheckCodeEnable":1}}"#.to_vec(),
+            },
+            requests: Mutex::new(Vec::new()),
+        });
+        let client = AuthClient::new(
+            GatewayEndpoint::new("atrust.example.edu", 443).unwrap(),
+            transport,
+        );
+        let configuration = AuthConfiguration {
+            login_state: LoginState::LoggedOut,
+            methods: vec![crate::AuthInfo {
+                login_domain: "local".to_owned(),
+                auth_type: "auth/psw".to_owned(),
+                auth_name: "Local".to_owned(),
+                login_url: String::new(),
+            }],
+            csrf_token: "csrf".to_owned(),
+            public_key: format!("{:X}", public_key.n()),
+            public_key_exponent: public_key.e().to_string(),
+            anti_replay_random: "anti-replay".to_owned(),
+        };
+        let credentials =
+            PasswordCredentials::new("account", SecretString::new("password").unwrap(), "local")
+                .unwrap();
+
+        let outcome = client
+            .authenticate_password(
+                &configuration,
+                &credentials,
+                &DeviceId::new("device-id").unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(outcome.captcha_required);
+        assert!(outcome.ticket.is_none());
     }
 }

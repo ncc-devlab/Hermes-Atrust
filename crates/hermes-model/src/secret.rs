@@ -3,6 +3,35 @@ use std::fmt;
 use thiserror::Error;
 use zeroize::Zeroize;
 
+/// UTF-8 secret that is redacted from debug output and zeroized on drop.
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(value: impl Into<String>) -> Result<Self, SecretError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(SecretError::Empty);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Drop for SecretString {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl fmt::Debug for SecretString {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SecretString([REDACTED])")
+    }
+}
+
 /// HMAC key used by aTrust request authentication.
 pub struct SignKey(Vec<u8>);
 
@@ -56,5 +85,12 @@ mod tests {
     #[test]
     fn sign_key_rejects_empty_input() {
         assert!(matches!(SignKey::from_hex(""), Err(SecretError::Empty)));
+    }
+
+    #[test]
+    fn secret_string_debug_output_is_redacted() {
+        let secret = SecretString::new("do-not-log").unwrap();
+        assert_eq!(secret.expose(), "do-not-log");
+        assert_eq!(format!("{secret:?}"), "SecretString([REDACTED])");
     }
 }

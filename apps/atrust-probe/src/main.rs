@@ -1,11 +1,13 @@
+use std::env;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use atrust_auth::{AuthClient, AuthConfigOptions};
+use atrust_auth::{AuthClient, AuthConfigOptions, PasswordCredentials};
 use clap::{Parser, Subcommand};
 use hermes_logging::{LogFormat, LoggerConfig};
-use hermes_model::GatewayEndpoint;
+use hermes_model::{DeviceId, GatewayEndpoint, SecretString};
 use hermes_transport::{ReqwestTransport, ReqwestTransportConfig, TlsPolicy};
+use rand::Rng as _;
 use tracing::{error, info};
 
 #[derive(Debug, Parser)]
@@ -32,6 +34,16 @@ enum Command {
         modified: bool,
         #[arg(long)]
         need_ticket: bool,
+    },
+    /// Perform one local password authentication attempt using environment credentials.
+    Password {
+        #[arg(long, default_value = "local")]
+        login_domain: String,
+    },
+    /// Show the server-provided CAS entry point without opening a browser.
+    CasStart {
+        #[arg(long)]
+        login_domain: String,
     },
 }
 
@@ -98,6 +110,48 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
+        Command::Password { login_domain } => {
+            let username = env::var("HERMES_ATRUST_USERNAME")?;
+            let password = SecretString::new(env::var("HERMES_ATRUST_PASSWORD")?)?;
+            let credentials = PasswordCredentials::new(username, password, login_domain)?;
+            let device_id = DeviceId::new(random_hex(32))?;
+            let configuration = client
+                .auth_config(AuthConfigOptions {
+                    modified: false,
+                    need_ticket: true,
+                })
+                .await?;
+            let outcome = client
+                .authenticate_password(&configuration, &credentials, &device_id, None)
+                .await?;
+            info!(
+                event = "probe.password_primary_complete",
+                captcha_required = outcome.captcha_required,
+                ticket_received = outcome.ticket.is_some()
+            );
+        }
+        Command::CasStart { login_domain } => {
+            let configuration = client
+                .auth_config(AuthConfigOptions {
+                    modified: false,
+                    need_ticket: true,
+                })
+                .await?;
+            let challenge = client.prepare_cas(&configuration, &login_domain)?;
+            info!(
+                event = "probe.cas_challenge",
+                login_domain = challenge.login_domain(),
+                login_url = %challenge.login_url
+            );
+        }
     }
     Ok(())
+}
+
+fn random_hex(length: usize) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut rng = rand::rng();
+    (0..length)
+        .map(|_| HEX[rng.random_range(0..HEX.len())] as char)
+        .collect()
 }

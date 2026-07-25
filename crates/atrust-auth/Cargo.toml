@@ -9,7 +9,10 @@ rust-version.workspace = true
 base64.workspace = true
 hermes-model = { path = "../hermes-model" }
 hermes-transport = { path = "../hermes-transport" }
+hex.workspace = true
 rand.workspace = true
+rsa.workspace = true
+atrust-protocol = { path = "../atrust-protocol" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

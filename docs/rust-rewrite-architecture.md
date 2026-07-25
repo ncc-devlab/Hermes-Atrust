@@ -86,3 +86,103 @@ authConfig
 此里程碑不连接节点、不建立 TCP/L3 隧道，也不接管系统 DNS 或路由。
 
 ## 联调记录
+
+当前 aTrust 联调目标为 `atrust.xidian.edu.cn:443`。地址只存在于联调命令和部署
+配置中，不进入协议 crate 的常量。
+
+### 2026-07-25：西电 authConfig 只读探测
+
+使用默认的严格证书校验执行：
+
+```bash
+cargo run -p atrust-probe -- \
+  --host atrust.xidian.edu.cn \
+  auth-config
+```
+
+请求成功，服务端处于未登录状态并返回两个认证入口：
+
+| 登录域 | 认证类型 | 名称 |
+| --- | --- | --- |
+| `cas42187` | `auth/cas` | 统一身份认证 |
+| `local` | `auth/psw` | Local Password Auth |
+
+该网关的证书可通过当前系统/Web PKI 校验，后续联调默认禁止使用 `--insecure-tls`。
+本次请求未携带账号、Cookie 或验证码，未建立隧道。
+
+### 2026-07-25：西电主认证探测
+
+- `local` 密码端点可达，初次请求返回图形验证码挑战；
+- 对照客户端完成验证码后，服务端报告凭据不正确并提示剩余 9 次尝试；
+- 为避免账户锁定，未继续重试，也未将账号、密码、验证码或响应正文写入项目；
+- Rust 将非零业务码与 `graphCheckCodeEnable` 组合建模为挑战，不自动重试；
+- `cas42187` 成功解析出服务端 CAS 登录入口，但完整流程需要浏览器完成学校 SSO 并
+  捕获网关 callback，因此当前停在解耦的 `CasChallenge` 阶段。
+
+## 未完成部分
+
+### 认证控制面
+
+- Cookie jar 的显式导入、导出、过期和持久化模型；
+- 密码认证的 RSA PKCS#1 v1.5、anti-replay 拼接和错误响应处理；
+- CAS 跳转、浏览器交互、ticket 回调和重定向来源校验；
+- `authCheck` 多阶段认证状态机；
+- 短信、图形验证码、自定义短信和发送频率保护；
+- `reportEnv`、`onlineInfo` 和会话恢复；
+- `clientResource` 获取及业务 envelope 校验；
+- 设备查询、授信和取消授信；
+- SID、DeviceID、ConnectionID、SignKey 的完整生命周期。
+
+### 资源和节点
+
+- IP/CIDR/范围、端口范围、协议和域名资源的严格解析；
+- 确定性的资源冲突优先级和无匹配拒绝策略；
+- DNS 配置、major node group 和节点地址解析；
+- 节点 TCP/TLS 探测、评分、健康缓存和周期更新；
+- IPv6 节点地址及服务端资源能力判定。
+
+### 底层传输
+
+- Tokio TCP/TLS connector 抽象；
+- Linux、macOS、Windows 的指定网卡绑定；
+- 自动探测底层网卡及网络切换后的重新探测；
+- VPN 服务端和虚拟 IP 的路由排除；
+- TCP/TLS 分阶段超时、取消、重试和退避；
+- 自定义 CA、证书固定及更细粒度 TLS 诊断。
+
+### TCP 隧道
+
+- 初始化 JSON DTO、确定性签名和 golden vector；
+- IPv4/域名目标地址帧；
+- `05 81`、`53 00` 和 connect status 状态机；
+- 应用数据帧、半关闭、服务端关闭和 short-write 处理；
+- 受控 HTTP 目标的真实联调。
+
+### L3 隧道
+
+- Get-IP codec 及 `0x0053` 长度语义确认；
+- SID 总连接认证和虚拟 IP 解析；
+- 按五元组鉴权、conntrack 和 connect token 生命周期；
+- L3 数据帧、心跳、多节点组连接和确定性关闭；
+- 下行 `0x94` 两种格式的明确判别；
+- ICMP、UDP、TCP 的逐阶段真实联调；
+- second VIP 和 IPv6 能力确认。
+
+### 上层接入
+
+- DNS resolver、域名资源、Fake IP 和 DNS 劫持；
+- SOCKS5、HTTP 代理和端口转发；
+- 用户态网络栈与 TUN 适配；
+- 路由添加、MTU 和回环保护；
+- 主程序配置合并、生命周期管理和优雅退出。
+
+### 测试和诊断
+
+- 本地 HTTP/TLS 模拟服务器及拆包、超限和超时测试；
+- Go/Rust 认证请求逐字节 golden fixture；
+- codec property test 和 fuzz target；
+- 西电登录及资源获取的 ignored live tests；
+- `atrust-probe` 的登录、资源、节点、TCP 和 L3 子命令；
+- 日志事件命名规范、敏感字段审计和可选诊断抓包层。
+
+EasyConnect 的全部认证和数据面仍按计划暂缓，不属于当前 aTrust 里程碑。
