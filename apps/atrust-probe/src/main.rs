@@ -10,6 +10,10 @@ use hermes_transport::{ReqwestTransport, ReqwestTransportConfig, TlsPolicy};
 use rand::Rng as _;
 use tracing::{error, info};
 
+mod browser;
+
+use browser::WebDriverBrowser;
+
 #[derive(Debug, Parser)]
 #[command(about = "Read-only aTrust protocol probe", version)]
 struct Cli {
@@ -44,6 +48,17 @@ enum Command {
     CasStart {
         #[arg(long)]
         login_domain: String,
+    },
+    /// Complete interactive CAS login in a Firefox WebDriver session.
+    CasLogin {
+        #[arg(long)]
+        login_domain: String,
+        #[arg(long, default_value = "http://127.0.0.1:4444")]
+        webdriver_url: String,
+        #[arg(long, default_value_t = 300)]
+        timeout_seconds: u64,
+        #[arg(long)]
+        keep_browser_open: bool,
     },
 }
 
@@ -143,6 +158,33 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 login_domain = challenge.login_domain(),
                 login_url = %challenge.login_url
             );
+        }
+        Command::CasLogin {
+            login_domain,
+            webdriver_url,
+            timeout_seconds,
+            keep_browser_open,
+        } => {
+            let configuration = client
+                .auth_config(AuthConfigOptions {
+                    modified: false,
+                    need_ticket: true,
+                })
+                .await?;
+            let challenge = client.prepare_cas(&configuration, &login_domain)?;
+            let browser = WebDriverBrowser::connect(&webdriver_url).await?;
+            info!(event = "probe.cas_browser_waiting");
+            let ticket = browser
+                .complete_cas(&challenge, std::time::Duration::from_secs(timeout_seconds))
+                .await?;
+            info!(
+                event = "probe.cas_callback_validated",
+                ticket_received = true
+            );
+            drop(ticket);
+            if !keep_browser_open {
+                browser.close().await?;
+            }
         }
     }
     Ok(())

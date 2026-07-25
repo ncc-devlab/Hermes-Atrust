@@ -20,7 +20,9 @@ application
 - `atrust-protocol`：纯线协议 JSON 和签名基础，不包含网络、配置、日志或异步运行时。
 - `hermes-logging`：应用入口使用的统一 `tracing` 订阅器，支持 compact 与 JSON 输出；
 - `hermes-transport`：可替换的异步 HTTP 接口、受限响应读取和显式 TLS 策略；
-- `atrust-auth`：认证控制面状态和请求，当前实现只读 `authConfig`。
+- `atrust-auth`：`authConfig`、RSA 密码主认证、CAS challenge 和严格回调校验；
+- `atrust-probe`：真实对端诊断，以及与协议 crate 解耦的 WebDriver/BiDi 人工 CAS
+  登录编排。
 
 只有存在实际实现时才新增 crate，禁止先创建无职责的空壳模块。
 
@@ -60,6 +62,10 @@ cargo test --workspace
 真实测试必须同时满足 `#[ignore]` 和显式环境开关。独立的 `atrust-probe` 用于人工
 诊断和抓包，测试代码不得自动重复密码、验证码或短信请求。
 
+学校认证中的验证码、滑块、MFA 和二次认证属于人工交互边界。协议核心不得识别、
+代填或绕过这些认证因子。部署专属约束和联调进度见
+[`xidian-atrust-integration.md`](xidian-atrust-integration.md)。
+
 ## 未确认协议关卡
 
 以下事实未经真实对端和抓包确认前，不得当作稳定协议继续向上封装：
@@ -76,11 +82,11 @@ cargo test --workspace
 第一个真实联调里程碑只包含：
 
 ```text
-authConfig
-→ 一条明确选择的登录流程
-→ authCheck/必要二次认证
-→ clientResource
-→ 严格资源解析
+authConfig                              [已完成]
+→ 一条明确选择的登录流程和 ticket 回调 [已完成 CAS 路径]
+→ authCheck/必要二次认证                [下一步]
+→ clientResource                       [未开始]
+→ 严格资源解析                          [未开始]
 ```
 
 此里程碑不连接节点、不建立 TCP/L3 隧道，也不接管系统 DNS 或路由。
@@ -116,18 +122,25 @@ cargo run -p atrust-probe -- \
 - 对照客户端完成验证码后，服务端报告凭据不正确并提示剩余 9 次尝试；
 - 为避免账户锁定，未继续重试，也未将账号、密码、验证码或响应正文写入项目；
 - Rust 将非零业务码与 `graphCheckCodeEnable` 组合建模为挑战，不自动重试；
-- `cas42187` 成功解析出服务端 CAS 登录入口，但完整流程需要浏览器完成学校 SSO 并
-  捕获网关 callback，因此当前停在解耦的 `CasChallenge` 阶段。
+- `cas42187` 已确认跳转至 `ids.xidian.edu.cn/authserver/login`，其 `service` 指回
+  aTrust 的 `/passport/v1/auth/cas?sfDomain=cas42187`；
+- Xidian 统一认证包含必须人工参与的两步认证，第二步需要输入验证码；
+- Firefox WebDriver/BiDi 真实联调已完成学校登录，并在请求发出前捕获 aTrust 回调；
+- `CasChallenge` 已验证回调 scheme、authority、path 和非空 ticket；
+- 当前边界停在 ticket 回调，尚未建立 aTrust 已认证会话，也未获取资源或建立隧道。
+
+详细证据、人工认证约束和下一阶段任务见
+[`xidian-atrust-integration.md`](xidian-atrust-integration.md)。
 
 ## 未完成部分
 
 ### 认证控制面
 
 - Cookie jar 的显式导入、导出、过期和持久化模型；
-- 密码认证的 RSA PKCS#1 v1.5、anti-replay 拼接和错误响应处理；
-- CAS 跳转、浏览器交互、ticket 回调和重定向来源校验；
+- CAS 回调后 ticket 的消费方式及浏览器/HTTP transport 会话连续性；
+- 回调参数与选中登录域的绑定，以及重复 `ticket`/`sfDomain` 参数拒绝；
 - `authCheck` 多阶段认证状态机；
-- 短信、图形验证码、自定义短信和发送频率保护；
+- 将验证码、MFA 和二次认证建模为显式人工暂停状态及发送频率保护；
 - `reportEnv`、`onlineInfo` 和会话恢复；
 - `clientResource` 获取及业务 envelope 校验；
 - 设备查询、授信和取消授信；
@@ -181,8 +194,8 @@ cargo run -p atrust-probe -- \
 - 本地 HTTP/TLS 模拟服务器及拆包、超限和超时测试；
 - Go/Rust 认证请求逐字节 golden fixture；
 - codec property test 和 fuzz target；
-- 西电登录及资源获取的 ignored live tests；
-- `atrust-probe` 的登录、资源、节点、TCP 和 L3 子命令；
+- ticket 后认证和资源获取的 ignored live tests；
+- `atrust-probe` 的认证续接、资源、节点、TCP 和 L3 子命令；
 - 日志事件命名规范、敏感字段审计和可选诊断抓包层。
 
 EasyConnect 的全部认证和数据面仍按计划暂缓，不属于当前 aTrust 里程碑。
