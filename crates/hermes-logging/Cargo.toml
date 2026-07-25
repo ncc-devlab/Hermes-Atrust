@@ -1,0 +1,13 @@
+[package]
+name = "hermes-logging"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

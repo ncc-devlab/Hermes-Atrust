@@ -18,6 +18,9 @@ application
 
 - `hermes-model`：经过校验的公共强类型和敏感值封装；
 - `atrust-protocol`：纯线协议 JSON 和签名基础，不包含网络、配置、日志或异步运行时。
+- `hermes-logging`：应用入口使用的统一 `tracing` 订阅器，支持 compact 与 JSON 输出；
+- `hermes-transport`：可替换的异步 HTTP 接口、受限响应读取和显式 TLS 策略；
+- `atrust-auth`：认证控制面状态和请求，当前实现只读 `authConfig`。
 
 只有存在实际实现时才新增 crate，禁止先创建无职责的空壳模块。
 
@@ -34,6 +37,8 @@ application
 6. 协议签名基于确定的 JSON 字节。禁止把待签名对象转换为无序 map 后再序列化。
 7. 密码、Cookie、SID、SignKey 和连接 token 不得出现在 `Debug` 或普通日志中。
 8. 所有异步网络状态机必须支持超时、取消和确定性关闭。
+9. 业务模块统一通过 `tracing` 发出结构化事件；只有应用入口可以初始化 logger。
+10. transport 日志只记录方法、主机、状态、耗时和长度，不记录 query、Header 或正文。
 
 ## 测试层次
 
@@ -79,3 +84,5 @@ authConfig
 ```
 
 此里程碑不连接节点、不建立 TCP/L3 隧道，也不接管系统 DNS 或路由。
+
+## 联调记录

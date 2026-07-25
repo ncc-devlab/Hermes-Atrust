@@ -1,0 +1,18 @@
+[package]
+name = "atrust-probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+atrust-auth = { path = "../../crates/atrust-auth" }
+clap.workspace = true
+hermes-logging = { path = "../../crates/hermes-logging" }
+hermes-model = { path = "../../crates/hermes-model" }
+hermes-transport = { path = "../../crates/hermes-transport" }
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
