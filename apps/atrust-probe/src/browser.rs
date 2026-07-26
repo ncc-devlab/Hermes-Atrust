@@ -1,16 +1,19 @@
 use std::time::Duration;
 
-use atrust_auth::{CasChallenge, CasExchange};
+use atrust_auth::{CasChallenge, CasExchange, parse_portal_ticket};
 use futures_util::{SinkExt as _, StreamExt as _};
+use hermes_transport::GatewayCookie;
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::time::{Instant, timeout_at};
+use tokio::time::{Instant, sleep, timeout_at};
 use tokio_tungstenite::{connect_async, tungstenite};
+use tracing::info;
 use url::Url;
 
 const WEBDRIVER_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_WEBDRIVER_RESPONSE: usize = 1024 * 1024;
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Error)]
 pub enum BrowserError {
@@ -32,12 +35,28 @@ pub enum BrowserError {
     Bidi(#[source] Box<tungstenite::Error>),
     #[error("WebDriver BiDi returned an invalid response")]
     InvalidBidiResponse,
-    #[error("timed out waiting for the aTrust login completion")]
+    #[error("timed out waiting for aTrust multi-step login completion")]
     CallbackTimeout,
-    #[error("browser returned an invalid aTrust completion URL")]
-    InvalidCompletion(#[source] atrust_auth::CasError),
-    #[error("browser did not block the aTrust completion page before loading it")]
-    CompletionNotIntercepted,
+    #[error("browser returned invalid gateway cookies")]
+    InvalidCookies,
+    #[error("browser closed before any gateway cookies were observed")]
+    BrowserClosedWithoutSession,
+}
+
+/// Browser-produced materials after IDS + aTrust multi-step pages have finished.
+#[derive(Debug)]
+pub struct BrowserLoginResult {
+    /// Optional portal ticket observed after multi-step. Cookie session is primary.
+    pub exchange: Option<CasExchange>,
+    pub gateway_cookies: Vec<GatewayCookie>,
+    pub final_path: Option<String>,
+    pub portal_hits: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BrowserKind {
+    Firefox,
+    Chrome,
 }
 
 #[derive(Debug)]
@@ -46,12 +65,6 @@ pub struct WebDriverBrowser {
     endpoint: Url,
     session_id: String,
     bidi_endpoint: Url,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BrowserKind {
-    Firefox,
-    Chrome,
 }
 
 impl WebDriverBrowser {
@@ -73,7 +86,6 @@ impl WebDriverBrowser {
                     "browserName": "chrome",
                     "webSocketUrl": true,
                     "goog:chromeOptions": {
-                        // Isolated process/profile; does not touch the user's default Chrome profile.
                         "args": [
                             "--user-data-dir=/tmp/hermes-chrome-profile",
                             "--no-first-run",
@@ -126,37 +138,33 @@ impl WebDriverBrowser {
         })
     }
 
-    /// Lets IDS and intermediate aTrust multi-factor pages run in the browser, then harvests
-    /// credentials only after the final same-gateway portal entry is reached.
+    /// Runs full interactive login in the browser and only harvests after the window is closed.
+    ///
+    /// Intermediate IDS / aTrust MFA pages are observed (URL path + cookie names only) but never
+    /// cause an early exit. Close the browser manually after finishing every step.
     pub async fn complete_cas(
         &self,
         challenge: CasChallenge,
         timeout: Duration,
-    ) -> Result<CasExchange, BrowserError> {
+    ) -> Result<BrowserLoginResult, BrowserError> {
         let deadline = Instant::now() + timeout;
         let (mut events, _) = timeout_at(deadline, connect_async(self.bidi_endpoint.as_str()))
             .await
             .map_err(|_| BrowserError::CallbackTimeout)?
             .map_err(|error| BrowserError::Bidi(Box::new(error)))?;
-        let portal = challenge.portal_url();
-        let mut pattern = json!({
-            "type": "pattern",
-            "protocol": portal.scheme(),
-            "hostname": portal.host_str(),
-            "pathname": portal.path()
-        });
-        if let Some(port) = portal.port_or_known_default() {
-            pattern["port"] = json!(port.to_string());
-        }
-        let mut next_command_id = 1_u64;
+
+        // Observe only — never intercept intermediate MFA navigations.
         events
             .send(tungstenite::Message::Text(
                 json!({
-                    "id": next_command_id,
-                    "method": "network.addIntercept",
+                    "id": 1,
+                    "method": "session.subscribe",
                     "params": {
-                        "phases": ["beforeRequestSent"],
-                        "urlPatterns": [pattern]
+                        "events": [
+                            "network.beforeRequestSent",
+                            "browsingContext.navigationStarted",
+                            "browsingContext.load"
+                        ]
                     }
                 })
                 .to_string()
@@ -164,22 +172,7 @@ impl WebDriverBrowser {
             ))
             .await
             .map_err(|error| BrowserError::Bidi(Box::new(error)))?;
-        wait_for_command(&mut events, next_command_id, deadline).await?;
-        next_command_id += 1;
-        events
-            .send(tungstenite::Message::Text(
-                json!({
-                    "id": next_command_id,
-                    "method": "session.subscribe",
-                    "params": { "events": ["network.beforeRequestSent"] }
-                })
-                .to_string()
-                .into(),
-            ))
-            .await
-            .map_err(|error| BrowserError::Bidi(Box::new(error)))?;
-        wait_for_command(&mut events, next_command_id, deadline).await?;
-        next_command_id += 1;
+        wait_for_command(&mut events, 1, deadline).await?;
 
         self.command(
             reqwest::Method::POST,
@@ -188,51 +181,225 @@ impl WebDriverBrowser {
         )
         .await?;
 
+        let gateway_authority = challenge.callback_url().authority().to_owned();
+        let mut last_portal: Option<Url> = None;
+        let mut portal_hits: u32 = 0;
+        let mut last_path = String::new();
+        let mut last_cookie_names: Vec<String> = Vec::new();
+        let mut latest_cookies: Vec<GatewayCookie> = Vec::new();
+        let mut latest_path: Option<String> = None;
+        let mut sid_seen = false;
+
+        info!(
+            event = "probe.browser_waiting_manual_close",
+            note = "finish IDS + aTrust MFA fully, then close this browser window to harvest"
+        );
+
         loop {
-            let message = timeout_at(deadline, events.next())
-                .await
-                .map_err(|_| BrowserError::CallbackTimeout)?
-                .ok_or(BrowserError::InvalidBidiResponse)?
-                .map_err(|error| BrowserError::Bidi(Box::new(error)))?;
-            let tungstenite::Message::Text(message) = message else {
-                continue;
-            };
-            let event: Value =
-                serde_json::from_str(&message).map_err(|_| BrowserError::InvalidBidiResponse)?;
-            if event.get("method").and_then(Value::as_str) != Some("network.beforeRequestSent") {
-                continue;
+            while let Ok(Some(message)) =
+                timeout_at(Instant::now() + Duration::from_millis(250), events.next()).await
+            {
+                let Ok(message) = message else {
+                    // BiDi stream errors often mean the browser/session is going away.
+                    break;
+                };
+                let tungstenite::Message::Text(message) = message else {
+                    continue;
+                };
+                let Ok(event) = serde_json::from_str::<Value>(&message) else {
+                    continue;
+                };
+                let Some(url) = event
+                    .pointer("/params/request/url")
+                    .or_else(|| event.pointer("/params/url"))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let Ok(parsed) = Url::parse(url) else {
+                    continue;
+                };
+                let path = safe_path(&parsed);
+                if challenge.is_callback_target(&parsed) {
+                    info!(
+                        event = "probe.browser_intermediate_cas",
+                        path,
+                        note = "CAS callback observed; still waiting for full MFA and manual close"
+                    );
+                    continue;
+                }
+                if challenge.is_completion_target(&parsed) {
+                    portal_hits = portal_hits.saturating_add(1);
+                    info!(
+                        event = "probe.browser_portal_navigation",
+                        portal_hits,
+                        path,
+                        note = if portal_hits == 1 {
+                            "first portal hit often starts aTrust two-step; not harvesting"
+                        } else {
+                            "later portal navigation after multi-step input"
+                        }
+                    );
+                    last_portal = Some(parsed);
+                    continue;
+                }
+                if parsed.authority() == gateway_authority && path != last_path {
+                    info!(event = "probe.browser_url_change", path);
+                    last_path = path;
+                }
             }
-            let Some(current) = event.pointer("/params/request/url").and_then(Value::as_str) else {
-                continue;
-            };
-            let current = Url::parse(current).map_err(BrowserError::InvalidBrowserUrl)?;
-            if !challenge.is_completion_target(&current) {
-                continue;
+
+            if Instant::now() >= deadline {
+                return Err(BrowserError::CallbackTimeout);
             }
-            if event.pointer("/params/isBlocked").and_then(Value::as_bool) != Some(true) {
-                return Err(BrowserError::CompletionNotIntercepted);
+
+            match self.current_url().await {
+                Ok(url) => {
+                    let path = safe_path(&url);
+                    if path != last_path {
+                        info!(event = "probe.browser_url_change", path = %path);
+                        last_path = path.clone();
+                    }
+                    latest_path = Some(path);
+                }
+                Err(_) => {
+                    // Session/browser is gone: harvest whatever we last observed.
+                    info!(
+                        event = "probe.browser_closed",
+                        portal_hits,
+                        gateway_cookie_count = latest_cookies.len(),
+                        sid_seen
+                    );
+                    if latest_cookies.is_empty() {
+                        return Err(BrowserError::BrowserClosedWithoutSession);
+                    }
+                    let exchange = last_portal.as_ref().and_then(|url| {
+                        if portal_hits >= 2 || sid_seen {
+                            parse_portal_ticket(url, &gateway_authority)
+                                .ok()
+                                .map(|portal_ticket| CasExchange { portal_ticket })
+                        } else {
+                            None
+                        }
+                    });
+                    drop(challenge);
+                    return Ok(BrowserLoginResult {
+                        exchange,
+                        gateway_cookies: latest_cookies,
+                        final_path: latest_path,
+                        portal_hits,
+                    });
+                }
             }
-            let request = event
-                .pointer("/params/request/request")
-                .and_then(Value::as_str)
-                .ok_or(BrowserError::InvalidBidiResponse)?;
-            events
-                .send(tungstenite::Message::Text(
-                    json!({
-                        "id": next_command_id,
-                        "method": "network.failRequest",
-                        "params": { "request": request }
-                    })
-                    .to_string()
-                    .into(),
-                ))
-                .await
-                .map_err(|error| BrowserError::Bidi(Box::new(error)))?;
-            wait_for_command(&mut events, next_command_id, deadline).await?;
-            return challenge
-                .finish_completion(&current)
-                .map_err(BrowserError::InvalidCompletion);
+
+            match self.gateway_cookies_for_authority(&gateway_authority).await {
+                Ok(cookies) => {
+                    let mut names = cookies
+                        .iter()
+                        .map(|cookie| cookie.name.clone())
+                        .collect::<Vec<_>>();
+                    names.sort();
+                    if names != last_cookie_names {
+                        info!(
+                            event = "probe.browser_cookie_names",
+                            cookie_names = ?names,
+                            sid_present = names.iter().any(|name| name.eq_ignore_ascii_case("sid"))
+                        );
+                        last_cookie_names = names;
+                    }
+                    sid_seen = cookies
+                        .iter()
+                        .any(|cookie| cookie.name.eq_ignore_ascii_case("sid"));
+                    latest_cookies = cookies;
+                }
+                Err(_) => {
+                    info!(
+                        event = "probe.browser_closed",
+                        portal_hits,
+                        gateway_cookie_count = latest_cookies.len(),
+                        sid_seen
+                    );
+                    if latest_cookies.is_empty() {
+                        return Err(BrowserError::BrowserClosedWithoutSession);
+                    }
+                    let exchange = last_portal.as_ref().and_then(|url| {
+                        if portal_hits >= 2 || sid_seen {
+                            parse_portal_ticket(url, &gateway_authority)
+                                .ok()
+                                .map(|portal_ticket| CasExchange { portal_ticket })
+                        } else {
+                            None
+                        }
+                    });
+                    drop(challenge);
+                    return Ok(BrowserLoginResult {
+                        exchange,
+                        gateway_cookies: latest_cookies,
+                        final_path: latest_path,
+                        portal_hits,
+                    });
+                }
+            }
+
+            sleep(POLL_INTERVAL).await;
         }
+    }
+
+    async fn current_url(&self) -> Result<Url, BrowserError> {
+        let value = self.command(reqwest::Method::GET, "url", None).await?;
+        let raw = value.as_str().ok_or(BrowserError::InvalidResponse)?;
+        Url::parse(raw).map_err(BrowserError::InvalidBrowserUrl)
+    }
+
+    async fn gateway_cookies_for_authority(
+        &self,
+        authority: &str,
+    ) -> Result<Vec<GatewayCookie>, BrowserError> {
+        let host = authority
+            .split(':')
+            .next()
+            .unwrap_or(authority)
+            .trim_matches(|ch| ch == '[' || ch == ']')
+            .to_ascii_lowercase();
+        let value = self.command(reqwest::Method::GET, "cookie", None).await?;
+        let cookies = value
+            .as_array()
+            .ok_or(BrowserError::InvalidCookies)?
+            .iter()
+            .filter_map(|cookie| {
+                let name = cookie.get("name")?.as_str()?;
+                let value = cookie.get("value")?.as_str()?;
+                let domain_raw = cookie.get("domain").and_then(Value::as_str).unwrap_or("");
+                let domain = domain_raw.trim_start_matches('.').to_ascii_lowercase();
+                let domain_ok =
+                    domain.is_empty() || domain == host || host.ends_with(&format!(".{domain}"));
+                if !domain_ok {
+                    return None;
+                }
+                Some(GatewayCookie {
+                    name: name.to_owned(),
+                    value: value.to_owned(),
+                    domain: if domain.is_empty() {
+                        Some(host.clone())
+                    } else {
+                        Some(domain)
+                    },
+                    path: cookie
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    secure: cookie
+                        .get("secure")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true),
+                    http_only: cookie
+                        .get("httpOnly")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(cookies)
     }
 
     pub async fn close(self) -> Result<(), BrowserError> {
@@ -242,7 +409,6 @@ impl WebDriverBrowser {
             .send()
             .await
             .map_err(BrowserError::Request)?;
-        // Session may already be gone after failRequest/navigation teardown.
         if response.status().is_success() || response.status() == StatusCode::NOT_FOUND {
             return Ok(());
         }
@@ -307,6 +473,10 @@ fn normalized_endpoint(endpoint: &str) -> Result<Url, BrowserError> {
         endpoint.set_path(&format!("{}/", endpoint.path()));
     }
     Ok(endpoint)
+}
+
+fn safe_path(url: &Url) -> String {
+    format!("{}://{}{}", url.scheme(), url.authority(), url.path())
 }
 
 async fn response_value(response: reqwest::Response) -> Result<Value, BrowserError> {

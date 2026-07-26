@@ -5,9 +5,11 @@ mod cas;
 mod client;
 mod password;
 mod profile;
+mod session;
 
 pub use auth_config::{AuthConfigOptions, AuthConfiguration, AuthInfo, LoginState};
-pub use cas::{CasCallbackCredential, CasChallenge, CasError, CasExchange};
+pub use cas::{CasCallbackCredential, CasChallenge, CasError, CasExchange, parse_portal_ticket};
 pub use client::{AuthClient, AuthError};
 pub use password::{PasswordAuthOutcome, PasswordCredentials, PasswordError};
 pub use profile::AuthProtocolProfile;
+pub use session::{AuthStep, SessionProgress};

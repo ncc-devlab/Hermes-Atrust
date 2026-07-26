@@ -1,7 +1,9 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures_util::StreamExt as _;
+use reqwest::cookie::Jar;
 use reqwest::header::{HeaderName, HeaderValue};
 use reqwest::redirect::Policy;
 use thiserror::Error;
@@ -73,9 +75,50 @@ impl HttpResponse {
     }
 }
 
+/// Cookie imported from a trusted gateway origin only.
+#[derive(Clone)]
+pub struct GatewayCookie {
+    pub name: String,
+    pub value: String,
+    pub domain: Option<String>,
+    pub path: Option<String>,
+    pub secure: bool,
+    pub http_only: bool,
+}
+
+impl std::fmt::Debug for GatewayCookie {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GatewayCookie")
+            .field("name", &self.name)
+            .field("value", &"[REDACTED]")
+            .field("domain", &self.domain)
+            .field("path", &self.path)
+            .field("secure", &self.secure)
+            .field("http_only", &self.http_only)
+            .finish()
+    }
+}
+
 #[async_trait]
 pub trait HttpTransport: Send + Sync {
     async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, HttpTransportError>;
+
+    /// Imports cookies for an already-validated gateway origin.
+    ///
+    /// Implementations must not accept arbitrary third-party origins; callers validate host.
+    fn import_gateway_cookies(
+        &self,
+        _origin: &Url,
+        _cookies: &[GatewayCookie],
+    ) -> Result<(), HttpTransportError> {
+        Err(HttpTransportError::CookieImportUnsupported)
+    }
+
+    /// Returns cookie names currently stored for `origin` without exposing values.
+    fn gateway_cookie_names(&self, _origin: &Url) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -107,6 +150,7 @@ impl Default for ReqwestTransportConfig {
 #[derive(Debug)]
 pub struct ReqwestTransport {
     client: reqwest::Client,
+    jar: Arc<Jar>,
     max_response_body: usize,
 }
 
@@ -123,8 +167,9 @@ impl ReqwestTransport {
             warn!(event = "transport.insecure_tls_enabled");
         }
 
+        let jar = Arc::new(Jar::default());
         let client = reqwest::Client::builder()
-            .cookie_store(true)
+            .cookie_provider(jar.clone())
             .redirect(Policy::none())
             .timeout(config.timeout)
             .danger_accept_invalid_certs(dangerous_tls)
@@ -133,6 +178,7 @@ impl ReqwestTransport {
 
         Ok(Self {
             client,
+            jar,
             max_response_body: config.max_response_body,
         })
     }
@@ -203,6 +249,87 @@ impl HttpTransport for ReqwestTransport {
             body,
         })
     }
+
+    fn import_gateway_cookies(
+        &self,
+        origin: &Url,
+        cookies: &[GatewayCookie],
+    ) -> Result<(), HttpTransportError> {
+        if origin.scheme() != "https" {
+            return Err(HttpTransportError::InvalidCookieOrigin);
+        }
+        let origin_host = origin
+            .host_str()
+            .ok_or(HttpTransportError::InvalidCookieOrigin)?;
+        for cookie in cookies {
+            validate_cookie_token(&cookie.name)
+                .map_err(|_| HttpTransportError::InvalidCookieName)?;
+            if cookie.value.is_empty()
+                || cookie
+                    .value
+                    .chars()
+                    .any(|ch| ch.is_control() || ch == ';' || ch == ',')
+            {
+                return Err(HttpTransportError::InvalidCookieValue);
+            }
+            let mut set_cookie = format!("{}={}", cookie.name, cookie.value);
+            let domain = cookie
+                .domain
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(origin_host)
+                .trim_start_matches('.');
+            if !domain.eq_ignore_ascii_case(origin_host)
+                && !origin_host
+                    .to_ascii_lowercase()
+                    .ends_with(&format!(".{}", domain.to_ascii_lowercase()))
+            {
+                return Err(HttpTransportError::InvalidCookieOrigin);
+            }
+            set_cookie.push_str(&format!("; Domain={domain}"));
+            let path = cookie
+                .path
+                .as_deref()
+                .filter(|value| value.starts_with('/'))
+                .unwrap_or("/");
+            set_cookie.push_str(&format!("; Path={path}"));
+            if cookie.secure || origin.scheme() == "https" {
+                set_cookie.push_str("; Secure");
+            }
+            if cookie.http_only {
+                set_cookie.push_str("; HttpOnly");
+            }
+            self.jar.add_cookie_str(&set_cookie, origin);
+        }
+        debug!(
+            event = "transport.cookie_import",
+            host = origin.host_str().unwrap_or("<unknown>"),
+            cookie_count = cookies.len(),
+            cookie_names = ?cookies.iter().map(|cookie| cookie.name.as_str()).collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    fn gateway_cookie_names(&self, origin: &Url) -> Vec<String> {
+        // reqwest::Jar does not expose enumeration; probe using Cookie header synthesis.
+        // Cookie names are observed via application-layer session checks instead.
+        let _ = origin;
+        Vec::new()
+    }
+}
+
+fn validate_cookie_token(value: &str) -> Result<(), ()> {
+    if value.is_empty() {
+        return Err(());
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'!'))
+    {
+        return Err(());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Error)]
@@ -221,6 +348,14 @@ pub enum HttpTransportError {
     Request(#[source] reqwest::Error),
     #[error("HTTP response exceeds the configured {limit} byte limit")]
     ResponseTooLarge { limit: usize },
+    #[error("cookie import is not supported by this transport")]
+    CookieImportUnsupported,
+    #[error("cookie origin must be an HTTPS gateway URL")]
+    InvalidCookieOrigin,
+    #[error("cookie name is invalid")]
+    InvalidCookieName,
+    #[error("cookie value is invalid")]
+    InvalidCookieValue,
     #[error("mock transport failure: {0}")]
     Mock(String),
 }

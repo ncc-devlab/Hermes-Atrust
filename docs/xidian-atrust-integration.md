@@ -5,41 +5,38 @@
 
 ## 人工认证约束
 
-Xidian 的 aTrust 统一身份认证包含两步认证，第二步需要用户输入验证码。因此完整登录
-必须有人工参与，不能作为无人值守流程运行。
+Xidian 的完整登录必须有人工参与，不能作为无人值守流程运行。至少包含：
 
-联调工具和后续产品实现必须遵守以下约束：
+1. 学校 IDS 登录（账号、密码、滑块等）；
+2. aTrust 侧二次认证（当前实测为 SMS 验证码）。
 
-1. 使用真实浏览器或 WebView 展示学校提供的登录页面；
-2. 用户自行输入账号、密码、滑块结果、验证码及后续可能增加的认证因子；
-3. Hermes 不实现验证码识别、滑块破解、验证码代填或绕过二次认证；
-4. 不自动重复密码提交、验证码发送或验证码校验，避免账户锁定和发送频率限制；
-5. 日志和测试产物不得包含密码、验证码、Cookie、ticket、完整回调 URL、Header 或
-   响应正文；
-6. 自动化只负责打开服务端提供的入口、等待回调以及把未受信任的回调交给
-   `atrust-auth` 校验。
+联调工具和后续产品实现必须遵守：
 
-`adapters_tests/XIDIAN/ids` 中的脚本可用于理解 IDS 页面和 CAS 跳转，但其中的密码
-加密和滑块处理不能成为 Hermes 的生产登录方案。
+1. 使用真实浏览器或 WebView 展示服务端/学校提供的页面；
+2. 用户自行输入账号、密码、滑块、SMS 验证码及后续可能增加的因子；
+3. Hermes **不**实现验证码识别、滑块破解、代填或绕过二次认证；
+4. 不自动重复密码提交、验证码发送或校验，避免账户锁定和发送频率限制；
+5. 日志和测试产物不得包含密码、验证码、Cookie 值、ticket 值、完整回调 URL、
+   敏感 Header 或响应正文；最多记录路径、业务码、Cookie **名**、布尔标志；
+6. 自动化只负责打开入口、观察导航/Cookie 名，并在**用户确认流程结束后**收割
+   网关 Cookie 会话。
+
+本地凭据只能放在被 git 忽略的 `.env` 中，禁止提交。
 
 ## 已确认链路
 
-2026-07-25 使用严格 TLS 校验对 `atrust.xidian.edu.cn:443` 进行了真实联调。
+### 认证方式发现（2026-07-25 / 2026-07-26）
 
-### 认证方式发现
-
-`authConfig` 正常返回：
+对 `atrust.xidian.edu.cn:443` 使用严格 TLS：
 
 | 登录域 | 认证类型 | 名称 |
 | --- | --- | --- |
 | `cas42187` | `auth/cas` | 统一身份认证 |
 | `local` | `auth/psw` | Local Password Auth |
 
-网关证书可由当前系统信任链验证，Xidian 联调不得使用 `--insecure-tls`。
+证书可通过系统信任链校验，联调默认禁止 `--insecure-tls`。
 
 ### IDS 对应关系
-
-无凭据探测确认了以下重定向关系：
 
 ```text
 https://atrust.xidian.edu.cn/passport/v1/public/casLogin?sfDomain=cas42187
@@ -49,101 +46,123 @@ service:
 https://atrust.xidian.edu.cn/passport/v1/auth/cas?sfDomain=cas42187
 ```
 
-IDS 登录页包含动态 `pwdEncryptSalt`、`lt`、`execution` 和 `userNameLogin`，与现有
-Xidian IDS 参考脚本属于同一身份系统。
+### 完整浏览器登录与会话建立（2026-07-26，独立 Chrome）
 
-### 浏览器回调实测
+使用：
 
-`atrust-probe cas-login` 通过 Firefox WebDriver 打开服务端提供的登录入口。用户人工
-完成学校登录、滑块和验证码后，Firefox WebDriver BiDi 在请求发出前捕获到返回
-aTrust 的 HTTPS 回调。`CasChallenge` 成功完成以下校验：
+- 独立 Chrome：`user-data-dir=/tmp/hermes-chrome-profile`（与日常浏览器隔离）；
+- 匹配的 ChromeDriver 150；
+- `atrust-probe cas-login --browser chrome`；
+- **人工关窗后才收割**（不因首次 portal / 首次 `sid` 提前退出）。
 
-- 回调使用 HTTPS；
-- 回调 authority 与配置的 aTrust 网关一致；
-- 回调路径为 `/passport/v1/auth/cas`；
-- 回调包含非空 ticket，且 ticket 未进入日志。
-
-这证明以下控制面链路可用：
+实测导航顺序（仅路径与接口名，无敏感值）：
 
 ```text
-aTrust authConfig
-  -> aTrust CAS 入口
-  -> Xidian IDS
-  -> 人工两步认证
-  -> aTrust CAS 回调
-  -> ticket 校验
+casLogin
+  -> IDS /authserver/login
+  -> /passport/v1/auth/cas                 # 中间 CAS，不收割
+  -> /portal/shortcut.html                 # 首次 portal，常对应进入 aTrust 二步
+  -> 浏览器侧 reportEnv / authCheck
+  -> /portal/ + phoneNumber / auth/sms     # aTrust SMS MFA（人工输入）
+  -> onlineInfo / clientResource           # MFA 完成后
+  -> 用户关闭 probe 浏览器
+  -> Hermes 导入网关 Cookie 并校验会话
 ```
 
-该结果不能证明 aTrust 会话、资源获取或 VPN 数据面已经可用。
+关窗后客户端结果：
+
+| 观察项 | 结果 |
+| --- | --- |
+| `portal_hits` | 2 |
+| 网关 Cookie 名 | `sid`, `sid.sig`, `sid-legacy`, `sid-legacy.sig`, `straceid`, `straceid.sig`, `lang`, `language`, `sdp_limit_auth_tag`, `sdp_limit_auth_tag.sig` |
+| `authConfig` 登录态 | `LoggedIn` |
+| `onlineInfo` | 成功（`username_present=true`，用户名不入库） |
+| 会话事件 | `probe.session_established sid_present=true` |
+
+**结论：** 控制面已验证到「浏览器完整完成 IDS + aTrust SMS 后的 Cookie 会话 +
+`onlineInfo`」。VPN 数据面（TCP/L3/TUN/DNS/路由）仍未验证。
+
+### 已证伪或应避免的策略
+
+1. **不要在第一次 `/passport/v1/auth/cas` 或首次 portal 收割。**  
+   该跳转通常只是进入 aTrust 二步验证页，而非登录完成。
+2. **不要对已由浏览器打开过的 portal ticket 再跑 `reportEnv`。**  
+   ticket 倾向于一次性；浏览器已消费后客户端重放会得到超时/页签冲突类错误。
+3. **不要因出现 `sid` 就立即退出。**  
+   二步页阶段也可能已有 Cookie；必须等用户走完 SMS 并手动关窗（或未来明确的
+   “流程完成”信号）后再收割。
+4. **不要把 IDS Cookie 导入 aTrust transport。**  
+   仅导入网关 origin 的 Cookie；学校差异留在浏览器/UI 适配层。
 
 ## 当前代码边界
 
-- `atrust-auth` 负责认证方式发现、aTrust 密码主认证、CAS challenge 和回调校验；
-- `atrust-probe` 负责 WebDriver 生命周期和人工联调编排；
-- `browser.rs` 使用通用 WebDriver/BiDi 接口，不包含 Xidian 表单字段、IDS 密码算法
-  或验证码逻辑；
-- 浏览器返回的 URL 始终是不受信任输入，只有消耗型的 `CasChallenge::finish` 可以
-  把它转换为绑定网关和登录域的 `CasCallbackCredential`；
-- Xidian 在 IDS 登录后还会出现 aTrust 二次验证界面；浏览器必须完整完成这些中间
-  步骤，**不得在第一次 `/passport/v1/auth/cas` 回调时提前收割凭据**；
-- BiDi 仅拦截最终同网关 `/portal/shortcut.html` 入口，确认“已进入”后才提取 portal
-  ticket，中间 CAS 回调与 aTrust 二步页面全部放行给浏览器；
-- `AuthClient::exchange_cas_credential` 仍保留给“客户端自行提交 service ticket”的
-  路径，但 `cas-login` 默认不走该路径，以免打断尚未完成的 aTrust 二步验证；
-- portal ticket 形状来自旧客户端实现，尚未完成 Xidian 真实会话建立验证。
+### 解耦原则
 
-学校 IDS 页面只存在于浏览器中。Hermes 不解析学校表单、不接触 IDS 密码、不复制 IDS
-Cookie；WebDriver、未来的内嵌 WebView 或系统浏览器适配器都必须只向认证核心交付
-`CasCallbackCredential`。学校差异因此被限制在网页本身和 UI 适配器，不进入 aTrust
-协议状态机。
+```text
+任意学校网页登录（浏览器 / WebView）
+  -> 仅交付：网关 Cookie 会话（+ 可选 portal 观察）
+  -> atrust-auth / transport：会话校验、后续控制面
+```
+
+- 学校表单、滑块、SMS UI **不**进入 `atrust-auth` / `atrust-protocol`；
+- `browser.rs` 只使用通用 WebDriver/BiDi，不解析 Xidian 表单字段；
+- 其它学校应复用同一「浏览器完成交互 + 关窗/完成信号后收割网关 Cookie」模型。
+
+### 已实现能力
+
+| 组件 | 能力 |
+| --- | --- |
+| `hermes-transport` | 无自动重定向、脱敏 Debug、网关 Cookie 受限导入 |
+| `atrust-auth` | authConfig、密码主认证、CAS challenge、portal ticket 解析、reportEnv/authCheck/onlineInfo、会话进度模型 |
+| `atrust-probe` | auth-config / password / cas-start / cas-login；Chrome/Firefox；人工关窗收割 |
+
+### cas-login 行为（协作约定）
+
+1. 打开独立浏览器到服务端 CAS 入口；
+2. **只观察** URL 路径变化与 Cookie **名**（不记录值）；
+3. 中间 CAS / 首次 portal / MFA 页面全部放行；
+4. **用户手动关闭 probe 浏览器后**再导入网关 Cookie；
+5. 刷新 `authConfig`，优先 `onlineInfo` 确认会话；
+6. portal ticket / `reportEnv` 仅作可选回退，Xidian 实测路径以 Cookie 会话为准。
+
+### 推荐联调命令
+
+```bash
+# 本地 .env（已 gitignore），至少包含：
+# HERMES_ATRUST_HOST=atrust.xidian.edu.cn
+# HERMES_ATRUST_CAS_DOMAIN=cas42187
+
+# 独立 Chrome + chromedriver（示例端口 9515）
+cargo run -p atrust-probe -- \
+  --host atrust.xidian.edu.cn \
+  cas-login \
+  --login-domain cas42187 \
+  --browser chrome \
+  --webdriver-url http://127.0.0.1:9515 \
+  --timeout-seconds 1800
+```
+
+流程：在 probe Chrome 中完成 IDS + SMS → 确认 portal 业务页可用 → **关闭该窗口** →
+查看是否出现 `probe.session_established`。
 
 ## 尚未闭环
 
-当前代码已经串起“学校网页登录、完整 aTrust 多步人工认证、最终 portal 进入后收割
-portal ticket”的实验路径，尚未完成：
+1. 将 `clientResource` 从「浏览器侧观察到调用」推进到 Hermes 内严格解析；
+2. SID / DeviceID / ConnectionID / SignKey 的完整生命周期与持久化；
+3. 节点发现、TCP/L3 隧道、代理与 TUN；
+4. 将 SMS/MFA 建模为可恢复的 `SessionProgress::InteractionRequired` 产品状态机
+   （当前 Xidian 路径把 MFA 全部留在浏览器内完成）；
+5. 脱敏 golden fixture 与更多 ignored live tests；
+6. Cookie 导入后的 jar 可观测性（当前依赖 onlineInfo 等业务结果反证）。
 
-1. 在 Xidian 确认最终 portal URL 与 ticket 字段，以及浏览器 Cookie 是否已足以继续
-   `reportEnv`/`authCheck`；
-2. 评估是否仍需客户端重放 service ticket，以及该重放是否会与 aTrust 二步页面冲突；
-3. 实现 `authCheck` 和服务端要求的后续认证状态机；
-4. 获取并严格解析 `clientResource`；
-5. 建模 SID、DeviceID、ConnectionID 和 SignKey 生命周期；
-6. 选择资源与节点并建立最小 TCP 隧道；
-7. 通过 VPN 隧道访问受控目标并校验实际响应。
+## 下一阶段任务（建议顺序）
 
-### 2026-07-26：独立 Chrome 最终进入收割实测
-
-使用独立 Chrome 进程（`user-data-dir=/tmp/hermes-chrome-profile`，与日常浏览器隔离）
-和匹配的 ChromeDriver 150 完成一次人工联调：
-
-1. `authConfig` / `cas-start` 正常；
-2. 浏览器完整完成 IDS 与 aTrust 二步验证页面；
-3. 程序仅在最终 `/portal/shortcut.html` 进入时收割，并记录
-   `probe.cas_completion_harvested portal_ticket_received=true`；
-4. 日志未出现账号、密码、ticket 值或完整回调 URL。
-
-因此“最终进入后再收割 portal ticket”已在 Xidian 真实路径验证。aTrust 已认证会话
-（`reportEnv` / `authCheck` / SID）和 VPN 数据面仍未验证。
-
-## 下一阶段任务
-
-下一阶段仍以认证控制面为唯一范围，不提前实现 L3、TUN、DNS 或系统路由。
-
-1. 获取一次授权且脱敏的回调后网络记录，只保留方法、路径、状态码、字段名和 Cookie
-   名，删除所有值、Header 和正文；
-2. 验证当前“浏览器阻止回调、`ReqwestTransport` 唯一消费”的路径；若缺少前置 aTrust
-   Cookie 才设计限定网关来源和 Cookie 名称的最小交接，禁止导入学校 IDS Cookie；
-3. 确认 portal ticket、`reportEnv` 和后续 `authCheck` 的实际字段与顺序；
-4. 实现 ticket 后的认证状态机，并把“需要人工验证码”建模为显式暂停状态，由 UI
-   提交用户输入后继续，禁止后台自动重试；
-5. 为每个新端点补充脱敏 golden fixture、本地模拟测试和显式启用的 ignored live
-   test；
-6. 认证成功后实现最小 `clientResource` 请求，完成第一个控制面里程碑；
-7. 控制面稳定后再实现单一 TCP 资源的隧道握手和受控目标响应测试。
+1. 实现最小 `clientResource` 请求与 envelope/资源字段校验；
+2. 从资源结果中抽取节点与策略，仍不建立隧道；
+3. 单一 TCP 资源握手 + 受控目标响应；
+4. 再考虑 L3 / TUN / DNS。
 
 ## 测试门禁
-
-每次相关变更至少执行：
 
 ```bash
 cargo fmt --all -- --check

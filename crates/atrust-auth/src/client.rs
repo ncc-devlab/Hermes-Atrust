@@ -18,6 +18,9 @@ use crate::password::{
     PasswordAuthOutcome, PasswordCredentials, PasswordEnvelope, PasswordError, PasswordRequest,
 };
 use crate::profile::AuthProtocolProfile;
+use crate::session::{
+    AuthStep, AuthStepData, BusinessEnvelope, OnlineInfoData, ReportEnvRequest, SessionProgress,
+};
 
 pub struct AuthClient {
     endpoint: GatewayEndpoint,
@@ -161,6 +164,151 @@ impl AuthClient {
         Ok(CasExchange { portal_ticket })
     }
 
+    /// Continues after browser login has already entered the portal and produced a portal ticket.
+    ///
+    /// This intentionally does not auto-complete SMS/MFA; unsupported next services become
+    /// `SessionProgress::InteractionRequired`.
+    pub async fn establish_session_from_portal(
+        &self,
+        configuration: &AuthConfiguration,
+        exchange: &CasExchange,
+        device_id: &DeviceId,
+    ) -> Result<SessionProgress, AuthError> {
+        self.report_env(configuration, &exchange.portal_ticket, device_id)
+            .await?;
+        let step = self.auth_check(configuration).await?;
+        if !step.is_complete() {
+            if step.service == "auth/authCheck" {
+                // Some gateways return authCheck as a no-op loop starter; query once more.
+                let step = self.auth_check(configuration).await?;
+                if !step.is_complete() {
+                    return Ok(SessionProgress::InteractionRequired {
+                        service: step.service,
+                        auth_id: step.auth_id,
+                    });
+                }
+            } else {
+                return Ok(SessionProgress::InteractionRequired {
+                    service: step.service,
+                    auth_id: step.auth_id,
+                });
+            }
+        }
+        let username = self.online_info(configuration).await.ok();
+        Ok(SessionProgress::Established {
+            username,
+            sid_present: false,
+        })
+    }
+
+    pub async fn report_env(
+        &self,
+        configuration: &AuthConfiguration,
+        portal_ticket: &SecretString,
+        device_id: &DeviceId,
+    ) -> Result<(), AuthError> {
+        let mut url = self.endpoint_url("/controller/v1/public/reportEnv")?;
+        self.append_shared_query(&mut url);
+        let body = to_wire_json(&ReportEnvRequest::new(portal_ticket, device_id))?;
+        let mut request = HttpRequest {
+            method: HttpMethod::Post,
+            url,
+            headers: Vec::new(),
+            body,
+        };
+        self.append_auth_headers(&mut request, configuration, false);
+        debug!(
+            event = "atrust.report_env.request",
+            host = self.endpoint.host()
+        );
+        let response = self.transport.execute(request).await?;
+        if !response.is_success() {
+            return Err(AuthError::UnexpectedStatus(response.status));
+        }
+        let envelope: BusinessEnvelope<serde_json::Value> =
+            serde_json::from_slice(&response.body).map_err(AuthError::InvalidSessionResponse)?;
+        if envelope.code != 0 {
+            return Err(AuthError::AuthenticationRejected {
+                code: envelope.code,
+                message: envelope.message,
+            });
+        }
+        debug!(
+            event = "atrust.report_env.complete",
+            host = self.endpoint.host()
+        );
+        Ok(())
+    }
+
+    pub async fn auth_check(
+        &self,
+        configuration: &AuthConfiguration,
+    ) -> Result<AuthStep, AuthError> {
+        let mut url = self.endpoint_url("/passport/v1/auth/authCheck")?;
+        self.append_shared_query(&mut url);
+        let mut request = HttpRequest::get(url);
+        self.append_auth_headers(&mut request, configuration, false);
+        debug!(
+            event = "atrust.auth_check.request",
+            host = self.endpoint.host()
+        );
+        let response = self.transport.execute(request).await?;
+        if !response.is_success() {
+            return Err(AuthError::UnexpectedStatus(response.status));
+        }
+        let envelope: BusinessEnvelope<AuthStepData> =
+            serde_json::from_slice(&response.body).map_err(AuthError::InvalidSessionResponse)?;
+        if envelope.code != 0 {
+            return Err(AuthError::AuthenticationRejected {
+                code: envelope.code,
+                message: envelope.message,
+            });
+        }
+        let step = AuthStep::from_data(envelope.data);
+        debug!(
+            event = "atrust.auth_check.complete",
+            host = self.endpoint.host(),
+            next_service = %step.service,
+            auth_id_present = step.auth_id.is_some()
+        );
+        Ok(step)
+    }
+
+    pub async fn online_info(
+        &self,
+        configuration: &AuthConfiguration,
+    ) -> Result<String, AuthError> {
+        let mut url = self.endpoint_url("/passport/v1/user/onlineInfo")?;
+        self.append_shared_query(&mut url);
+        let mut request = HttpRequest::get(url);
+        self.append_auth_headers(&mut request, configuration, false);
+        debug!(
+            event = "atrust.online_info.request",
+            host = self.endpoint.host()
+        );
+        let response = self.transport.execute(request).await?;
+        if !response.is_success() {
+            return Err(AuthError::UnexpectedStatus(response.status));
+        }
+        let envelope: BusinessEnvelope<OnlineInfoData> =
+            serde_json::from_slice(&response.body).map_err(AuthError::InvalidSessionResponse)?;
+        if envelope.code != 0 {
+            return Err(AuthError::AuthenticationRejected {
+                code: envelope.code,
+                message: envelope.message,
+            });
+        }
+        if envelope.data.username.is_empty() {
+            return Err(AuthError::MissingOnlineUsername);
+        }
+        debug!(
+            event = "atrust.online_info.complete",
+            host = self.endpoint.host(),
+            username_present = true
+        );
+        Ok(envelope.data.username)
+    }
+
     /// Performs exactly one primary password attempt and never retries credentials or captchas.
     pub async fn authenticate_password(
         &self,
@@ -261,6 +409,36 @@ impl AuthClient {
         query.append_pair("lang", self.profile.language);
     }
 
+    fn append_auth_headers(
+        &self,
+        request: &mut HttpRequest,
+        configuration: &AuthConfiguration,
+        include_rid: bool,
+    ) {
+        request
+            .headers
+            .push(("user-agent".to_owned(), self.profile.user_agent.to_owned()));
+        if !request.body.is_empty() {
+            request.headers.push((
+                "content-type".to_owned(),
+                "application/json;charset=utf-8".to_owned(),
+            ));
+        }
+        if !configuration.csrf_token.is_empty() {
+            request
+                .headers
+                .push(("x-csrf-token".to_owned(), configuration.csrf_token.clone()));
+        }
+        if include_rid {
+            request
+                .headers
+                .push(("x-sdp-rid".to_owned(), BASE64.encode(self.auth_authority())));
+        }
+        request
+            .headers
+            .push(("x-sdp-traceid".to_owned(), random_trace_id()));
+    }
+
     fn auth_authority(&self) -> String {
         if self.endpoint.port() == 443 {
             let host = self.endpoint.host();
@@ -342,6 +520,10 @@ pub enum AuthError {
     InvalidPortalData(#[source] CasError),
     #[error("aTrust CAS redirect does not contain exactly one non-empty portal ticket")]
     MissingPortalTicket,
+    #[error("aTrust returned an invalid session response: {0}")]
+    InvalidSessionResponse(#[source] serde_json::Error),
+    #[error("aTrust onlineInfo did not return a username")]
+    MissingOnlineUsername,
 }
 
 #[cfg(test)]

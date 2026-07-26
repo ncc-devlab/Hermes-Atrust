@@ -83,13 +83,19 @@ cargo test --workspace
 
 ```text
 authConfig                              [已完成]
-→ 一条明确选择的登录流程和最终进入后收割 [已完成 CAS/多步等待；会话待实测]
-→ authCheck/必要二次认证                [下一步]
-→ clientResource                       [未开始]
+→ 浏览器完成 IDS + aTrust 多步 MFA      [Xidian 已实测]
+→ 人工关窗后收割网关 Cookie 会话        [Xidian 已实测]
+→ onlineInfo 会话确认                   [Xidian 已实测]
+→ clientResource                       [浏览器已观察到调用；客户端解析下一步]
 → 严格资源解析                          [未开始]
 ```
 
 此里程碑不连接节点、不建立 TCP/L3 隧道，也不接管系统 DNS 或路由。
+
+学校差异（IDS 表单、滑块、SMS UI）只存在于浏览器/UI 适配层。协议层只接受：
+
+- 网关 origin 的 Cookie 会话（主路径）；
+- 可选的、尚未被浏览器消费的 service/portal ticket（辅路径，Xidian 交互登录默认不用）。
 
 ## 联调记录
 
@@ -125,9 +131,9 @@ cargo run -p atrust-probe -- \
 - `cas42187` 已确认跳转至 `ids.xidian.edu.cn/authserver/login`，其 `service` 指回
   aTrust 的 `/passport/v1/auth/cas?sfDomain=cas42187`；
 - Xidian 统一认证包含必须人工参与的两步认证，第二步需要输入验证码；
-- Firefox WebDriver/BiDi 真实联调已完成学校登录，并在请求发出前捕获 aTrust 回调；
-- `CasChallenge` 已验证回调 scheme、authority、path 和非空 ticket；
-- 当前边界停在 ticket 回调，尚未建立 aTrust 已认证会话，也未获取资源或建立隧道。
+- 独立 Chrome 联调已跑通 IDS + aTrust SMS，并在人工关窗后建立 Cookie 会话；
+- `onlineInfo` 在导入网关 Cookie 后成功；`clientResource` 已在浏览器侧观察到调用；
+- 首次 CAS/portal 不得提前收割；portal ticket 被浏览器消费后不可再 `reportEnv`。
 
 详细证据、人工认证约束和下一阶段任务见
 [`xidian-atrust-integration.md`](xidian-atrust-integration.md)。
@@ -136,14 +142,12 @@ cargo run -p atrust-probe -- \
 
 ### 认证控制面
 
-- Cookie jar 的显式导入、导出、过期和持久化模型；
-- 浏览器登录等待最终 portal 进入后再收割 portal ticket，避免在 aTrust 二步验证前提前
-  拦截；客户端侧 service-ticket 交换 API 仍保留但默认不用于 Xidian 交互路径；
-- 回调参数已绑定选中登录域并拒绝重复 `ticket`/`sfDomain`，仍需真实 fixture；
-- `authCheck` 多阶段认证状态机；
-- 将验证码、MFA 和二次认证建模为显式人工暂停状态及发送频率保护；
-- `reportEnv`、`onlineInfo` 和会话恢复；
-- `clientResource` 获取及业务 envelope 校验；
+- Cookie jar 的导出、过期、持久化与更可审计的会话生命周期；
+- 网关 Cookie 受限导入已实现；需补充导入后的 jar 可观测与隔离测试；
+- 回调参数绑定与严格校验已有单元测试，仍需脱敏 golden fixture；
+- 产品级 `authCheck`/SMS 状态机（Xidian 当前把 MFA 全部留在浏览器内完成）；
+- `reportEnv`/`onlineInfo` API 已实现；会话恢复与多设备策略未做；
+- `clientResource` 客户端请求与严格 envelope/资源解析；
 - 设备查询、授信和取消授信；
 - SID、DeviceID、ConnectionID、SignKey 的完整生命周期。
 

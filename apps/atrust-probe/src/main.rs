@@ -2,13 +2,14 @@ use std::env;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use atrust_auth::{AuthClient, AuthConfigOptions, PasswordCredentials};
+use atrust_auth::{AuthClient, AuthConfigOptions, PasswordCredentials, SessionProgress};
 use clap::{Parser, Subcommand};
 use hermes_logging::{LogFormat, LoggerConfig};
 use hermes_model::{DeviceId, GatewayEndpoint, SecretString};
-use hermes_transport::{ReqwestTransport, ReqwestTransportConfig, TlsPolicy};
+use hermes_transport::{HttpTransport, ReqwestTransport, ReqwestTransportConfig, TlsPolicy};
 use rand::Rng as _;
 use tracing::{error, info, warn};
+use url::Url;
 
 mod browser;
 
@@ -61,7 +62,8 @@ enum Command {
         /// Browser engine used for interactive login: chrome or firefox.
         #[arg(long, default_value = "chrome")]
         browser: String,
-        #[arg(long, default_value_t = 300)]
+        /// Maximum wait while observing the browser. Harvest starts only after you close it.
+        #[arg(long, default_value_t = 1800)]
         timeout_seconds: u64,
         #[arg(long)]
         keep_browser_open: bool,
@@ -104,7 +106,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         tls_policy,
         ..ReqwestTransportConfig::default()
     })?);
-    let client = AuthClient::new(endpoint, transport);
+    let client = AuthClient::new(endpoint.clone(), transport.clone());
 
     match cli.command {
         Command::AuthConfig {
@@ -193,31 +195,148 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let browser = WebDriverBrowser::connect(&webdriver_url, kind).await?;
             info!(
                 event = "probe.cas_browser_waiting",
-                note = "waiting for final portal entry after IDS and aTrust multi-step pages"
+                note = "finish IDS + aTrust MFA fully, then manually close the probe browser to harvest"
             );
-            let exchange = match browser
+            let login = match browser
                 .complete_cas(challenge, std::time::Duration::from_secs(timeout_seconds))
                 .await
             {
-                Ok(exchange) => exchange,
+                Ok(login) => login,
                 Err(error) => {
-                    if !keep_browser_open && let Err(close_error) = browser.close().await {
-                        warn!(event = "probe.cas_browser_close_failed", error = %close_error);
-                    }
+                    // Browser may already be closed by the user; ignore close failures.
+                    let _ = browser.close().await;
                     return Err(Box::new(error));
                 }
             };
             info!(
                 event = "probe.cas_completion_harvested",
-                portal_ticket_received = true
+                portal_ticket_received = login.exchange.is_some(),
+                portal_hits = login.portal_hits,
+                final_path = login.final_path.as_deref().unwrap_or(""),
+                gateway_cookie_count = login.gateway_cookies.len(),
+                gateway_cookie_names = ?login
+                    .gateway_cookies
+                    .iter()
+                    .map(|cookie| cookie.name.as_str())
+                    .collect::<Vec<_>>()
             );
-            drop(exchange);
-            if !keep_browser_open {
-                browser.close().await?;
+            let origin = Url::parse(&format!("https://{}/", gateway_authority(&endpoint)))?;
+            let sid_present = login
+                .gateway_cookies
+                .iter()
+                .any(|cookie| cookie.name.eq_ignore_ascii_case("sid"));
+            if login.gateway_cookies.is_empty() {
+                warn!(event = "probe.gateway_cookies_missing");
+            } else {
+                transport.import_gateway_cookies(&origin, &login.gateway_cookies)?;
             }
+            // Refresh authConfig after browser login so csrf/login state match the session.
+            let configuration = client
+                .auth_config(AuthConfigOptions {
+                    modified: true,
+                    need_ticket: false,
+                })
+                .await?;
+            info!(
+                event = "probe.post_login_auth_config",
+                login_state = ?configuration.login_state,
+                csrf_present = !configuration.csrf_token.is_empty()
+            );
+            // Portal ticket is single-use and was already opened by the browser via continueRequest.
+            // Prefer cookie-backed control-plane checks; only fall back to reportEnv if needed.
+            let progress = match client.online_info(&configuration).await {
+                Ok(username) => SessionProgress::Established {
+                    username: Some(username),
+                    sid_present,
+                },
+                Err(online_error) => {
+                    warn!(event = "probe.online_info_failed", error = %online_error);
+                    let step = match client.auth_check(&configuration).await {
+                        Ok(step) => {
+                            info!(
+                                event = "probe.auth_check",
+                                service = %step.service,
+                                complete = step.is_complete()
+                            );
+                            Some(step)
+                        }
+                        Err(error) => {
+                            warn!(event = "probe.auth_check_failed", error = %error);
+                            None
+                        }
+                    };
+                    if let Some(step) = step.filter(|step| !step.is_complete()) {
+                        SessionProgress::InteractionRequired {
+                            service: step.service,
+                            auth_id: step.auth_id,
+                        }
+                    } else if let Some(exchange) = login.exchange.as_ref() {
+                        let device_id = DeviceId::new(random_hex(32))?;
+                        match client
+                            .establish_session_from_portal(&configuration, exchange, &device_id)
+                            .await
+                        {
+                            Ok(progress) => progress,
+                            Err(error) => {
+                                if !keep_browser_open
+                                    && let Err(close_error) = browser.close().await
+                                {
+                                    warn!(
+                                        event = "probe.cas_browser_close_failed",
+                                        error = %close_error
+                                    );
+                                }
+                                return Err(format!(
+                                    "cookie session failed ({online_error}); portal reportEnv failed ({error})"
+                                )
+                                .into());
+                            }
+                        }
+                    } else {
+                        if !keep_browser_open && let Err(close_error) = browser.close().await {
+                            warn!(event = "probe.cas_browser_close_failed", error = %close_error);
+                        }
+                        return Err(format!(
+                            "cookie session failed ({online_error}); no post-MFA portal ticket available"
+                        )
+                        .into());
+                    }
+                }
+            };
+            match progress {
+                SessionProgress::Established {
+                    username,
+                    sid_present,
+                } => info!(
+                    event = "probe.session_established",
+                    username_present = username.is_some(),
+                    sid_present
+                ),
+                SessionProgress::InteractionRequired { service, auth_id } => info!(
+                    event = "probe.session_interaction_required",
+                    service,
+                    auth_id_present = auth_id.is_some()
+                ),
+            }
+            // Session is usually already gone after the user closed the window.
+            let _ = browser.close().await;
+            let _ = keep_browser_open;
         }
     }
     Ok(())
+}
+
+fn gateway_authority(endpoint: &GatewayEndpoint) -> String {
+    if endpoint.port() == 443 {
+        let host = endpoint.host();
+        if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]")
+        } else {
+            host.to_owned()
+        }
+    } else {
+        endpoint.to_string()
+    }
 }
 
 fn random_hex(length: usize) -> String {
