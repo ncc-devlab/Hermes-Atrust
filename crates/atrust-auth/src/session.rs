@@ -148,4 +148,60 @@ mod tests {
         assert_eq!(step.service, "auth/sms");
         assert_eq!(step.auth_id.as_deref(), Some("sms-1"));
     }
+
+    #[test]
+    fn uses_first_list_entry_when_next_service_empty() {
+        let step = AuthStep::from_data(AuthStepData {
+            next_service: String::new(),
+            next_service_list: vec![AuthServiceInfo {
+                auth_id: "sms-2".to_owned(),
+                auth_type: "auth/sms".to_owned(),
+            }],
+        });
+        assert_eq!(step.service, "auth/sms");
+        assert_eq!(step.auth_id.as_deref(), Some("sms-2"));
+        assert!(!step.is_complete());
+    }
+
+    #[test]
+    fn auth_id_only_defaults_service_to_sms() {
+        let step = AuthStep::from_data(AuthStepData {
+            next_service: String::new(),
+            next_service_list: vec![AuthServiceInfo {
+                auth_id: "only-id".to_owned(),
+                auth_type: String::new(),
+            }],
+        });
+        assert_eq!(step.service, "auth/sms");
+        assert_eq!(step.auth_id.as_deref(), Some("only-id"));
+    }
+
+    #[test]
+    fn deserializes_business_envelope_without_sensitive_fields() {
+        let body = br#"{
+            "code": 0,
+            "message": "ok",
+            "data": {
+                "nextService": "auth/authCheck",
+                "nextServiceList": [{
+                    "authId": "check-1",
+                    "authType": "auth/authCheck"
+                }]
+            }
+        }"#;
+        let envelope: BusinessEnvelope<AuthStepData> = serde_json::from_slice(body).unwrap();
+        assert_eq!(envelope.code, 0);
+        assert_eq!(envelope.message, "ok");
+        let step = AuthStep::from_data(envelope.data);
+        assert_eq!(step.service, "auth/authCheck");
+        assert_eq!(step.auth_id.as_deref(), Some("check-1"));
+    }
+
+    #[test]
+    fn deserializes_online_info_username_presence_only_in_model() {
+        let body = br#"{"code":0,"message":"","data":{"username":"student"}}"#;
+        let envelope: BusinessEnvelope<OnlineInfoData> = serde_json::from_slice(body).unwrap();
+        assert_eq!(envelope.code, 0);
+        assert_eq!(envelope.data.username, "student");
+    }
 }

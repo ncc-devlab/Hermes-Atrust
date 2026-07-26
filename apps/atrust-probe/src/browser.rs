@@ -274,7 +274,7 @@ impl WebDriverBrowser {
                         return Err(BrowserError::BrowserClosedWithoutSession);
                     }
                     let exchange = last_portal.as_ref().and_then(|url| {
-                        if portal_hits >= 2 || sid_seen {
+                        if portal_ticket_harvest_allowed(portal_hits, sid_seen) {
                             parse_portal_ticket(url, &gateway_authority)
                                 .ok()
                                 .map(|portal_ticket| CasExchange { portal_ticket })
@@ -323,7 +323,7 @@ impl WebDriverBrowser {
                         return Err(BrowserError::BrowserClosedWithoutSession);
                     }
                     let exchange = last_portal.as_ref().and_then(|url| {
-                        if portal_hits >= 2 || sid_seen {
+                        if portal_ticket_harvest_allowed(portal_hits, sid_seen) {
                             parse_portal_ticket(url, &gateway_authority)
                                 .ok()
                                 .map(|portal_ticket| CasExchange { portal_ticket })
@@ -479,6 +479,11 @@ fn safe_path(url: &Url) -> String {
     format!("{}://{}{}", url.scheme(), url.authority(), url.path())
 }
 
+/// Optional portal ticket may be kept only after multi-step progress, never on first portal alone.
+fn portal_ticket_harvest_allowed(portal_hits: u32, sid_seen: bool) -> bool {
+    portal_hits >= 2 || sid_seen
+}
+
 async fn response_value(response: reqwest::Response) -> Result<Value, BrowserError> {
     if !response.status().is_success() {
         return Err(BrowserError::WebDriverStatus(response.status()));
@@ -508,7 +513,7 @@ async fn response_value(response: reqwest::Response) -> Result<Value, BrowserErr
 
 #[cfg(test)]
 mod tests {
-    use super::normalized_endpoint;
+    use super::{normalized_endpoint, portal_ticket_harvest_allowed};
 
     #[test]
     fn normalizes_webdriver_endpoint_path() {
@@ -524,5 +529,18 @@ mod tests {
                 .as_str(),
             "http://127.0.0.1:4444/wd/hub/"
         );
+    }
+
+    #[test]
+    fn does_not_harvest_portal_ticket_on_first_portal_without_sid() {
+        assert!(!portal_ticket_harvest_allowed(0, false));
+        assert!(!portal_ticket_harvest_allowed(1, false));
+    }
+
+    #[test]
+    fn harvests_portal_ticket_after_second_portal_or_sid() {
+        assert!(portal_ticket_harvest_allowed(2, false));
+        assert!(portal_ticket_harvest_allowed(1, true));
+        assert!(portal_ticket_harvest_allowed(0, true));
     }
 }

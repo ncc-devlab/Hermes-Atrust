@@ -170,4 +170,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+已覆盖的会话路径单测（默认 CI 运行）：
+
+- `reportEnv` / `authCheck` / `onlineInfo` / `establish_session_from_portal` mock；
+- 网关 Cookie 受限导入与名称可观测（不暴露值）；
+- `AuthStep` 边界与 `BusinessEnvelope` 脱敏解析；
+- 首次 portal 不收割 portal ticket 的策略。
+
 真实 Xidian 登录只能由人工显式启动，不进入默认测试、CI 或自动重试任务。
+`.env` 仅保留主机/域/WebDriver 等非密钥设置；不需要也不应存放账号密码。

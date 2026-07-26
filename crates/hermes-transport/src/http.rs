@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -152,6 +153,8 @@ pub struct ReqwestTransport {
     client: reqwest::Client,
     jar: Arc<Jar>,
     max_response_body: usize,
+    /// Cookie names observed via trusted gateway import only (values never stored here).
+    imported_cookie_names: Arc<Mutex<HashMap<String, Vec<String>>>>,
 }
 
 impl ReqwestTransport {
@@ -180,6 +183,7 @@ impl ReqwestTransport {
             client,
             jar,
             max_response_body: config.max_response_body,
+            imported_cookie_names: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 }
@@ -302,20 +306,44 @@ impl HttpTransport for ReqwestTransport {
             }
             self.jar.add_cookie_str(&set_cookie, origin);
         }
+        let host_key = origin_host.to_ascii_lowercase();
+        let mut names = cookies
+            .iter()
+            .map(|cookie| cookie.name.clone())
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        if let Ok(mut map) = self.imported_cookie_names.lock() {
+            map.entry(host_key)
+                .and_modify(|existing| {
+                    existing.extend(names.iter().cloned());
+                    existing.sort();
+                    existing.dedup();
+                })
+                .or_insert(names.clone());
+        }
         debug!(
             event = "transport.cookie_import",
             host = origin.host_str().unwrap_or("<unknown>"),
             cookie_count = cookies.len(),
-            cookie_names = ?cookies.iter().map(|cookie| cookie.name.as_str()).collect::<Vec<_>>()
+            cookie_names = ?names
         );
         Ok(())
     }
 
     fn gateway_cookie_names(&self, origin: &Url) -> Vec<String> {
-        // reqwest::Jar does not expose enumeration; probe using Cookie header synthesis.
-        // Cookie names are observed via application-layer session checks instead.
-        let _ = origin;
-        Vec::new()
+        // reqwest::Jar does not expose enumeration; track names from trusted imports only.
+        let Some(host) = origin.host_str() else {
+            return Vec::new();
+        };
+        self.imported_cookie_names
+            .lock()
+            .map(|map| {
+                map.get(&host.to_ascii_lowercase())
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -442,5 +470,90 @@ mod tests {
             response.location.as_deref(),
             Some("https://example.test/next")
         );
+    }
+
+    fn sample_cookie(name: &str, value: &str, domain: Option<&str>) -> GatewayCookie {
+        GatewayCookie {
+            name: name.to_owned(),
+            value: value.to_owned(),
+            domain: domain.map(str::to_owned),
+            path: Some("/".to_owned()),
+            secure: true,
+            http_only: true,
+        }
+    }
+
+    #[test]
+    fn imports_gateway_cookies_and_exposes_names_only() {
+        let transport = ReqwestTransport::new(&ReqwestTransportConfig::default()).unwrap();
+        let origin = Url::parse("https://atrust.example.edu/").unwrap();
+        let cookies = [
+            sample_cookie("sid", "session-value", Some("atrust.example.edu")),
+            sample_cookie("sid.sig", "sig-value", None),
+        ];
+
+        transport.import_gateway_cookies(&origin, &cookies).unwrap();
+
+        let mut names = transport.gateway_cookie_names(&origin);
+        names.sort();
+        assert_eq!(names, vec!["sid".to_owned(), "sid.sig".to_owned()]);
+        assert!(!format!("{cookies:?}").contains("session-value"));
+        assert_eq!(
+            transport.gateway_cookie_names(&Url::parse("https://other.example.edu/").unwrap()),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn rejects_http_origin_and_cross_domain_cookie_import() {
+        let transport = ReqwestTransport::new(&ReqwestTransportConfig::default()).unwrap();
+        let https = Url::parse("https://atrust.example.edu/").unwrap();
+        let http = Url::parse("http://atrust.example.edu/").unwrap();
+
+        assert!(matches!(
+            transport.import_gateway_cookies(&http, &[sample_cookie("sid", "value", None)]),
+            Err(HttpTransportError::InvalidCookieOrigin)
+        ));
+        assert!(matches!(
+            transport.import_gateway_cookies(
+                &https,
+                &[sample_cookie("sid", "value", Some("evil.example"))]
+            ),
+            Err(HttpTransportError::InvalidCookieOrigin)
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_cookie_name_and_value() {
+        let transport = ReqwestTransport::new(&ReqwestTransportConfig::default()).unwrap();
+        let origin = Url::parse("https://atrust.example.edu/").unwrap();
+
+        assert!(matches!(
+            transport.import_gateway_cookies(&origin, &[sample_cookie("sid;evil", "value", None)]),
+            Err(HttpTransportError::InvalidCookieName)
+        ));
+        assert!(matches!(
+            transport.import_gateway_cookies(&origin, &[sample_cookie("sid", "", None)]),
+            Err(HttpTransportError::InvalidCookieValue)
+        ));
+        assert!(matches!(
+            transport.import_gateway_cookies(&origin, &[sample_cookie("sid", "a;b", None)]),
+            Err(HttpTransportError::InvalidCookieValue)
+        ));
+    }
+
+    #[test]
+    fn merges_imported_cookie_names_per_origin() {
+        let transport = ReqwestTransport::new(&ReqwestTransportConfig::default()).unwrap();
+        let origin = Url::parse("https://atrust.example.edu/").unwrap();
+        transport
+            .import_gateway_cookies(&origin, &[sample_cookie("sid", "session-value", None)])
+            .unwrap();
+        transport
+            .import_gateway_cookies(&origin, &[sample_cookie("lang", "zh-CN", None)])
+            .unwrap();
+        let mut names = transport.gateway_cookie_names(&origin);
+        names.sort();
+        assert_eq!(names, vec!["lang".to_owned(), "sid".to_owned()]);
     }
 }

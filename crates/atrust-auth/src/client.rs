@@ -531,7 +531,7 @@ mod tests {
     use std::sync::Mutex;
 
     use async_trait::async_trait;
-    use hermes_transport::{HttpResponse, HttpTransportError};
+    use hermes_transport::{HttpMethod, HttpResponse, HttpTransportError};
     use rsa::traits::PublicKeyParts;
     use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
 
@@ -785,5 +785,241 @@ mod tests {
             parse_portal_ticket(&redirect, "atrust.example.edu"),
             Err(CasError::InvalidPortalAuthority)
         ));
+    }
+
+    #[derive(Debug)]
+    struct QueueTransport {
+        responses: Mutex<std::collections::VecDeque<HttpResponse>>,
+        requests: Mutex<Vec<HttpRequest>>,
+    }
+
+    impl QueueTransport {
+        fn new(responses: Vec<HttpResponse>) -> Arc<Self> {
+            Arc::new(Self {
+                responses: Mutex::new(responses.into()),
+                requests: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl HttpTransport for QueueTransport {
+        async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, HttpTransportError> {
+            self.requests.lock().unwrap().push(request);
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| HttpTransportError::Mock("no queued response".to_owned()))
+        }
+    }
+
+    fn session_configuration() -> AuthConfiguration {
+        AuthConfiguration {
+            login_state: LoginState::LoggedIn,
+            methods: Vec::new(),
+            csrf_token: "csrf-session".to_owned(),
+            public_key: String::new(),
+            public_key_exponent: String::new(),
+            anti_replay_random: String::new(),
+        }
+    }
+
+    fn ok_json(body: &'static str) -> HttpResponse {
+        HttpResponse {
+            status: 200,
+            location: None,
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn report_env_posts_ticket_and_rejects_nonzero_code() {
+        let transport = QueueTransport::new(vec![ok_json(
+            r#"{"code":1,"message":"ticket used","data":{}}"#,
+        )]);
+        let client = AuthClient::new(
+            GatewayEndpoint::new("atrust.example.edu", 443).unwrap(),
+            transport.clone(),
+        );
+        let ticket = SecretString::new("portal-ticket").unwrap();
+        let err = client
+            .report_env(
+                &session_configuration(),
+                &ticket,
+                &DeviceId::new("device-id").unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthError::AuthenticationRejected { code: 1, .. }
+        ));
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests[0].url.path(), "/controller/v1/public/reportEnv");
+        assert_eq!(requests[0].method, HttpMethod::Post);
+        assert!(
+            requests[0]
+                .headers
+                .iter()
+                .any(|(name, value)| name == "x-csrf-token" && value == "csrf-session")
+        );
+        assert!(!format!("{:?}", requests[0]).contains("portal-ticket"));
+    }
+
+    #[tokio::test]
+    async fn auth_check_maps_next_service_and_complete() {
+        let transport = QueueTransport::new(vec![
+            ok_json(
+                r#"{"code":0,"message":"","data":{"nextService":"auth/sms","nextServiceList":[{"authId":"sms-1","authType":"auth/sms"}]}}"#,
+            ),
+            ok_json(r#"{"code":0,"message":"","data":{}}"#),
+        ]);
+        let client = AuthClient::new(
+            GatewayEndpoint::new("atrust.example.edu", 443).unwrap(),
+            transport.clone(),
+        );
+        let configuration = session_configuration();
+
+        let sms = client.auth_check(&configuration).await.unwrap();
+        assert_eq!(sms.service, "auth/sms");
+        assert_eq!(sms.auth_id.as_deref(), Some("sms-1"));
+        assert!(!sms.is_complete());
+
+        let done = client.auth_check(&configuration).await.unwrap();
+        assert!(done.is_complete());
+        let paths: Vec<_> = transport
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.url.path().to_owned())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/passport/v1/auth/authCheck".to_owned(),
+                "/passport/v1/auth/authCheck".to_owned()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn online_info_returns_username_and_rejects_empty() {
+        let transport = QueueTransport::new(vec![
+            ok_json(r#"{"code":0,"message":"","data":{"username":"student"}}"#),
+            ok_json(r#"{"code":0,"message":"","data":{"username":""}}"#),
+        ]);
+        let client = AuthClient::new(
+            GatewayEndpoint::new("atrust.example.edu", 443).unwrap(),
+            transport.clone(),
+        );
+        let configuration = session_configuration();
+
+        let username = client.online_info(&configuration).await.unwrap();
+        assert_eq!(username, "student");
+        assert!(!format!("{:?}", transport.requests.lock().unwrap()[0]).contains("student"));
+
+        let err = client.online_info(&configuration).await.unwrap_err();
+        assert!(matches!(err, AuthError::MissingOnlineUsername));
+        let paths: Vec<_> = transport
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.url.path().to_owned())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/passport/v1/user/onlineInfo".to_owned(),
+                "/passport/v1/user/onlineInfo".to_owned()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn establish_session_reports_interaction_for_sms() {
+        let transport = QueueTransport::new(vec![
+            ok_json(r#"{"code":0,"message":"","data":{}}"#),
+            ok_json(
+                r#"{"code":0,"message":"","data":{"nextService":"auth/sms","nextServiceList":[{"authId":"sms-9","authType":"auth/sms"}]}}"#,
+            ),
+        ]);
+        let client = AuthClient::new(
+            GatewayEndpoint::new("atrust.example.edu", 443).unwrap(),
+            transport,
+        );
+        let exchange = CasExchange {
+            portal_ticket: SecretString::new("portal-ticket").unwrap(),
+        };
+        let progress = client
+            .establish_session_from_portal(
+                &session_configuration(),
+                &exchange,
+                &DeviceId::new("device-id").unwrap(),
+            )
+            .await
+            .unwrap();
+        match progress {
+            SessionProgress::InteractionRequired { service, auth_id } => {
+                assert_eq!(service, "auth/sms");
+                assert_eq!(auth_id.as_deref(), Some("sms-9"));
+            }
+            SessionProgress::Established { .. } => panic!("expected SMS interaction"),
+        }
+    }
+
+    #[tokio::test]
+    async fn establish_session_retries_auth_check_noop_then_establishes() {
+        let transport = QueueTransport::new(vec![
+            ok_json(r#"{"code":0,"message":"","data":{}}"#),
+            ok_json(
+                r#"{"code":0,"message":"","data":{"nextService":"auth/authCheck","nextServiceList":[{"authId":"","authType":"auth/authCheck"}]}}"#,
+            ),
+            ok_json(r#"{"code":0,"message":"","data":{}}"#),
+            ok_json(r#"{"code":0,"message":"","data":{"username":"student"}}"#),
+        ]);
+        let client = AuthClient::new(
+            GatewayEndpoint::new("atrust.example.edu", 443).unwrap(),
+            transport.clone(),
+        );
+        let exchange = CasExchange {
+            portal_ticket: SecretString::new("portal-ticket").unwrap(),
+        };
+        let progress = client
+            .establish_session_from_portal(
+                &session_configuration(),
+                &exchange,
+                &DeviceId::new("device-id").unwrap(),
+            )
+            .await
+            .unwrap();
+        match progress {
+            SessionProgress::Established {
+                username,
+                sid_present,
+            } => {
+                assert_eq!(username.as_deref(), Some("student"));
+                assert!(!sid_present);
+            }
+            SessionProgress::InteractionRequired { .. } => panic!("expected established"),
+        }
+        let paths: Vec<_> = transport
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.url.path().to_owned())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/controller/v1/public/reportEnv".to_owned(),
+                "/passport/v1/auth/authCheck".to_owned(),
+                "/passport/v1/auth/authCheck".to_owned(),
+                "/passport/v1/user/onlineInfo".to_owned(),
+            ]
+        );
     }
 }
