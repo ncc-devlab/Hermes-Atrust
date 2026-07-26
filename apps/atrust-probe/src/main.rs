@@ -8,14 +8,17 @@ use hermes_logging::{LogFormat, LoggerConfig};
 use hermes_model::{DeviceId, GatewayEndpoint, SecretString};
 use hermes_transport::{ReqwestTransport, ReqwestTransportConfig, TlsPolicy};
 use rand::Rng as _;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 mod browser;
 
-use browser::WebDriverBrowser;
+use browser::{BrowserKind, WebDriverBrowser};
 
 #[derive(Debug, Parser)]
-#[command(about = "Read-only aTrust protocol probe", version)]
+#[command(
+    about = "aTrust protocol probe for auth discovery and controlled interactive login",
+    version
+)]
 struct Cli {
     #[arg(long)]
     host: String,
@@ -49,12 +52,15 @@ enum Command {
         #[arg(long)]
         login_domain: String,
     },
-    /// Complete interactive CAS login in a Firefox WebDriver session.
+    /// Complete interactive CAS login in a WebDriver browser session.
     CasLogin {
         #[arg(long)]
         login_domain: String,
-        #[arg(long, default_value = "http://127.0.0.1:4444")]
+        #[arg(long, default_value = "http://127.0.0.1:9515")]
         webdriver_url: String,
+        /// Browser engine used for interactive login: chrome or firefox.
+        #[arg(long, default_value = "chrome")]
+        browser: String,
         #[arg(long, default_value_t = 300)]
         timeout_seconds: u64,
         #[arg(long)]
@@ -162,6 +168,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::CasLogin {
             login_domain,
             webdriver_url,
+            browser,
             timeout_seconds,
             keep_browser_open,
         } => {
@@ -171,17 +178,40 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     need_ticket: true,
                 })
                 .await?;
+            // configuration is only used to discover the CAS entry; intermediate aTrust
+            // multi-step pages must finish in the browser before any credential harvest.
             let challenge = client.prepare_cas(&configuration, &login_domain)?;
-            let browser = WebDriverBrowser::connect(&webdriver_url).await?;
-            info!(event = "probe.cas_browser_waiting");
-            let ticket = browser
-                .complete_cas(&challenge, std::time::Duration::from_secs(timeout_seconds))
-                .await?;
+            let kind = match browser.as_str() {
+                "chrome" => BrowserKind::Chrome,
+                "firefox" => BrowserKind::Firefox,
+                other => {
+                    return Err(
+                        format!("unsupported browser `{other}`; use chrome or firefox").into(),
+                    );
+                }
+            };
+            let browser = WebDriverBrowser::connect(&webdriver_url, kind).await?;
             info!(
-                event = "probe.cas_callback_validated",
-                ticket_received = true
+                event = "probe.cas_browser_waiting",
+                note = "waiting for final portal entry after IDS and aTrust multi-step pages"
             );
-            drop(ticket);
+            let exchange = match browser
+                .complete_cas(challenge, std::time::Duration::from_secs(timeout_seconds))
+                .await
+            {
+                Ok(exchange) => exchange,
+                Err(error) => {
+                    if !keep_browser_open && let Err(close_error) = browser.close().await {
+                        warn!(event = "probe.cas_browser_close_failed", error = %close_error);
+                    }
+                    return Err(Box::new(error));
+                }
+            };
+            info!(
+                event = "probe.cas_completion_harvested",
+                portal_ticket_received = true
+            );
+            drop(exchange);
             if !keep_browser_open {
                 browser.close().await?;
             }

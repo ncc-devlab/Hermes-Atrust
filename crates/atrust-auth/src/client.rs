@@ -13,7 +13,7 @@ use tracing::debug;
 use url::Url;
 
 use crate::auth_config::{AuthConfigEnvelope, AuthConfigOptions, AuthConfiguration};
-use crate::cas::{CasChallenge, CasError};
+use crate::cas::{CasCallbackCredential, CasChallenge, CasError, CasExchange, parse_portal_ticket};
 use crate::password::{
     PasswordAuthOutcome, PasswordCredentials, PasswordEnvelope, PasswordError, PasswordRequest,
 };
@@ -121,6 +121,44 @@ impl AuthClient {
             &method.login_url,
         )
         .map_err(AuthError::Cas)
+    }
+
+    /// Consumes a browser-produced CAS service ticket in the aTrust HTTP session.
+    ///
+    /// The expected portal redirect is inherited from the legacy client and remains a
+    /// protocol-validation gate until confirmed against each supported gateway profile.
+    pub async fn exchange_cas_credential(
+        &self,
+        configuration: &AuthConfiguration,
+        credential: CasCallbackCredential,
+    ) -> Result<CasExchange, AuthError> {
+        if credential.callback_authority != self.auth_authority() {
+            return Err(AuthError::CasCredentialGatewayMismatch);
+        }
+        let mut url = self.endpoint_url("/passport/v1/auth/cas")?;
+        url.query_pairs_mut()
+            .append_pair("sfDomain", &credential.login_domain)
+            .append_pair("ticket", credential.service_ticket.expose());
+        let mut request = HttpRequest::get(url);
+        request
+            .headers
+            .push(("user-agent".to_owned(), self.profile.user_agent.to_owned()));
+        request
+            .headers
+            .push(("x-csrf-token".to_owned(), configuration.csrf_token.clone()));
+        request
+            .headers
+            .push(("x-sdp-traceid".to_owned(), random_trace_id()));
+
+        let response = self.transport.execute(request).await?;
+        if response.status != 302 {
+            return Err(AuthError::UnexpectedCasStatus(response.status));
+        }
+        let location = response.location.ok_or(AuthError::MissingCasRedirect)?;
+        let redirect = Url::parse(&location).map_err(AuthError::InvalidCasRedirect)?;
+        let portal_ticket = parse_portal_ticket(&redirect, &self.auth_authority())
+            .map_err(AuthError::from_portal_error)?;
+        Ok(CasExchange { portal_ticket })
     }
 
     /// Performs exactly one primary password attempt and never retries credentials or captchas.
@@ -237,6 +275,21 @@ impl AuthClient {
     }
 }
 
+impl AuthError {
+    fn from_portal_error(error: CasError) -> Self {
+        match error {
+            CasError::InvalidPortalScheme
+            | CasError::InvalidPortalAuthority
+            | CasError::InvalidPortalPath
+            | CasError::InvalidPortalUrl
+            | CasError::PortalUrlTooLong => Self::InvalidCasRedirectTarget,
+            CasError::InvalidPortalData => Self::InvalidPortalData(error),
+            CasError::MissingPortalTicket => Self::MissingPortalTicket,
+            other => Self::Cas(other),
+        }
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DeviceEnvironment<'a> {
@@ -275,6 +328,20 @@ pub enum AuthError {
     InvalidPasswordResponse(#[source] serde_json::Error),
     #[error("failed to prepare CAS authentication: {0}")]
     Cas(#[from] CasError),
+    #[error("CAS credential belongs to another aTrust gateway")]
+    CasCredentialGatewayMismatch,
+    #[error("aTrust CAS exchange returned unexpected HTTP status {0}")]
+    UnexpectedCasStatus(u16),
+    #[error("aTrust CAS exchange did not return a redirect")]
+    MissingCasRedirect,
+    #[error("aTrust CAS exchange returned an invalid redirect URL: {0}")]
+    InvalidCasRedirect(#[source] url::ParseError),
+    #[error("aTrust CAS exchange redirected outside the expected portal endpoint")]
+    InvalidCasRedirectTarget,
+    #[error("aTrust CAS redirect contains invalid portal data: {0}")]
+    InvalidPortalData(#[source] CasError),
+    #[error("aTrust CAS redirect does not contain exactly one non-empty portal ticket")]
+    MissingPortalTicket,
 }
 
 #[cfg(test)]
@@ -307,6 +374,7 @@ mod tests {
         let transport = Arc::new(MockTransport {
             response: HttpResponse {
                 status: 200,
+                location: None,
                 body: body.to_vec(),
             },
             requests: Mutex::new(Vec::new()),
@@ -382,6 +450,7 @@ mod tests {
         let transport = Arc::new(MockTransport {
             response: HttpResponse {
                 status: 200,
+                location: None,
                 body: br#"{"code":0,"message":"","data":{"ticket":"ticket-value","graphCheckCodeEnable":0}}"#.to_vec(),
             },
             requests: Mutex::new(Vec::new()),
@@ -433,6 +502,7 @@ mod tests {
         let transport = Arc::new(MockTransport {
             response: HttpResponse {
                 status: 200,
+                location: None,
                 body: br#"{"code":75500000,"message":"challenge required","data":{"ticket":"","graphCheckCodeEnable":1}}"#.to_vec(),
             },
             requests: Mutex::new(Vec::new()),
@@ -469,5 +539,69 @@ mod tests {
             .unwrap();
         assert!(outcome.captcha_required);
         assert!(outcome.ticket.is_none());
+    }
+
+    #[tokio::test]
+    async fn exchanges_web_credential_for_strict_portal_ticket() {
+        let location = "https://atrust.example.edu/portal/shortcut.html?data=%7B%22ticket%22%3A%22portal-secret%22%7D";
+        let transport = Arc::new(MockTransport {
+            response: HttpResponse {
+                status: 302,
+                location: Some(location.to_owned()),
+                body: Vec::new(),
+            },
+            requests: Mutex::new(Vec::new()),
+        });
+        let endpoint = GatewayEndpoint::new("atrust.example.edu", 443).unwrap();
+        let client = AuthClient::new(endpoint.clone(), transport.clone());
+        let challenge = CasChallenge::new(
+            &endpoint,
+            "cas-domain".to_owned(),
+            "https://ids.example.edu/login",
+        )
+        .unwrap();
+        let callback = Url::parse(
+            "https://atrust.example.edu/passport/v1/auth/cas?sfDomain=cas-domain&ticket=service-secret",
+        )
+        .unwrap();
+        let credential = challenge.finish(&callback).unwrap();
+        let configuration = AuthConfiguration {
+            login_state: LoginState::LoggedOut,
+            methods: Vec::new(),
+            csrf_token: "csrf-secret".to_owned(),
+            public_key: String::new(),
+            public_key_exponent: String::new(),
+            anti_replay_random: String::new(),
+        };
+
+        let exchange = client
+            .exchange_cas_credential(&configuration, credential)
+            .await
+            .unwrap();
+
+        assert_eq!(exchange.portal_ticket.expose(), "portal-secret");
+        let requests = transport.requests.lock().unwrap();
+        let query: std::collections::HashMap<_, _> = requests[0].url.query_pairs().collect();
+        assert_eq!(query.get("sfDomain").unwrap(), "cas-domain");
+        assert_eq!(query.get("ticket").unwrap(), "service-secret");
+        assert!(
+            requests[0]
+                .headers
+                .iter()
+                .any(|(name, value)| name == "x-csrf-token" && value == "csrf-secret")
+        );
+        assert!(!format!("{:?}", requests[0]).contains("service-secret"));
+    }
+
+    #[test]
+    fn rejects_cross_origin_portal_redirect() {
+        let redirect = Url::parse(
+            "https://attacker.example/portal/shortcut.html?data=%7B%22ticket%22%3A%22secret%22%7D",
+        )
+        .unwrap();
+        assert!(matches!(
+            parse_portal_ticket(&redirect, "atrust.example.edu"),
+            Err(CasError::InvalidPortalAuthority)
+        ));
     }
 }

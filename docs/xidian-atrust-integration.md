@@ -82,24 +82,48 @@ aTrust authConfig
 - `atrust-probe` 负责 WebDriver 生命周期和人工联调编排；
 - `browser.rs` 使用通用 WebDriver/BiDi 接口，不包含 Xidian 表单字段、IDS 密码算法
   或验证码逻辑；
-- 浏览器返回的 URL 始终是不受信任输入，只有 `CasChallenge::validate_callback` 可以
-  把它转换为受保护的 ticket；
-- 当前没有代码消费该 ticket 以建立 aTrust 已认证会话。
+- 浏览器返回的 URL 始终是不受信任输入，只有消耗型的 `CasChallenge::finish` 可以
+  把它转换为绑定网关和登录域的 `CasCallbackCredential`；
+- Xidian 在 IDS 登录后还会出现 aTrust 二次验证界面；浏览器必须完整完成这些中间
+  步骤，**不得在第一次 `/passport/v1/auth/cas` 回调时提前收割凭据**；
+- BiDi 仅拦截最终同网关 `/portal/shortcut.html` 入口，确认“已进入”后才提取 portal
+  ticket，中间 CAS 回调与 aTrust 二步页面全部放行给浏览器；
+- `AuthClient::exchange_cas_credential` 仍保留给“客户端自行提交 service ticket”的
+  路径，但 `cas-login` 默认不走该路径，以免打断尚未完成的 aTrust 二步验证；
+- portal ticket 形状来自旧客户端实现，尚未完成 Xidian 真实会话建立验证。
+
+学校 IDS 页面只存在于浏览器中。Hermes 不解析学校表单、不接触 IDS 密码、不复制 IDS
+Cookie；WebDriver、未来的内嵌 WebView 或系统浏览器适配器都必须只向认证核心交付
+`CasCallbackCredential`。学校差异因此被限制在网页本身和 UI 适配器，不进入 aTrust
+协议状态机。
 
 ## 尚未闭环
 
-当前已经完成“学校登录到 aTrust 回调”的闭环，尚未完成：
+当前代码已经串起“学校网页登录、完整 aTrust 多步人工认证、最终 portal 进入后收割
+portal ticket”的实验路径，尚未完成：
 
-1. 确认回调 ticket 的后续消费方式以及浏览器 Cookie 是否必须转交 HTTP transport；
-2. 执行回调后的 aTrust 会话建立；
+1. 在 Xidian 确认最终 portal URL 与 ticket 字段，以及浏览器 Cookie 是否已足以继续
+   `reportEnv`/`authCheck`；
+2. 评估是否仍需客户端重放 service ticket，以及该重放是否会与 aTrust 二步页面冲突；
 3. 实现 `authCheck` 和服务端要求的后续认证状态机；
 4. 获取并严格解析 `clientResource`；
 5. 建模 SID、DeviceID、ConnectionID 和 SignKey 生命周期；
 6. 选择资源与节点并建立最小 TCP 隧道；
 7. 通过 VPN 隧道访问受控目标并校验实际响应。
 
-因此当前结论是：Xidian IDS 和 aTrust CAS 认证对端响应正常，认证控制面到 ticket
-回调已验证；aTrust 已认证会话和 VPN 数据面仍未验证。
+### 2026-07-26：独立 Chrome 最终进入收割实测
+
+使用独立 Chrome 进程（`user-data-dir=/tmp/hermes-chrome-profile`，与日常浏览器隔离）
+和匹配的 ChromeDriver 150 完成一次人工联调：
+
+1. `authConfig` / `cas-start` 正常；
+2. 浏览器完整完成 IDS 与 aTrust 二步验证页面；
+3. 程序仅在最终 `/portal/shortcut.html` 进入时收割，并记录
+   `probe.cas_completion_harvested portal_ticket_received=true`；
+4. 日志未出现账号、密码、ticket 值或完整回调 URL。
+
+因此“最终进入后再收割 portal ticket”已在 Xidian 真实路径验证。aTrust 已认证会话
+（`reportEnv` / `authCheck` / SID）和 VPN 数据面仍未验证。
 
 ## 下一阶段任务
 
@@ -107,9 +131,9 @@ aTrust authConfig
 
 1. 获取一次授权且脱敏的回调后网络记录，只保留方法、路径、状态码、字段名和 Cookie
    名，删除所有值、Header 和正文；
-2. 确认 CAS service ticket 是由浏览器访问回调消费，还是由客户端提交到其它端点；
-3. 为浏览器 Cookie 与 `ReqwestTransport` 设计最小、可审计的会话交接，若协议无需
-   Cookie 则不增加导入导出能力；
+2. 验证当前“浏览器阻止回调、`ReqwestTransport` 唯一消费”的路径；若缺少前置 aTrust
+   Cookie 才设计限定网关来源和 Cookie 名称的最小交接，禁止导入学校 IDS Cookie；
+3. 确认 portal ticket、`reportEnv` 和后续 `authCheck` 的实际字段与顺序；
 4. 实现 ticket 后的认证状态机，并把“需要人工验证码”建模为显式暂停状态，由 UI
    提交用户输入后继续，禁止后台自动重试；
 5. 为每个新端点补充脱敏 golden fixture、本地模拟测试和显式启用的 ignored live

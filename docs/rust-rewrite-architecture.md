@@ -83,7 +83,7 @@ cargo test --workspace
 
 ```text
 authConfig                              [已完成]
-→ 一条明确选择的登录流程和 ticket 回调 [已完成 CAS 路径]
+→ 一条明确选择的登录流程和最终进入后收割 [已完成 CAS/多步等待；会话待实测]
 → authCheck/必要二次认证                [下一步]
 → clientResource                       [未开始]
 → 严格资源解析                          [未开始]
@@ -137,8 +137,9 @@ cargo run -p atrust-probe -- \
 ### 认证控制面
 
 - Cookie jar 的显式导入、导出、过期和持久化模型；
-- CAS 回调后 ticket 的消费方式及浏览器/HTTP transport 会话连续性；
-- 回调参数与选中登录域的绑定，以及重复 `ticket`/`sfDomain` 参数拒绝；
+- 浏览器登录等待最终 portal 进入后再收割 portal ticket，避免在 aTrust 二步验证前提前
+  拦截；客户端侧 service-ticket 交换 API 仍保留但默认不用于 Xidian 交互路径；
+- 回调参数已绑定选中登录域并拒绝重复 `ticket`/`sfDomain`，仍需真实 fixture；
 - `authCheck` 多阶段认证状态机；
 - 将验证码、MFA 和二次认证建模为显式人工暂停状态及发送频率保护；
 - `reportEnv`、`onlineInfo` 和会话恢复；

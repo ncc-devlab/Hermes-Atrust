@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use futures_util::StreamExt as _;
 use reqwest::header::{HeaderName, HeaderValue};
+use reqwest::redirect::Policy;
 use thiserror::Error;
 use tracing::{debug, warn};
 use url::Url;
@@ -13,13 +14,27 @@ pub enum HttpMethod {
     Post,
 }
 
-/// Transport-neutral HTTP request. Headers must already be free of secrets before logging.
-#[derive(Clone, Debug)]
+/// Transport-neutral HTTP request. Its debug representation never exposes headers or body.
+#[derive(Clone)]
 pub struct HttpRequest {
     pub method: HttpMethod,
     pub url: Url,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+}
+
+impl std::fmt::Debug for HttpRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HttpRequest")
+            .field("method", &self.method)
+            .field("scheme", &self.url.scheme())
+            .field("authority", &self.url.authority())
+            .field("path", &self.url.path())
+            .field("header_count", &self.headers.len())
+            .field("body_bytes", &self.body.len())
+            .finish()
+    }
 }
 
 impl HttpRequest {
@@ -33,10 +48,23 @@ impl HttpRequest {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct HttpResponse {
     pub status: u16,
+    /// Redirect target retained because aTrust CAS carries a portal ticket in `Location`.
+    pub location: Option<String>,
     pub body: Vec<u8>,
+}
+
+impl std::fmt::Debug for HttpResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HttpResponse")
+            .field("status", &self.status)
+            .field("location_present", &self.location.is_some())
+            .field("body_bytes", &self.body.len())
+            .finish()
+    }
 }
 
 impl HttpResponse {
@@ -97,6 +125,7 @@ impl ReqwestTransport {
 
         let client = reqwest::Client::builder()
             .cookie_store(true)
+            .redirect(Policy::none())
             .timeout(config.timeout)
             .danger_accept_invalid_certs(dangerous_tls)
             .build()
@@ -133,6 +162,12 @@ impl HttpTransport for ReqwestTransport {
 
         let response = builder.send().await.map_err(HttpTransportError::Request)?;
         let status = response.status().as_u16();
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .map(|value| value.to_str().map(str::to_owned))
+            .transpose()
+            .map_err(HttpTransportError::InvalidResponseHeader)?;
         if response
             .content_length()
             .is_some_and(|length| length > self.max_response_body as u64)
@@ -162,7 +197,11 @@ impl HttpTransport for ReqwestTransport {
             elapsed_ms = started.elapsed().as_millis(),
             response_bytes = body.len()
         );
-        Ok(HttpResponse { status, body })
+        Ok(HttpResponse {
+            status,
+            location,
+            body,
+        })
     }
 }
 
@@ -176,6 +215,8 @@ pub enum HttpTransportError {
     InvalidHeaderName(#[source] reqwest::header::InvalidHeaderName),
     #[error("invalid HTTP header value: {0}")]
     InvalidHeaderValue(#[source] reqwest::header::InvalidHeaderValue),
+    #[error("invalid HTTP response header value: {0}")]
+    InvalidResponseHeader(#[source] reqwest::header::ToStrError),
     #[error("HTTP request failed: {0}")]
     Request(#[source] reqwest::Error),
     #[error("HTTP response exceeds the configured {limit} byte limit")]
@@ -186,6 +227,9 @@ pub enum HttpTransportError {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+
     use super::*;
 
     #[test]
@@ -206,5 +250,62 @@ mod tests {
             ReqwestTransport::new(&config),
             Err(HttpTransportError::InvalidConfiguration(_))
         ));
+    }
+
+    #[test]
+    fn request_and_response_debug_are_redacted() {
+        let mut request =
+            HttpRequest::get(Url::parse("https://example.test/path?ticket=secret").unwrap());
+        request
+            .headers
+            .push(("x-csrf-token".to_owned(), "csrf-secret".to_owned()));
+        request.body = b"password-secret".to_vec();
+        let response = HttpResponse {
+            status: 302,
+            location: Some("https://example.test/?data=portal-secret".to_owned()),
+            body: b"response-secret".to_vec(),
+        };
+
+        let debug = format!("{request:?} {response:?}");
+        for secret in [
+            "secret",
+            "csrf-secret",
+            "password-secret",
+            "portal-secret",
+            "response-secret",
+        ] {
+            assert!(!debug.contains(secret));
+        }
+    }
+
+    #[tokio::test]
+    async fn redirects_are_returned_without_being_followed() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut connection, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = connection.read(&mut request).unwrap();
+            connection
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: https://example.test/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let transport = ReqwestTransport::new(&ReqwestTransportConfig::default()).unwrap();
+
+        let response = transport
+            .execute(HttpRequest::get(
+                Url::parse(&format!("http://{address}/start")).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(response.status, 302);
+        assert_eq!(
+            response.location.as_deref(),
+            Some("https://example.test/next")
+        );
     }
 }
