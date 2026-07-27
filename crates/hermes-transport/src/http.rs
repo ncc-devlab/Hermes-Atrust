@@ -120,6 +120,11 @@ pub trait HttpTransport: Send + Sync {
     fn gateway_cookie_names(&self, _origin: &Url) -> Vec<String> {
         Vec::new()
     }
+
+    /// Returns a single cookie value previously imported for `origin` (never log the result).
+    fn gateway_cookie_value(&self, _origin: &Url, _name: &str) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -148,13 +153,30 @@ impl Default for ReqwestTransportConfig {
     }
 }
 
-#[derive(Debug)]
 pub struct ReqwestTransport {
     client: reqwest::Client,
     jar: Arc<Jar>,
     max_response_body: usize,
-    /// Cookie names observed via trusted gateway import only (values never stored here).
+    /// Cookie names observed via trusted gateway import only.
     imported_cookie_names: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    /// Cookie values from trusted imports only; used for SID export. Never log values.
+    imported_cookie_values: Arc<Mutex<HashMap<String, HashMap<String, String>>>>,
+}
+
+impl std::fmt::Debug for ReqwestTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name_hosts = self
+            .imported_cookie_names
+            .lock()
+            .map(|map| map.len())
+            .unwrap_or(0);
+        formatter
+            .debug_struct("ReqwestTransport")
+            .field("max_response_body", &self.max_response_body)
+            .field("imported_cookie_host_count", &name_hosts)
+            .field("cookie_values", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
 }
 
 impl ReqwestTransport {
@@ -184,6 +206,7 @@ impl ReqwestTransport {
             jar,
             max_response_body: config.max_response_body,
             imported_cookie_names: Arc::new(Mutex::new(HashMap::new())),
+            imported_cookie_values: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 }
@@ -314,13 +337,19 @@ impl HttpTransport for ReqwestTransport {
         names.sort();
         names.dedup();
         if let Ok(mut map) = self.imported_cookie_names.lock() {
-            map.entry(host_key)
+            map.entry(host_key.clone())
                 .and_modify(|existing| {
                     existing.extend(names.iter().cloned());
                     existing.sort();
                     existing.dedup();
                 })
                 .or_insert(names.clone());
+        }
+        if let Ok(mut map) = self.imported_cookie_values.lock() {
+            let entry = map.entry(host_key).or_default();
+            for cookie in cookies {
+                entry.insert(cookie.name.to_ascii_lowercase(), cookie.value.clone());
+            }
         }
         debug!(
             event = "transport.cookie_import",
@@ -344,6 +373,14 @@ impl HttpTransport for ReqwestTransport {
                     .unwrap_or_default()
             })
             .unwrap_or_default()
+    }
+
+    fn gateway_cookie_value(&self, origin: &Url, name: &str) -> Option<String> {
+        let host = origin.host_str()?;
+        let map = self.imported_cookie_values.lock().ok()?;
+        map.get(&host.to_ascii_lowercase())?
+            .get(&name.to_ascii_lowercase())
+            .cloned()
     }
 }
 
@@ -555,5 +592,23 @@ mod tests {
         let mut names = transport.gateway_cookie_names(&origin);
         names.sort();
         assert_eq!(names, vec!["lang".to_owned(), "sid".to_owned()]);
+    }
+
+    #[test]
+    fn exports_imported_cookie_value_by_name_without_logging_it() {
+        let transport = ReqwestTransport::new(&ReqwestTransportConfig::default()).unwrap();
+        let origin = Url::parse("https://atrust.example.edu/").unwrap();
+        transport
+            .import_gateway_cookies(
+                &origin,
+                &[sample_cookie("sid", "session-secret-value", None)],
+            )
+            .unwrap();
+        assert_eq!(
+            transport.gateway_cookie_value(&origin, "SID").as_deref(),
+            Some("session-secret-value")
+        );
+        assert_eq!(transport.gateway_cookie_value(&origin, "missing"), None);
+        assert!(!format!("{transport:?}").contains("session-secret-value"));
     }
 }

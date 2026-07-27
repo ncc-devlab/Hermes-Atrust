@@ -79,8 +79,24 @@ casLogin
 | `onlineInfo` | 成功（`username_present=true`，用户名不入库） |
 | 会话事件 | `probe.session_established sid_present=true` |
 
-**结论：** 控制面已验证到「浏览器完整完成 IDS + aTrust SMS 后的 Cookie 会话 +
-`onlineInfo`」。VPN 数据面（TCP/L3/TUN/DNS/路由）仍未验证。
+### 会话后 clientResource / 节点（2026-07-26 再次实测）
+
+同一 `cas-login` 进程在关窗收割后继续：
+
+| 观察项 | 结果 |
+| --- | --- |
+| `ip_resource_count` | **1361** |
+| `domain_resource_count` | **523** |
+| `node_group_count` | **1**（`major` 存在） |
+| `resolved_endpoint_count` | **2**（`primary_node_count=1`） |
+| `sdpc_placeholder_count` | 0（西电节点为显式地址，非 `{{sdpcHost}}`） |
+| DNS option | 主/备均未出现在解析结果中 |
+| 浏览器侧路径 | `phoneNumber` → `auth/sms` → `onlineInfo` → **`clientResource`** |
+
+**结论：** 控制面已验证到「Cookie 会话 + onlineInfo + clientResource 严格解析 +
+节点地址解析」。`SessionMaterial` 可从 Cookie `sid` 导出（代码路径就绪；需下一轮
+`cas-login` 确认 `probe.session_material`）。TLS `node-probe` 与 TCP 帧 codec 已落地，
+**尚未**对西电节点发 init 或建隧道。
 
 ### 已证伪或应避免的策略
 
@@ -113,8 +129,8 @@ casLogin
 | 组件 | 能力 |
 | --- | --- |
 | `hermes-transport` | 无自动重定向、脱敏 Debug、网关 Cookie 受限导入 |
-| `atrust-auth` | authConfig、密码主认证、CAS challenge、portal ticket 解析、reportEnv/authCheck/onlineInfo、会话进度模型 |
-| `atrust-probe` | auth-config / password / cas-start / cas-login；Chrome/Firefox；人工关窗收割 |
+| `atrust-auth` | authConfig、密码主认证、CAS challenge、portal ticket 解析、reportEnv/authCheck/onlineInfo、clientResource 严格解析、会话进度模型 |
+| `atrust-probe` | auth-config / password / cas-start / cas-login（成功后同进程 clientResource）/ client-resource；Chrome/Firefox；人工关窗收割 |
 
 ### cas-login 行为（协作约定）
 
@@ -123,7 +139,8 @@ casLogin
 3. 中间 CAS / 首次 portal / MFA 页面全部放行；
 4. **用户手动关闭 probe 浏览器后**再导入网关 Cookie；
 5. 刷新 `authConfig`，优先 `onlineInfo` 确认会话；
-6. portal ticket / `reportEnv` 仅作可选回退，Xidian 实测路径以 Cookie 会话为准。
+6. portal ticket / `reportEnv` 仅作可选回退，Xidian 实测路径以 Cookie 会话为准；
+7. 会话建立成功后同进程调用 `clientResource`，只记录资源/节点计数（无隧道）。
 
 ### 推荐联调命令
 
@@ -147,20 +164,20 @@ cargo run -p atrust-probe -- \
 
 ## 尚未闭环
 
-1. 将 `clientResource` 从「浏览器侧观察到调用」推进到 Hermes 内严格解析；
+1. ~~`clientResource` 客户端请求与严格解析~~（已实现；待西电 Cookie 会话后实测计数）
 2. SID / DeviceID / ConnectionID / SignKey 的完整生命周期与持久化；
 3. 节点发现、TCP/L3 隧道、代理与 TUN；
 4. 将 SMS/MFA 建模为可恢复的 `SessionProgress::InteractionRequired` 产品状态机
    （当前 Xidian 路径把 MFA 全部留在浏览器内完成）；
 5. 脱敏 golden fixture 与更多 ignored live tests；
-6. Cookie 导入后的 jar 可观测性（当前依赖 onlineInfo 等业务结果反证）。
+6. 会话 Cookie 跨进程持久化（当前 jar 仅进程内；`cas-login` 成功后同进程会尝试 `clientResource`）。
 
 ## 下一阶段任务（建议顺序）
 
-1. 实现最小 `clientResource` 请求与 envelope/资源字段校验；
-2. 从资源结果中抽取节点与策略，仍不建立隧道；
-3. 单一 TCP 资源握手 + 受控目标响应；
-4. 再考虑 L3 / TUN / DNS。
+1. 西电 `cas-login` 后确认 `probe.client_resource` / `probe.nodes_summary` 非空；
+2. ~~节点地址解析 / `{{sdpcHost}}` 替换~~（已实现，默认端口 441，无拨号探测）；
+3. 定位 SID / SignKey 来源并落地 `SessionMaterial`（见 `tunnel-plan.md` Phase A）；
+4. 节点 TLS 冒烟 → 最小 TCP 隧道 → 再考虑 L3 / TUN / DNS。
 
 ## 测试门禁
 
@@ -175,7 +192,8 @@ cargo test --workspace
 - `reportEnv` / `authCheck` / `onlineInfo` / `establish_session_from_portal` mock；
 - 网关 Cookie 受限导入与名称可观测（不暴露值）；
 - `AuthStep` 边界与 `BusinessEnvelope` 脱敏解析；
-- 首次 portal 不收割 portal ticket 的策略。
+- 首次 portal 不收割 portal ticket 的策略；
+- `clientResource` 请求体 golden 与 IP/CIDR/域名/节点组/DNS 严格解析。
 
 真实 Xidian 登录只能由人工显式启动，不进入默认测试、CI 或自动重试任务。
 `.env` 仅保留主机/域/WebDriver 等非密钥设置；不需要也不应存放账号密码。

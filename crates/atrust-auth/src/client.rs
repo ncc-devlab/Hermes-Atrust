@@ -18,6 +18,7 @@ use crate::password::{
     PasswordAuthOutcome, PasswordCredentials, PasswordEnvelope, PasswordError, PasswordRequest,
 };
 use crate::profile::AuthProtocolProfile;
+use crate::resource::{ClientResourceRequest, ClientResources, ResourceError};
 use crate::session::{
     AuthStep, AuthStepData, BusinessEnvelope, OnlineInfoData, ReportEnvRequest, SessionProgress,
 };
@@ -309,6 +310,42 @@ impl AuthClient {
         Ok(envelope.data.username)
     }
 
+    /// Fetches and strictly parses control-plane resources. Does not open tunnels.
+    pub async fn client_resource(
+        &self,
+        configuration: &AuthConfiguration,
+    ) -> Result<ClientResources, AuthError> {
+        let mut url = self.endpoint_url("/controller/v1/user/clientResource")?;
+        self.append_shared_query(&mut url);
+        let body = ClientResourceRequest::default_request().to_bytes()?;
+        let mut request = HttpRequest {
+            method: HttpMethod::Post,
+            url,
+            headers: Vec::new(),
+            body,
+        };
+        self.append_auth_headers(&mut request, configuration, false);
+        debug!(
+            event = "atrust.client_resource.request",
+            host = self.endpoint.host()
+        );
+        let response = self.transport.execute(request).await?;
+        if !response.is_success() {
+            return Err(AuthError::UnexpectedStatus(response.status));
+        }
+        let resources = ClientResources::parse_bytes(&response.body)?;
+        debug!(
+            event = "atrust.client_resource.complete",
+            host = self.endpoint.host(),
+            ip_resource_count = resources.ip_resources.len(),
+            domain_resource_count = resources.domain_resources.len(),
+            node_group_count = resources.node_groups.len(),
+            major_node_group_present = resources.major_node_group_id.is_some(),
+            dns_primary_present = resources.dns.primary.is_some()
+        );
+        Ok(resources)
+    }
+
     /// Performs exactly one primary password attempt and never retries credentials or captchas.
     pub async fn authenticate_password(
         &self,
@@ -524,6 +561,8 @@ pub enum AuthError {
     InvalidSessionResponse(#[source] serde_json::Error),
     #[error("aTrust onlineInfo did not return a username")]
     MissingOnlineUsername,
+    #[error("failed to parse clientResource: {0}")]
+    Resource(#[from] ResourceError),
 }
 
 #[cfg(test)]
@@ -968,6 +1007,49 @@ mod tests {
             }
             SessionProgress::Established { .. } => panic!("expected SMS interaction"),
         }
+    }
+
+    #[tokio::test]
+    async fn client_resource_posts_expected_body_and_parses_summary() {
+        let body = r#"{
+            "code":0,
+            "data":{
+                "appList":{"data":{"appInfo":[{"apps":[{
+                    "id":"app-1","nodeGroupId":"ng-1",
+                    "addressList":[{"protocol":"tcp","port":"443","host":"10.0.0.1"}]
+                }]}],
+                "config":{"nodeGroupConf":{"majorNodeGroup":{"id":"ng-1"},"nodeGroupList":[
+                    {"id":"ng-1","addressInfo":[{"address":"10.9.0.1:441","type":"ip"}]}
+                ]}}}},
+                "sdpPolicy":{"data":{"clientOption":{"dnsOptionV2":{"firstDNS":"10.8.8.8"}}}}
+            }
+        }"#;
+        let transport = QueueTransport::new(vec![ok_json(body)]);
+        let client = AuthClient::new(
+            GatewayEndpoint::new("atrust.example.edu", 443).unwrap(),
+            transport.clone(),
+        );
+        let resources = client
+            .client_resource(&session_configuration())
+            .await
+            .unwrap();
+        assert_eq!(resources.ip_resources.len(), 1);
+        assert_eq!(resources.node_groups.len(), 1);
+        assert_eq!(resources.dns.primary.as_deref(), Some("10.8.8.8"));
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests[0].url.path(), "/controller/v1/user/clientResource");
+        assert_eq!(requests[0].method, HttpMethod::Post);
+        assert_eq!(
+            requests[0].body,
+            br#"{"resourceType":{"sdpPolicy":{},"appList":{},"favoriteAppList":{},"featureCenter":{},"uemSpace":{"params":{"action":"login"}}}}"#
+        );
+        assert!(
+            requests[0]
+                .headers
+                .iter()
+                .any(|(name, value)| name == "x-csrf-token" && value == "csrf-session")
+        );
+        assert!(!format!("{resources:?}").contains("app-1"));
     }
 
     #[tokio::test]

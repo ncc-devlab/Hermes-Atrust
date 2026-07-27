@@ -86,6 +86,7 @@ impl WebDriverBrowser {
                     "browserName": "chrome",
                     "webSocketUrl": true,
                     "goog:chromeOptions": {
+                        "binary": "/opt/google/chrome/chrome",
                         "args": [
                             "--user-data-dir=/tmp/hermes-chrome-profile",
                             "--no-first-run",

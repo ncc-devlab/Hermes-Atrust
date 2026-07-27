@@ -1,5 +1,7 @@
 use std::fmt;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use md5::{Digest as _, Md5};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -45,12 +47,39 @@ identifier!(
     "Identifier for one client connection lifecycle."
 );
 
+impl ConnectionId {
+    /// Go-compatible form: `UPPER(MD5(deviceId)) + "-" + microsecond_unix_timestamp`.
+    pub fn from_device(device_id: &DeviceId) -> Result<Self, IdentifierError> {
+        let micros = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| IdentifierError::Clock)?
+            .as_micros();
+        Self::from_device_at(device_id, micros)
+    }
+
+    /// Deterministic variant for tests and replay of a known timestamp.
+    pub fn from_device_at(
+        device_id: &DeviceId,
+        unix_micros: u128,
+    ) -> Result<Self, IdentifierError> {
+        let digest = Md5::digest(device_id.as_str().as_bytes());
+        let mut hex = String::with_capacity(32);
+        for byte in digest {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{byte:02X}");
+        }
+        Self::new(format!("{hex}-{unix_micros}"))
+    }
+}
+
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum IdentifierError {
     #[error("identifier must not be empty")]
     Empty,
     #[error("identifier must not contain control characters")]
     ControlCharacter,
+    #[error("system clock is before the unix epoch")]
+    Clock,
 }
 
 #[cfg(test)]
@@ -71,5 +100,18 @@ mod tests {
             DeviceId::new("device\nother"),
             Err(IdentifierError::ControlCharacter)
         );
+    }
+
+    #[test]
+    fn connection_id_matches_go_shape() {
+        let device = DeviceId::new("device-abc").unwrap();
+        let connection = ConnectionId::from_device_at(&device, 1_700_000_000_000_000).unwrap();
+        let value = connection.as_str();
+        let (hash, stamp) = value.split_once('-').expect("hash-stamp");
+        assert_eq!(hash.len(), 32);
+        assert!(hash.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert!(hash.chars().all(|ch| !ch.is_ascii_lowercase()));
+        assert_eq!(stamp, "1700000000000000");
+        assert!(!format!("{connection:?}").contains(hash));
     }
 }

@@ -86,11 +86,15 @@ authConfig                              [已完成]
 → 浏览器完成 IDS + aTrust 多步 MFA      [Xidian 已实测]
 → 人工关窗后收割网关 Cookie 会话        [Xidian 已实测]
 → onlineInfo 会话确认                   [Xidian 已实测]
-→ clientResource                       [浏览器已观察到调用；客户端解析下一步]
-→ 严格资源解析                          [未开始]
+→ clientResource                       [Xidian 实测：1361 IP / 523 域名 / 1 节点组]
+→ 节点地址解析（无探测）               [Xidian 实测：2 endpoints，major 存在]
+→ SessionMaterial（Cookie SID + 客户端材料） [已实现；SignKey 仍 provisional]
+→ node-probe TLS-only                      [已实现；不发 init]
+→ TCP 帧 codec                             [已实现；无 DialTCP 状态机]
 ```
 
-此里程碑不连接节点、不建立 TCP/L3 隧道，也不接管系统 DNS 或路由。
+控制面里程碑已越过资源/节点；数据面仅允许 TLS 冒烟与 codec 单测，禁止默认拨号。
+隧道分阶段规划见 [`tunnel-plan.md`](tunnel-plan.md)。
 
 学校差异（IDS 表单、滑块、SMS UI）只存在于浏览器/UI 适配层。协议层只接受：
 
@@ -147,7 +151,7 @@ cargo run -p atrust-probe -- \
 - 回调参数绑定与严格校验已有单元测试，仍需脱敏 golden fixture；
 - 产品级 `authCheck`/SMS 状态机（Xidian 当前把 MFA 全部留在浏览器内完成）；
 - `reportEnv`/`onlineInfo` API 已实现；会话恢复与多设备策略未做；
-- `clientResource` 客户端请求与严格 envelope/资源解析；
+- `clientResource` 请求与 IP/域名/节点组/DNS 严格解析已实现；隧道未建；
 - 设备查询、授信和取消授信；
 - SID、DeviceID、ConnectionID、SignKey 的完整生命周期。
 
