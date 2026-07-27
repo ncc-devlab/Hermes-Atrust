@@ -83,18 +83,18 @@ cargo test --workspace
 
 ```text
 authConfig                              [已完成]
-→ 浏览器完成 IDS + aTrust 多步 MFA      [Xidian 已实测]
-→ 人工关窗后收割网关 Cookie 会话        [Xidian 已实测]
-→ onlineInfo 会话确认                   [Xidian 已实测]
-→ clientResource                       [Xidian 实测：1361 IP / 523 域名 / 1 节点组]
-→ 节点地址解析（无探测）               [Xidian 实测：2 endpoints，major 存在]
-→ SessionMaterial（Cookie SID + 客户端材料） [已实现；SignKey 仍 provisional]
-→ node-probe TLS-only                      [已实现；不发 init]
-→ TCP 帧 codec                             [已实现；无 DialTCP 状态机]
+→ 浏览器完成 IDS + aTrust 多步 MFA      [Xidian 2026-07-27 完整实测]
+→ 人工关窗后收割网关 Cookie 会话        [10 cookies；portal_hits=2]
+→ onlineInfo 会话确认                   [~27ms；LoggedIn]
+→ SessionMaterial                       [sid/device/conn/sign_key/user present；SignKey provisional]
+→ clientResource                        [200；~1.3MB/12.5s；1361 IP / 523 域名 / 1 节点组]
+→ 节点地址解析（无探测）               [2 endpoints，major 存在]
+→ node-probe TLS-only                   [代码就绪；西电节点尚未 live]
+→ TCP 帧 codec                          [已实现；无 DialTCP 状态机]
 ```
 
-控制面里程碑已越过资源/节点；数据面仅允许 TLS 冒烟与 codec 单测，禁止默认拨号。
-隧道分阶段规划见 [`tunnel-plan.md`](tunnel-plan.md)。
+**控制面里程碑已闭环（2026-07-27）。** 数据面仅允许 TLS 冒烟与 codec 单测，禁止默认拨号。
+下一优先：`node-probe` 对西电节点 live。隧道分阶段规划见 [`tunnel-plan.md`](tunnel-plan.md)。
 
 学校差异（IDS 表单、滑块、SMS UI）只存在于浏览器/UI 适配层。协议层只接受：
 
@@ -139,7 +139,17 @@ cargo run -p atrust-probe -- \
 - `onlineInfo` 在导入网关 Cookie 后成功；`clientResource` 已在浏览器侧观察到调用；
 - 首次 CAS/portal 不得提前收割；portal ticket 被浏览器消费后不可再 `reportEnv`。
 
-详细证据、人工认证约束和下一阶段任务见
+### 2026-07-27：控制面闭环（完整 cas-login）
+
+人工完成 IDS + SMS 后关窗，同进程：
+
+- WebDriver：每次新 Chrome profile，避免 SingletonLock → 500；
+- 收割 10 个网关 Cookie；`authConfig` → `LoggedIn`；`onlineInfo` 成功；
+- `probe.session_material` 全字段 present（`sign_key_provisional=true`）；
+- `clientResource` **200**，约 1.3MB / 12.5s → 1361 IP / 523 域名 / 1 组 2 节点；
+- 此前 `clientResource` “超时”在完整会话下未复现。
+
+详细证据与下一阶段任务见
 [`xidian-atrust-integration.md`](xidian-atrust-integration.md)。
 
 ## 未完成部分
@@ -150,17 +160,16 @@ cargo run -p atrust-probe -- \
 - 网关 Cookie 受限导入已实现；需补充导入后的 jar 可观测与隔离测试；
 - 回调参数绑定与严格校验已有单元测试，仍需脱敏 golden fixture；
 - 产品级 `authCheck`/SMS 状态机（Xidian 当前把 MFA 全部留在浏览器内完成）；
-- `reportEnv`/`onlineInfo` API 已实现；会话恢复与多设备策略未做；
-- `clientResource` 请求与 IP/域名/节点组/DNS 严格解析已实现；隧道未建；
+- `reportEnv`/`onlineInfo`/ `clientResource` API 与西电实测已完成；隧道未建；
 - 设备查询、授信和取消授信；
-- SID、DeviceID、ConnectionID、SignKey 的完整生命周期。
+- SID ↔ 隧道 init 对照、SignKey 服务端绑定、材料跨进程持久化。
 
 ### 资源和节点
 
-- IP/CIDR/范围、端口范围、协议和域名资源的严格解析；
+- ~~IP/CIDR/范围、端口范围、协议和域名资源的严格解析~~（已实现并西电实测）；
 - 确定性的资源冲突优先级和无匹配拒绝策略；
-- DNS 配置、major node group 和节点地址解析；
-- 节点 TCP/TLS 探测、评分、健康缓存和周期更新；
+- ~~DNS 配置、major node group 和节点地址解析~~（解析已实现；西电 DNS option 为空）；
+- 节点 TCP/TLS **live 探测**、评分、健康缓存和周期更新（TLS 冒烟代码就绪）；
 - IPv6 节点地址及服务端资源能力判定。
 
 ### 底层传输

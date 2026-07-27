@@ -131,6 +131,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrust-tcp"
+version = "0.1.0"
+dependencies = [
+ "atrust-protocol",
+ "hermes-model",
+ "hermes-transport",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

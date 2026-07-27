@@ -7,12 +7,12 @@
 
 | 材料 | 状态 | 说明 |
 | --- | --- | --- |
-| 网关 Cookie 会话 | 已实测（Xidian） | 浏览器关窗后收割 |
-| `onlineInfo` | 已实现 | 确认登录态 |
-| `clientResource` | 已实现 | IP/域名/节点组/DNS 严格解析 |
-| 节点地址解析 | 已实现 | `{{sdpcHost}}` → 网关 host，默认端口 `441` |
-| 节点可达性探测 | 未做 | TCP connect / 时延选优（对照 Go `getBestNodes`） |
-| SID | **已导出（Cookie）** | 优先 `sid`，回退 `sid-legacy`；`SessionMaterial` 持有 `SessionId` |
+| 网关 Cookie 会话 | **已实测（Xidian 2026-07-27）** | 浏览器关窗后收割 10 cookies |
+| `onlineInfo` | **已实测** | ~27ms，`username_present=true` |
+| `clientResource` | **已实测** | 200，~1.3MB / 12.5s；1361 IP / 523 域名 |
+| 节点地址解析 | **已实测** | 1 major 组、2 endpoints、0 sdpc placeholder |
+| 节点可达性探测 | 代码有 TLS 冒烟；**西电未 live** | TCP connect / 时延选优（对照 Go `getBestNodes`） |
+| SID | **已导出并实测** | Cookie `sid` + `sid.sig`；是否即 init SID 仍待对照 |
 | DeviceID | 已生成 | 客户端随机；持久化与 `reportEnv` 对齐仍待做 |
 | ConnectionID | 已生成 | `UPPER(MD5(deviceId)) + "-" + unix_micros` |
 | SignKey | **临时客户端随机** | `SignKey` 32 字节随机，`sign_key_provisional=true`；服务端注册未确认 |
@@ -64,12 +64,12 @@ TLS 到节点
 
 实现约束：
 
-1. 新 crate 仅在有真实代码时创建（建议 `atrust-tcp` 或先放 `atrust-protocol` codec + 薄 client）。
+1. ~~新 crate~~ **已落地 `atrust-tcp`**：`dial_tcp` / `complete_handshake` / `TcpTunnel`（AsyncRead+Write 帧）。
 2. JSON 必须用 `atrust_protocol::to_wire_json` 固定字段顺序；签名用
    `calculate_request_signature`（HMAC-SHA256 大写 hex）。
 3. **禁止** `fmt::sprintf` 拼签名 JSON（Go 现网有此模式，Rust 重写必须强类型）。
 4. 首个联调目标：校内已知 HTTP 端口或用户指定 `host:port`，只验证读写回环。
-5. 超时、取消、半关闭、short-write 全覆盖单测 + 本地 mock 节点。
+5. 超时、取消、半关闭、short-write：本地 mock duplex 握手 + 应用帧回环已单测；live 仍 ignored。
 
 ### Phase D — L3（延后）
 
@@ -87,10 +87,10 @@ EasyConnect 不在本规划内。
 ```text
 atrust-auth          会话、clientResource、节点解析（无拨号）
 atrust-protocol      帧编解码、签名、wire DTO
-hermes-transport     HTTP + 未来 TcpTlsConnector 抽象
-atrust-tcp（未来）   DialTCP 状态机
+hermes-transport     HTTP + `connect_tls` / `NodeTlsStream`
+atrust-tcp           DialTCP 状态机 + 帧化 TcpTunnel（无默认 live）
 atrust-l3（更后）    L3 总连接与数据帧
-atrust-probe         人工诊断子命令：auth / cas-login / client-resource / node-probe / tcp-dial
+atrust-probe         人工诊断子命令：auth / cas-login / client-resource / node-probe /（tcp-dial 待加）
 ```
 
 ## 测试门禁（按阶段加）
@@ -115,9 +115,13 @@ atrust-probe         人工诊断子命令：auth / cas-login / client-resource 
 ## 近期执行清单
 
 1. ~~西电人工 `cas-login`，确认 `probe.client_resource` + `probe.nodes_summary` 非零。~~
-   **已完成（2026-07-26）：** 1361 IP / 523 域名 / 1 组 2 节点。
+   **已完成（2026-07-27 完整复测）：** 1361 IP / 523 域名 / 1 组 2 节点；
+   `clientResource` body ~1.3MB / 12.5s；`probe.session_material` 全字段 present（SignKey provisional）。
 2. ~~从网关 Cookie 导出 SID + 落地 `SessionMaterial`（含 DeviceID / ConnectionID / 临时 SignKey）。~~
 3. ~~`node-probe` TLS-only 冒烟（`probe_node_tls` + CLI，默认 Verify；支持 `--address`）。~~
-4. ~~TCP init / target / app 帧 codec（`atrust-protocol`；无拨号状态机）。~~
-5. mock TLS 对端 + TCP 握手状态机；SignKey 服务端策略确认。
-6. 单一目标 `tcp-dial` live（ignored）。
+4. ~~TCP init / target / app 帧 codec（`atrust-protocol`）。~~
+5. ~~TCP 握手状态机 + 应用帧 I/O（`atrust-tcp`，mock duplex 单测）。~~
+6. **下一步：** 西电 `node-probe --primary` live（TLS only，不发 init）。
+7. Cookie SID ↔ init JSON SID 抓包对照；SignKey 服务端策略确认。
+8. 可选：gitignored 会话持久化，支撑跨进程 node-probe / tcp-dial。
+9. 单一目标 `tcp-dial` live（ignored；需 CLI 接线）。

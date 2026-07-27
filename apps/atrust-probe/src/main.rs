@@ -1,7 +1,7 @@
 use std::env;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-
 use std::time::Duration;
 
 use atrust_auth::{
@@ -37,6 +37,15 @@ struct Cli {
     insecure_tls: bool,
     #[arg(long)]
     json_logs: bool,
+    /// Append probe logs to this file (also still printed to stderr).
+    #[arg(long)]
+    log_file: Option<PathBuf>,
+    /// Whole-request HTTP timeout in seconds for gateway API calls.
+    #[arg(long, default_value_t = 120)]
+    http_timeout_seconds: u64,
+    /// Maximum response body size for gateway API calls (bytes).
+    #[arg(long, default_value_t = 32 * 1024 * 1024)]
+    max_response_body: usize,
     #[command(subcommand)]
     command: Command,
 }
@@ -109,17 +118,47 @@ async fn main() -> ExitCode {
         } else {
             LogFormat::Compact
         },
+        // Detailed by default for interactive probe; override with HERMES_LOG.
+        default_filter: "info,atrust_probe=debug,atrust_auth=debug,hermes_transport=debug"
+            .to_owned(),
+        log_file: cli.log_file.clone(),
         ..LoggerConfig::default()
     };
     if let Err(error) = hermes_logging::init(&logger) {
         eprintln!("failed to initialize logger: {error}");
         return ExitCode::FAILURE;
     }
+    info!(
+        event = "probe.logger_ready",
+        log_file = cli
+            .log_file
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+        http_timeout_seconds = cli.http_timeout_seconds,
+        max_response_body = cli.max_response_body
+    );
 
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            error!(event = "probe.failed", error = %error);
+            error!(
+                event = "probe.failed",
+                error = %error,
+                error_debug = ?error
+            );
+            let mut source = error.source();
+            let mut depth = 0u32;
+            while let Some(cause) = source {
+                error!(
+                    event = "probe.failed_cause",
+                    depth,
+                    cause = %cause,
+                    cause_debug = ?cause
+                );
+                source = cause.source();
+                depth += 1;
+            }
             ExitCode::FAILURE
         }
     }
@@ -132,10 +171,18 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         TlsPolicy::Verify
     };
+    let http_timeout = Duration::from_secs(cli.http_timeout_seconds.max(1));
+    let max_response_body = cli.max_response_body.max(1);
     let transport = Arc::new(ReqwestTransport::new(&ReqwestTransportConfig {
         tls_policy,
-        ..ReqwestTransportConfig::default()
+        timeout: http_timeout,
+        max_response_body,
     })?);
+    info!(
+        event = "probe.transport_ready",
+        timeout_ms = http_timeout.as_millis(),
+        max_response_body
+    );
     let client = AuthClient::new(endpoint.clone(), transport.clone());
 
     match cli.command {
@@ -365,7 +412,25 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     match client.client_resource(&configuration).await {
                         Ok(resources) => log_client_resources(&endpoint, &resources),
-                        Err(error) => warn!(event = "probe.client_resource_failed", error = %error),
+                        Err(error) => {
+                            warn!(
+                                event = "probe.client_resource_failed",
+                                error = %error,
+                                error_debug = ?error
+                            );
+                            let mut source = std::error::Error::source(&error);
+                            let mut depth = 0u32;
+                            while let Some(cause) = source {
+                                warn!(
+                                    event = "probe.client_resource_failed_cause",
+                                    depth,
+                                    cause = %cause,
+                                    cause_debug = ?cause
+                                );
+                                source = cause.source();
+                                depth += 1;
+                            }
+                        }
                     }
                 }
                 SessionProgress::InteractionRequired { service, auth_id } => info!(
@@ -388,7 +453,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             info!(
                 event = "probe.pre_resource_auth_config",
                 login_state = ?configuration.login_state,
-                csrf_present = !configuration.csrf_token.is_empty()
+                csrf_present = !configuration.csrf_token.is_empty(),
+                http_timeout_seconds = cli.http_timeout_seconds,
+                max_response_body = cli.max_response_body
             );
             let resources = client.client_resource(&configuration).await?;
             log_client_resources(&endpoint, &resources);

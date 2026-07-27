@@ -46,12 +46,13 @@ service:
 https://atrust.xidian.edu.cn/passport/v1/auth/cas?sfDomain=cas42187
 ```
 
-### 完整浏览器登录与会话建立（2026-07-26，独立 Chrome）
+### 完整浏览器登录与会话建立（2026-07-26 / 2026-07-27，独立 Chrome）
 
 使用：
 
-- 独立 Chrome：`user-data-dir=/tmp/hermes-chrome-profile`（与日常浏览器隔离）；
-- 匹配的 ChromeDriver 150；
+- 独立 Chrome + **每次 session 新 profile**（`/tmp/hermes-chrome-profile-{pid}-{ts}`；
+  固定 `/tmp/hermes-chrome-profile` 会因 SingletonLock 导致 Chrome 退出、WebDriver 500）；
+- 匹配的 ChromeDriver 150；二进制自动探测（优先 `/opt/google/chrome/chrome`）；
 - `atrust-probe cas-login --browser chrome`；
 - **人工关窗后才收割**（不因首次 portal / 首次 `sid` 提前退出）。
 
@@ -69,22 +70,24 @@ casLogin
   -> Hermes 导入网关 Cookie 并校验会话
 ```
 
-关窗后客户端结果：
+关窗后客户端结果（**2026-07-27 完整跑通**）：
 
 | 观察项 | 结果 |
 | --- | --- |
 | `portal_hits` | 2 |
 | 网关 Cookie 名 | `sid`, `sid.sig`, `sid-legacy`, `sid-legacy.sig`, `straceid`, `straceid.sig`, `lang`, `language`, `sdp_limit_auth_tag`, `sdp_limit_auth_tag.sig` |
-| `authConfig` 登录态 | `LoggedIn` |
-| `onlineInfo` | 成功（`username_present=true`，用户名不入库） |
+| `authConfig` 登录态 | `LoggedIn`（`csrf_present=true`） |
+| `onlineInfo` | 成功（约 27ms，`username_present=true`，用户名不入库） |
 | 会话事件 | `probe.session_established sid_present=true` |
+| `probe.session_material` | `sid` / `device_id` / `connection_id` / `sign_key` / `username` 均 present；`sign_key_provisional=true`；`sid_cookie_name=sid`；`sid_sig_present=true` |
 
-### 会话后 clientResource / 节点（2026-07-26 再次实测）
+### 会话后 clientResource / 节点（2026-07-27 同进程实测）
 
-同一 `cas-login` 进程在关窗收割后继续：
+同一 `cas-login` 进程在关窗收割后继续（日志 `/tmp/hermes-probe.log`）：
 
 | 观察项 | 结果 |
 | --- | --- |
+| `clientResource` HTTP | **200**；headers ~78ms；body **1 325 105 B / ~12.5s**（此前“超时”实为未登录/材料不全或旧超时，非协议本身不可达） |
 | `ip_resource_count` | **1361** |
 | `domain_resource_count` | **523** |
 | `node_group_count` | **1**（`major` 存在） |
@@ -93,10 +96,15 @@ casLogin
 | DNS option | 主/备均未出现在解析结果中 |
 | 浏览器侧路径 | `phoneNumber` → `auth/sms` → `onlineInfo` → **`clientResource`** |
 
-**结论：** 控制面已验证到「Cookie 会话 + onlineInfo + clientResource 严格解析 +
-节点地址解析」。`SessionMaterial` 可从 Cookie `sid` 导出（代码路径就绪；需下一轮
-`cas-login` 确认 `probe.session_material`）。TLS `node-probe` 与 TCP 帧 codec 已落地，
-**尚未**对西电节点发 init 或建隧道。
+**里程碑结论（控制面）：** 已闭环验证
+
+```text
+authConfig → 浏览器 IDS+SMS MFA → 关窗收割 Cookie
+  → LoggedIn + onlineInfo → SessionMaterial
+  → clientResource 严格解析 → 节点表（无拨号）
+```
+
+TLS `node-probe` 与 TCP 帧 codec 已落地，**尚未**对西电节点做 TLS 连通实测、发 init 或建隧道。
 
 ### 已证伪或应避免的策略
 
@@ -162,22 +170,42 @@ cargo run -p atrust-probe -- \
 流程：在 probe Chrome 中完成 IDS + SMS → 确认 portal 业务页可用 → **关闭该窗口** →
 查看是否出现 `probe.session_established`。
 
+## 里程碑状态
+
+| 里程碑 | 状态 | 日期 / 证据 |
+| --- | --- | --- |
+| authConfig 只读 | 完成 | 2026-07-25 |
+| 浏览器 IDS + SMS 关窗收割 | 完成 | 2026-07-26 / **2026-07-27** |
+| Cookie → LoggedIn + onlineInfo | 完成 | 2026-07-27 |
+| SessionMaterial 导出 | 完成（SignKey provisional） | 2026-07-27 `probe.session_material` |
+| clientResource + 节点解析 | 完成 | 2026-07-27：1361/523/1 组 2 节点，~1.3MB/12.5s |
+| node-probe TLS 冒烟 | 代码就绪，**未对西电 live** | 见 `tunnel-plan.md` Phase B |
+| TCP Dial / init | codec 就绪，无状态机 | Phase C |
+| L3 / TUN / DNS 路由 | 未做 | Phase D |
+
 ## 尚未闭环
 
-1. ~~`clientResource` 客户端请求与严格解析~~（已实现；待西电 Cookie 会话后实测计数）
-2. SID / DeviceID / ConnectionID / SignKey 的完整生命周期与持久化；
-3. 节点发现、TCP/L3 隧道、代理与 TUN；
+1. ~~`clientResource` 客户端请求与严格解析 + 西电实测计数~~
+2. SID / DeviceID / ConnectionID / SignKey 的**服务端绑定确认**与跨进程持久化
+   （Cookie SID 与隧道 init JSON 是否同一值仍待抓包；SignKey 仍 provisional）；
+3. 节点 TLS 可达性 live、TCP/L3 隧道、代理与 TUN；
 4. 将 SMS/MFA 建模为可恢复的 `SessionProgress::InteractionRequired` 产品状态机
    （当前 Xidian 路径把 MFA 全部留在浏览器内完成）；
 5. 脱敏 golden fixture 与更多 ignored live tests；
-6. 会话 Cookie 跨进程持久化（当前 jar 仅进程内；`cas-login` 成功后同进程会尝试 `clientResource`）。
+6. 会话 Cookie 跨进程持久化（当前 jar 仅进程内；`cas-login` 成功后同进程会尝试 `clientResource`）；
+7. BiDi `browser_url_change` 噪音过大（静态资源也记入），可改为仅 document 导航。
 
 ## 下一阶段任务（建议顺序）
 
-1. 西电 `cas-login` 后确认 `probe.client_resource` / `probe.nodes_summary` 非空；
-2. ~~节点地址解析 / `{{sdpcHost}}` 替换~~（已实现，默认端口 441，无拨号探测）；
-3. 定位 SID / SignKey 来源并落地 `SessionMaterial`（见 `tunnel-plan.md` Phase A）；
-4. 节点 TLS 冒烟 → 最小 TCP 隧道 → 再考虑 L3 / TUN / DNS。
+对照 [`tunnel-plan.md`](tunnel-plan.md)：
+
+1. **Phase B live：** `node-probe --primary`（或 `--address`）对西电解析出的节点做
+   TLS-only 冒烟；记录成功/超时/证书错误，**不发** init。
+2. **Phase A 收尾：** 抓包/对照确认 Cookie `sid` ≡ 隧道 init SID；查 SignKey 注册路径；
+   可选 gitignored 会话落盘，便于跨进程 `client-resource` / `node-probe`。
+3. **Phase C：** mock TLS 对端 + TCP 握手状态机；再 `tcp-dial` 单一受控目标（ignored live）。
+4. 产品化：跨进程 session store、MFA 状态机、日志降噪（document-only URL）。
+5. Phase D（延后）：L3 / VIP / TUN / DNS。
 
 ## 测试门禁
 

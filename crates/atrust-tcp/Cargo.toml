@@ -1,0 +1,20 @@
+[package]
+name = "atrust-tcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+atrust-protocol = { path = "../atrust-protocol" }
+hermes-model = { path = "../hermes-model" }
+hermes-transport = { path = "../hermes-transport" }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

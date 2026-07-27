@@ -3,6 +3,7 @@ members = [
     "apps/atrust-probe",
     "crates/atrust-auth",
     "crates/atrust-protocol",
+    "crates/atrust-tcp",
     "crates/hermes-logging",
     "crates/hermes-model",
     "crates/hermes-transport",

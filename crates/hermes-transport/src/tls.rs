@@ -94,21 +94,52 @@ async fn probe_once(
     host: &str,
     port: u16,
     tls_policy: TlsPolicy,
-    server_name: ServerName<'static>,
+    _server_name: ServerName<'static>,
 ) -> Result<(), ProbeStepError> {
-    let addr = resolve_first(host, port)
+    let _tls = connect_tls(host, port, tls_policy)
         .await
-        .map_err(|_| ProbeStepError::Tcp)?;
-    let stream = TcpStream::connect(addr)
-        .await
-        .map_err(|_| ProbeStepError::Tcp)?;
-    let connector = TlsConnector::from(Arc::new(client_config(tls_policy)));
-    let _tls = connector
-        .connect(server_name, stream)
-        .await
-        .map_err(|_| ProbeStepError::Tls)?;
+        .map_err(|error| match error {
+            TlsConnectError::Resolve(_) | TlsConnectError::Tcp(_) => ProbeStepError::Tcp,
+            TlsConnectError::InvalidServerName | TlsConnectError::Tls(_) => ProbeStepError::Tls,
+        })?;
     // Drop immediately: smoke only, no application data.
     Ok(())
+}
+
+/// Established TLS stream to a data-plane node (no application bytes written).
+pub type NodeTlsStream = tokio_rustls::client::TlsStream<TcpStream>;
+
+/// Connects TCP + TLS to `host:port` using the same policy as node probes.
+pub async fn connect_tls(
+    host: &str,
+    port: u16,
+    tls_policy: TlsPolicy,
+) -> Result<NodeTlsStream, TlsConnectError> {
+    let server_name =
+        ServerName::try_from(host.to_owned()).map_err(|_| TlsConnectError::InvalidServerName)?;
+    let addr = resolve_first(host, port)
+        .await
+        .map_err(TlsConnectError::Resolve)?;
+    let stream = TcpStream::connect(addr)
+        .await
+        .map_err(TlsConnectError::Tcp)?;
+    let connector = TlsConnector::from(Arc::new(client_config(tls_policy)));
+    connector
+        .connect(server_name, stream)
+        .await
+        .map_err(TlsConnectError::Tls)
+}
+
+#[derive(Debug, Error)]
+pub enum TlsConnectError {
+    #[error("invalid TLS server name")]
+    InvalidServerName,
+    #[error("DNS resolve failed: {0}")]
+    Resolve(std::io::Error),
+    #[error("TCP connect failed: {0}")]
+    Tcp(std::io::Error),
+    #[error("TLS handshake failed: {0}")]
+    Tls(std::io::Error),
 }
 
 async fn resolve_first(host: &str, port: u16) -> Result<SocketAddr, std::io::Error> {

@@ -9,7 +9,7 @@ use hermes_transport::{HttpMethod, HttpRequest, HttpTransport, HttpTransportErro
 use rand::Rng as _;
 use serde::Serialize;
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::auth_config::{AuthConfigEnvelope, AuthConfigOptions, AuthConfiguration};
@@ -327,13 +327,48 @@ impl AuthClient {
         self.append_auth_headers(&mut request, configuration, false);
         debug!(
             event = "atrust.client_resource.request",
-            host = self.endpoint.host()
+            host = self.endpoint.host(),
+            request_body_bytes = request.body.len()
         );
-        let response = self.transport.execute(request).await?;
+        let response = match self.transport.execute(request).await {
+            Ok(response) => response,
+            Err(error) => {
+                warn!(
+                    event = "atrust.client_resource.transport_failed",
+                    host = self.endpoint.host(),
+                    error = %error,
+                    error_debug = ?error
+                );
+                return Err(error.into());
+            }
+        };
         if !response.is_success() {
+            warn!(
+                event = "atrust.client_resource.unexpected_status",
+                host = self.endpoint.host(),
+                status = response.status,
+                response_bytes = response.body.len()
+            );
             return Err(AuthError::UnexpectedStatus(response.status));
         }
-        let resources = ClientResources::parse_bytes(&response.body)?;
+        info!(
+            event = "atrust.client_resource.response",
+            host = self.endpoint.host(),
+            status = response.status,
+            response_bytes = response.body.len()
+        );
+        let resources = match ClientResources::parse_bytes(&response.body) {
+            Ok(resources) => resources,
+            Err(error) => {
+                warn!(
+                    event = "atrust.client_resource.parse_failed",
+                    host = self.endpoint.host(),
+                    response_bytes = response.body.len(),
+                    error = %error
+                );
+                return Err(error.into());
+            }
+        };
         debug!(
             event = "atrust.client_resource.complete",
             host = self.endpoint.host(),

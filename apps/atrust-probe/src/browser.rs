@@ -1,4 +1,5 @@
-use std::time::Duration;
+use std::path::Path;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use atrust_auth::{CasChallenge, CasExchange, parse_portal_ticket};
 use futures_util::{SinkExt as _, StreamExt as _};
@@ -8,7 +9,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::time::{Instant, sleep, timeout_at};
 use tokio_tungstenite::{connect_async, tungstenite};
-use tracing::info;
+use tracing::{info, warn};
 use url::Url;
 
 const WEBDRIVER_TIMEOUT: Duration = Duration::from_secs(20);
@@ -21,8 +22,8 @@ pub enum BrowserError {
     InvalidEndpoint(#[source] url::ParseError),
     #[error("WebDriver request failed")]
     Request(#[source] reqwest::Error),
-    #[error("WebDriver returned HTTP {0}")]
-    WebDriverStatus(StatusCode),
+    #[error("WebDriver returned HTTP {status}: {message}")]
+    WebDriverStatus { status: StatusCode, message: String },
     #[error("WebDriver returned an invalid response")]
     InvalidResponse,
     #[error("WebDriver response exceeds the configured size limit")]
@@ -81,23 +82,13 @@ impl WebDriverBrowser {
                     "webSocketUrl": true
                 }
             }),
-            BrowserKind::Chrome => json!({
-                "alwaysMatch": {
-                    "browserName": "chrome",
-                    "webSocketUrl": true,
-                    "goog:chromeOptions": {
-                        "binary": "/opt/google/chrome/chrome",
-                        "args": [
-                            "--user-data-dir=/tmp/hermes-chrome-profile",
-                            "--no-first-run",
-                            "--no-default-browser-check",
-                            "--disable-sync",
-                            "--disable-background-networking"
-                        ]
-                    }
-                }
-            }),
+            BrowserKind::Chrome => chrome_capabilities(),
         };
+        info!(
+            event = "probe.webdriver_session_create",
+            browser = ?kind,
+            endpoint = %endpoint
+        );
         let response = client
             .post(
                 endpoint
@@ -413,7 +404,9 @@ impl WebDriverBrowser {
         if response.status().is_success() || response.status() == StatusCode::NOT_FOUND {
             return Ok(());
         }
-        Err(BrowserError::WebDriverStatus(response.status()))
+        let status = response.status();
+        let message = response_error_message(response).await;
+        Err(BrowserError::WebDriverStatus { status, message })
     }
 
     async fn command(
@@ -485,10 +478,56 @@ fn portal_ticket_harvest_allowed(portal_hits: u32, sid_seen: bool) -> bool {
     portal_hits >= 2 || sid_seen
 }
 
-async fn response_value(response: reqwest::Response) -> Result<Value, BrowserError> {
-    if !response.status().is_success() {
-        return Err(BrowserError::WebDriverStatus(response.status()));
+fn chrome_capabilities() -> Value {
+    // Fresh profile each session avoids SingletonLock conflicts with a previous
+    // Chrome/Chromium instance that left /tmp/hermes-chrome-profile locked.
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let profile = format!(
+        "/tmp/hermes-chrome-profile-{}-{}",
+        std::process::id(),
+        stamp
+    );
+    let mut options = json!({
+        "args": [
+            format!("--user-data-dir={profile}"),
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-sync",
+            "--disable-background-networking",
+            "--disable-dev-shm-usage"
+        ]
+    });
+    if let Some(binary) = resolve_chrome_binary() {
+        info!(event = "probe.chrome_binary", path = %binary);
+        options["binary"] = Value::String(binary);
     }
+    json!({
+        "alwaysMatch": {
+            "browserName": "chrome",
+            "webSocketUrl": true,
+            "goog:chromeOptions": options
+        }
+    })
+}
+
+fn resolve_chrome_binary() -> Option<String> {
+    const CANDIDATES: &[&str] = &[
+        "/opt/google/chrome/chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+    ];
+    CANDIDATES
+        .iter()
+        .find(|path| Path::new(path).is_file())
+        .map(|path| (*path).to_owned())
+}
+
+async fn read_limited_body(response: reqwest::Response) -> Result<Vec<u8>, BrowserError> {
     if response
         .content_length()
         .is_some_and(|length| length > MAX_WEBDRIVER_RESPONSE as u64)
@@ -504,6 +543,39 @@ async fn response_value(response: reqwest::Response) -> Result<Value, BrowserErr
         }
         body.extend_from_slice(&chunk);
     }
+    Ok(body)
+}
+
+async fn response_error_message(response: reqwest::Response) -> String {
+    match read_limited_body(response).await {
+        Ok(body) => {
+            if let Ok(envelope) = serde_json::from_slice::<Value>(&body) {
+                if let Some(message) = envelope
+                    .pointer("/value/message")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                {
+                    return message.lines().next().unwrap_or(message).to_owned();
+                }
+            }
+            String::from_utf8_lossy(&body).chars().take(500).collect()
+        }
+        Err(_) => "unable to read WebDriver error body".to_owned(),
+    }
+}
+
+async fn response_value(response: reqwest::Response) -> Result<Value, BrowserError> {
+    let status = response.status();
+    if !status.is_success() {
+        let message = response_error_message(response).await;
+        warn!(
+            event = "probe.webdriver_http_error",
+            status = %status,
+            message = %message
+        );
+        return Err(BrowserError::WebDriverStatus { status, message });
+    }
+    let body = read_limited_body(response).await?;
     let envelope: Value =
         serde_json::from_slice(&body).map_err(|_| BrowserError::InvalidResponse)?;
     envelope

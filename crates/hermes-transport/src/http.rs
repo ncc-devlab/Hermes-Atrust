@@ -221,6 +221,8 @@ impl HttpTransport for ReqwestTransport {
         };
         let method_name = method.as_str().to_owned();
         let host = request.url.host_str().unwrap_or("<unknown>").to_owned();
+        let path = request.url.path().to_owned();
+        let request_body_bytes = request.body.len();
 
         let mut builder = self.client.request(method, request.url);
         for (name, value) in request.headers {
@@ -233,30 +235,95 @@ impl HttpTransport for ReqwestTransport {
             builder = builder.body(request.body);
         }
 
-        let response = builder.send().await.map_err(HttpTransportError::Request)?;
+        debug!(
+            event = "transport.http_begin",
+            method = %method_name,
+            host = %host,
+            path = %path,
+            request_body_bytes,
+            max_response_body = self.max_response_body
+        );
+
+        let response = builder.send().await.map_err(|error| {
+            warn!(
+                event = "transport.http_send_failed",
+                method = %method_name,
+                host = %host,
+                path = %path,
+                elapsed_ms = started.elapsed().as_millis(),
+                is_timeout = error.is_timeout(),
+                is_connect = error.is_connect(),
+                error = %error
+            );
+            map_reqwest_error(error, 0)
+        })?;
         let status = response.status().as_u16();
+        let content_length = response.content_length();
         let location = response
             .headers()
             .get(reqwest::header::LOCATION)
             .map(|value| value.to_str().map(str::to_owned))
             .transpose()
             .map_err(HttpTransportError::InvalidResponseHeader)?;
-        if response
-            .content_length()
-            .is_some_and(|length| length > self.max_response_body as u64)
-        {
+        debug!(
+            event = "transport.http_headers",
+            method = %method_name,
+            host = %host,
+            path = %path,
+            status,
+            content_length,
+            elapsed_ms = started.elapsed().as_millis()
+        );
+        if content_length.is_some_and(|length| length > self.max_response_body as u64) {
+            warn!(
+                event = "transport.http_response_too_large",
+                method = %method_name,
+                host = %host,
+                path = %path,
+                status,
+                limit = self.max_response_body,
+                content_length,
+                bytes_read = 0u64
+            );
             return Err(HttpTransportError::ResponseTooLarge {
                 limit: self.max_response_body,
+                bytes_read: 0,
+                content_length,
             });
         }
 
         let mut body = Vec::new();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(HttpTransportError::Request)?;
+            let chunk = chunk.map_err(|error| {
+                warn!(
+                    event = "transport.http_body_failed",
+                    method = %method_name,
+                    host = %host,
+                    path = %path,
+                    status,
+                    bytes_read = body.len(),
+                    elapsed_ms = started.elapsed().as_millis(),
+                    is_timeout = error.is_timeout(),
+                    error = %error
+                );
+                map_reqwest_error(error, body.len())
+            })?;
             if body.len().saturating_add(chunk.len()) > self.max_response_body {
+                warn!(
+                    event = "transport.http_response_too_large",
+                    method = %method_name,
+                    host = %host,
+                    path = %path,
+                    status,
+                    limit = self.max_response_body,
+                    content_length,
+                    bytes_read = body.len()
+                );
                 return Err(HttpTransportError::ResponseTooLarge {
                     limit: self.max_response_body,
+                    bytes_read: body.len(),
+                    content_length,
                 });
             }
             body.extend_from_slice(&chunk);
@@ -264,11 +331,13 @@ impl HttpTransport for ReqwestTransport {
 
         debug!(
             event = "transport.http_complete",
-            method = method_name,
-            host,
+            method = %method_name,
+            host = %host,
+            path = %path,
             status,
             elapsed_ms = started.elapsed().as_millis(),
-            response_bytes = body.len()
+            response_bytes = body.len(),
+            content_length
         );
         Ok(HttpResponse {
             status,
@@ -411,8 +480,23 @@ pub enum HttpTransportError {
     InvalidResponseHeader(#[source] reqwest::header::ToStrError),
     #[error("HTTP request failed: {0}")]
     Request(#[source] reqwest::Error),
-    #[error("HTTP response exceeds the configured {limit} byte limit")]
-    ResponseTooLarge { limit: usize },
+    #[error(
+        "HTTP request timed out after reading {bytes_read} response bytes (is_timeout={is_timeout})"
+    )]
+    Timeout {
+        bytes_read: usize,
+        is_timeout: bool,
+        #[source]
+        source: reqwest::Error,
+    },
+    #[error(
+        "HTTP response exceeds the configured {limit} byte limit (read {bytes_read} bytes, content_length={content_length:?})"
+    )]
+    ResponseTooLarge {
+        limit: usize,
+        bytes_read: usize,
+        content_length: Option<u64>,
+    },
     #[error("cookie import is not supported by this transport")]
     CookieImportUnsupported,
     #[error("cookie origin must be an HTTPS gateway URL")]
@@ -423,6 +507,20 @@ pub enum HttpTransportError {
     InvalidCookieValue,
     #[error("mock transport failure: {0}")]
     Mock(String),
+}
+
+fn map_reqwest_error(error: reqwest::Error, bytes_read: usize) -> HttpTransportError {
+    // reqwest often surfaces total-request timeouts as body/decode failures mid-stream
+    // (e.g. "error decoding response body: operation timed out").
+    let message = error.to_string().to_ascii_lowercase();
+    if error.is_timeout() || message.contains("timed out") || message.contains("timeout") {
+        return HttpTransportError::Timeout {
+            bytes_read,
+            is_timeout: error.is_timeout(),
+            source: error,
+        };
+    }
+    HttpTransportError::Request(error)
 }
 
 #[cfg(test)]
