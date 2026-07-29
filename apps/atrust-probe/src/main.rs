@@ -1,5 +1,8 @@
 use std::env;
-use std::path::PathBuf;
+use std::fs::OpenOptions;
+use std::io::{BufWriter, Write as _};
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,6 +11,8 @@ use atrust_auth::{
     AuthClient, AuthConfigOptions, PasswordCredentials, SessionMaterial, SessionProgress,
     extract_sid_from_cookies,
 };
+use atrust_browser::{BrowserKind, WebDriverBrowser, append_trace_event, sha256_fingerprint};
+use atrust_tcp::{DialTcpRequest, TunnelTarget, dial_tcp};
 use clap::{Parser, Subcommand};
 use hermes_logging::{LogFormat, LoggerConfig};
 use hermes_model::{DeviceId, GatewayEndpoint, SecretString};
@@ -15,12 +20,9 @@ use hermes_transport::{
     HttpTransport, ReqwestTransport, ReqwestTransportConfig, TlsPolicy, probe_node_tls,
 };
 use rand::Rng as _;
+use serde_json::json;
 use tracing::{error, info, warn};
 use url::Url;
-
-mod browser;
-
-use browser::{BrowserKind, WebDriverBrowser};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -40,6 +42,9 @@ struct Cli {
     /// Append probe logs to this file (also still printed to stderr).
     #[arg(long)]
     log_file: Option<PathBuf>,
+    /// Append a redacted browser network trace as JSONL.
+    #[arg(long)]
+    browser_trace_file: Option<PathBuf>,
     /// Whole-request HTTP timeout in seconds for gateway API calls.
     #[arg(long, default_value_t = 120)]
     http_timeout_seconds: u64,
@@ -83,6 +88,17 @@ enum Command {
         timeout_seconds: u64,
         #[arg(long)]
         keep_browser_open: bool,
+        /// Phase B: after harvest + clientResource, TLS-smoke the primary data-plane
+        /// nodes in this same process (no init frame, no tunnel). Off by default.
+        #[arg(long)]
+        probe_nodes: bool,
+        /// Per-node TLS connect timeout (seconds) used by `--probe-nodes`.
+        #[arg(long, default_value_t = 5)]
+        node_connect_timeout_seconds: u64,
+        /// Export a one-shot zju-connect client_data JSON after onlineInfo succeeds.
+        /// The file contains live gateway cookies and is forced to mode 0600.
+        #[arg(long)]
+        zju_client_data_file: Option<PathBuf>,
     },
     /// Fetch clientResource after an interactive session exists in this process.
     ///
@@ -107,6 +123,32 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         timeout_seconds: u64,
     },
+    /// Phase C: password-login, then dial one TCP tunnel and complete the aTrust handshake.
+    ///
+    /// Reads credentials from `HERMES_ATRUST_USERNAME` / `HERMES_ATRUST_PASSWORD`.
+    /// This is a live data-plane action; it dials only the node you point it at and
+    /// completes exactly one handshake to `--target`. Never auto-retries credentials.
+    TcpDial {
+        #[arg(long, default_value = "local")]
+        login_domain: String,
+        /// Data-plane node `host:port`. Overrides the address advertised in clientResource
+        /// (which is often a server-side loopback). Point this at the reachable node.
+        #[arg(long)]
+        node: Option<String>,
+        /// Server-side destination the tunnel connects to, as `host:port`.
+        #[arg(long)]
+        target: String,
+        /// appId carried in the init JSON (matches a clientResource app on strict gateways).
+        #[arg(long, default_value = "app-lab")]
+        app_id: String,
+        /// After the handshake, send a minimal `GET / HTTP/1.0` and read one app frame.
+        #[arg(long)]
+        send_http: bool,
+        #[arg(long, default_value_t = 8)]
+        connect_timeout_seconds: u64,
+        #[arg(long, default_value_t = 8)]
+        handshake_timeout_seconds: u64,
+    },
 }
 
 #[tokio::main]
@@ -118,9 +160,8 @@ async fn main() -> ExitCode {
         } else {
             LogFormat::Compact
         },
-        // Detailed by default for interactive probe; override with HERMES_LOG.
-        default_filter: "info,atrust_probe=debug,atrust_auth=debug,hermes_transport=debug"
-            .to_owned(),
+        // Distribution builds default to warning-only; HERMES_LOG opts into diagnostics.
+        default_filter: "warn".to_owned(),
         log_file: cli.log_file.clone(),
         ..LoggerConfig::default()
     };
@@ -250,6 +291,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             browser,
             timeout_seconds,
             keep_browser_open,
+            probe_nodes,
+            node_connect_timeout_seconds,
+            zju_client_data_file,
         } => {
             let configuration = client
                 .auth_config(AuthConfigOptions {
@@ -275,7 +319,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 note = "finish IDS + aTrust MFA fully, then manually close the probe browser to harvest"
             );
             let login = match browser
-                .complete_cas(challenge, std::time::Duration::from_secs(timeout_seconds))
+                .complete_cas(
+                    challenge,
+                    std::time::Duration::from_secs(timeout_seconds),
+                    cli.browser_trace_file.as_deref(),
+                )
                 .await
             {
                 Ok(login) => login,
@@ -319,6 +367,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 login_state = ?configuration.login_state,
                 csrf_present = !configuration.csrf_token.is_empty()
             );
+            append_probe_trace(
+                cli.browser_trace_file.as_deref(),
+                "auth_config_checked",
+                json!({
+                    "login_state": format!("{:?}", configuration.login_state),
+                    "csrf_present": !configuration.csrf_token.is_empty(),
+                }),
+            )?;
             // Portal ticket is single-use and was already opened by the browser via continueRequest.
             // Prefer cookie-backed control-plane checks; only fall back to reportEnv if needed.
             let progress = match client.online_info(&configuration).await {
@@ -390,6 +446,21 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         username_present = username.is_some(),
                         sid_present
                     );
+                    append_probe_trace(
+                        cli.browser_trace_file.as_deref(),
+                        "online_info_succeeded",
+                        json!({
+                            "username_present": username.is_some(),
+                            "sid_present": sid_present,
+                        }),
+                    )?;
+                    if let Some(path) = zju_client_data_file.as_deref() {
+                        write_zju_client_data(path, &endpoint, &login.gateway_cookies)?;
+                        info!(
+                            event = "probe.zju_client_data_exported",
+                            cookie_count = login.gateway_cookies.len()
+                        );
+                    }
                     match build_session_material(&login.gateway_cookies, username.as_deref()) {
                         Ok(material) => {
                             let fields = material.log_fields();
@@ -404,6 +475,19 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                                 sid_cookie_name = fields.sid_cookie_name,
                                 sid_sig_present = fields.sid_sig_present
                             );
+                            append_probe_trace(
+                                cli.browser_trace_file.as_deref(),
+                                "session_material_assembled",
+                                json!({
+                                    "sid_fingerprint": sha256_fingerprint(material.sid.as_str().as_bytes()),
+                                    "device_id_fingerprint": sha256_fingerprint(material.device_id.as_str().as_bytes()),
+                                    "connection_id_fingerprint": sha256_fingerprint(material.connection_id.as_str().as_bytes()),
+                                    "sign_key_fingerprint": sha256_fingerprint(material.sign_key.expose()),
+                                    "sid_cookie_name": fields.sid_cookie_name,
+                                    "sid_sig_present": fields.sid_sig_present,
+                                    "sign_key_provisional": fields.sign_key_provisional,
+                                }),
+                            )?;
                             let _ = material;
                         }
                         Err(error) => {
@@ -411,7 +495,32 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     match client.client_resource(&configuration).await {
-                        Ok(resources) => log_client_resources(&endpoint, &resources),
+                        Ok(resources) => {
+                            append_probe_trace(
+                                cli.browser_trace_file.as_deref(),
+                                "client_resource_succeeded",
+                                json!({
+                                    "ip_resource_count": resources.ip_resources.len(),
+                                    "domain_resource_count": resources.domain_resources.len(),
+                                    "node_group_count": resources.node_groups.len(),
+                                }),
+                            )?;
+                            log_client_resources(&endpoint, &resources);
+                            // Phase B: TLS-only reachability smoke of the primary nodes,
+                            // in-process where the harvested cookie jar exists. No init frame.
+                            if probe_nodes {
+                                let candidates = resources.primary_nodes(&endpoint);
+                                let connect_timeout =
+                                    Duration::from_secs(node_connect_timeout_seconds.max(1));
+                                probe_nodes_tls(
+                                    &candidates,
+                                    tls_policy,
+                                    connect_timeout,
+                                    cli.browser_trace_file.as_deref(),
+                                )
+                                .await?;
+                            }
+                        }
                         Err(error) => {
                             warn!(
                                 event = "probe.client_resource_failed",
@@ -519,27 +628,185 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             .collect()
                     }
                 };
-            if candidates.is_empty() {
-                warn!(event = "probe.node_probe_no_candidates");
-                return Ok(());
-            }
-            for (group_id, node) in candidates {
-                let result =
-                    probe_node_tls(&node.host, node.port, tls_policy, connect_timeout).await;
-                info!(
-                    event = "probe.node_tls",
-                    group_id_present = !group_id.is_empty(),
-                    host_present = !node.host.is_empty(),
-                    port = node.port,
-                    from_sdpc_placeholder = node.from_sdpc_placeholder,
-                    outcome = %result.outcome,
-                    success = result.success(),
-                    elapsed_ms = result.elapsed.as_millis()
+            probe_nodes_tls(
+                &candidates,
+                tls_policy,
+                connect_timeout,
+                cli.browser_trace_file.as_deref(),
+            )
+            .await?;
+        }
+        Command::TcpDial {
+            login_domain,
+            node,
+            target,
+            app_id,
+            send_http,
+            connect_timeout_seconds,
+            handshake_timeout_seconds,
+        } => {
+            // 1. One password authentication attempt (no captcha auto-solve, no retry).
+            let username_env = env::var("HERMES_ATRUST_USERNAME")?;
+            let password = SecretString::new(env::var("HERMES_ATRUST_PASSWORD")?)?;
+            let credentials = PasswordCredentials::new(username_env, password, login_domain)?;
+            let device_id = DeviceId::new(random_hex(32))?;
+            let configuration = client
+                .auth_config(AuthConfigOptions {
+                    modified: false,
+                    need_ticket: true,
+                })
+                .await?;
+            let outcome = client
+                .authenticate_password(&configuration, &credentials, &device_id, None)
+                .await?;
+            if outcome.captcha_required {
+                return Err(
+                    "server requires a graphical captcha; aborting without auto-solve".into(),
                 );
             }
+            info!(
+                event = "probe.tcp_dial.password_ok",
+                ticket_received = outcome.ticket.is_some()
+            );
+
+            // 2. Refresh authConfig for the logged-in csrf and confirm the session by cookie.
+            let configuration = client
+                .auth_config(AuthConfigOptions {
+                    modified: true,
+                    need_ticket: false,
+                })
+                .await?;
+            let username = client.online_info(&configuration).await.ok();
+            info!(
+                event = "probe.tcp_dial.online_info",
+                username_present = username.is_some()
+            );
+
+            // 3. Export the server-set SID from the jar and assemble session material.
+            let origin = Url::parse(&format!("https://{}/", gateway_authority(&endpoint)))?;
+            let sid_value = transport
+                .session_cookie_value(&origin, "sid")
+                .ok_or("no sid cookie present after password login")?;
+            let sid_secret = SecretString::new(sid_value)?;
+            let material_device = DeviceId::new(random_hex(32))?;
+            let material = SessionMaterial::from_cookie_sid(
+                &sid_secret,
+                "sid",
+                false,
+                material_device,
+                username.clone(),
+                None,
+            )?;
+            let fields = material.log_fields();
+            info!(
+                event = "probe.tcp_dial.material",
+                sid_present = fields.sid_present,
+                sign_key_present = fields.sign_key_present,
+                sign_key_provisional = fields.sign_key_provisional,
+                username_present = fields.username_present
+            );
+
+            // 4. clientResource confirms authorization and can supply the node address.
+            let resources = match client.client_resource(&configuration).await {
+                Ok(resources) => {
+                    log_client_resources(&endpoint, &resources);
+                    Some(resources)
+                }
+                Err(error) => {
+                    warn!(event = "probe.tcp_dial.client_resource_failed", error = %error);
+                    None
+                }
+            };
+
+            // 5. Resolve the node to dial: explicit override wins over advertised primary.
+            let (node_host, node_port) = if let Some(node) = node {
+                parse_host_port(&node)?
+            } else {
+                let primary = resources
+                    .as_ref()
+                    .and_then(|resources| resources.primary_nodes(&endpoint).into_iter().next());
+                match primary {
+                    Some((_, endpoint)) => (endpoint.host, endpoint.port),
+                    None => {
+                        return Err(
+                            "no --node override and no primary node could be resolved".into()
+                        );
+                    }
+                }
+            };
+
+            // 6. Build the server-side destination frame target.
+            let (target_host, target_port) = parse_host_port(&target)?;
+            let tunnel_target = build_tunnel_target(&target_host, target_port, &app_id);
+
+            // 7. Dial + complete the aTrust TCP handshake.
+            info!(
+                event = "probe.tcp_dial.begin",
+                node_port,
+                target_port,
+                app_id_present = !app_id.is_empty(),
+                send_http
+            );
+            let request = DialTcpRequest {
+                node_host: &node_host,
+                node_port,
+                tls_policy,
+                sid: &material.sid,
+                device_id: &material.device_id,
+                connection_id: &material.connection_id,
+                sign_key: &material.sign_key,
+                username: material.username.as_deref().unwrap_or_default(),
+                target: tunnel_target,
+                process: None,
+                lang: "en-US",
+                connect_timeout: Duration::from_secs(connect_timeout_seconds.max(1)),
+                handshake_timeout: Duration::from_secs(handshake_timeout_seconds.max(1)),
+            };
+            let mut tunnel = dial_tcp(request).await?;
+            info!(
+                event = "probe.tcp_dial.handshake_ok",
+                node_port, target_port
+            );
+
+            // 8. Optional application-layer round trip through the established tunnel.
+            if send_http {
+                let http_request = format!(
+                    "GET / HTTP/1.0\r\nHost: {target_host}\r\nUser-Agent: hermes-probe\r\nConnection: close\r\n\r\n"
+                );
+                tunnel.write_app(http_request.as_bytes()).await?;
+                match tunnel.read_app().await? {
+                    Some(data) => info!(
+                        event = "probe.tcp_dial.app_response",
+                        bytes = data.len(),
+                        looks_like_http = data.starts_with(b"HTTP/")
+                    ),
+                    None => info!(event = "probe.tcp_dial.app_closed_by_peer"),
+                }
+            }
+
+            tunnel.close().await?;
+            info!(event = "probe.tcp_dial.closed");
         }
     }
     Ok(())
+}
+
+/// Builds a data-plane destination: raw IPv4 target when `host` parses as an IPv4
+/// literal, otherwise a domain target (handshake sends the domain bytes verbatim).
+fn build_tunnel_target(host: &str, port: u16, app_id: &str) -> TunnelTarget {
+    match host.parse::<std::net::Ipv4Addr>() {
+        Ok(ip) => TunnelTarget::Ipv4 {
+            ip,
+            port,
+            app_id: app_id.to_owned(),
+        },
+        Err(_) => TunnelTarget::Domain {
+            host: host.to_owned(),
+            port,
+            app_id: app_id.to_owned(),
+            resolved: None,
+        },
+    }
 }
 
 fn build_session_material(
@@ -557,6 +824,122 @@ fn build_session_material(
         username.map(str::to_owned),
         None,
     )
+}
+
+/// Phase B: TLS-only reachability smoke of data-plane nodes. Connects TCP and
+/// completes the TLS handshake to each candidate, then closes. It never sends an
+/// init frame, opens a tunnel, or uses any session material (SID / SignKey), so
+/// it is safe to run before the data-plane protocol is confirmed. Emits only
+/// host/port presence, outcome, and latency to logs and the redacted trace.
+async fn probe_nodes_tls(
+    candidates: &[(String, atrust_auth::ResolvedNodeEndpoint)],
+    tls_policy: TlsPolicy,
+    connect_timeout: Duration,
+    trace_file: Option<&Path>,
+) -> Result<NodeProbeSummary, Box<dyn std::error::Error>> {
+    if candidates.is_empty() {
+        warn!(event = "probe.node_probe_no_candidates");
+        return Ok(NodeProbeSummary::default());
+    }
+    let mut attempted = 0usize;
+    let mut succeeded = 0usize;
+    for (group_id, node) in candidates {
+        let result = probe_node_tls(&node.host, node.port, tls_policy, connect_timeout).await;
+        attempted += 1;
+        if result.success() {
+            succeeded += 1;
+        }
+        let elapsed_ms = u64::try_from(result.elapsed.as_millis()).unwrap_or(u64::MAX);
+        info!(
+            event = "probe.node_tls",
+            group_id_present = !group_id.is_empty(),
+            host_present = !node.host.is_empty(),
+            port = node.port,
+            from_sdpc_placeholder = node.from_sdpc_placeholder,
+            outcome = %result.outcome,
+            success = result.success(),
+            elapsed_ms
+        );
+        append_probe_trace(
+            trace_file,
+            "node_tls_probed",
+            json!({
+                "group_id_present": !group_id.is_empty(),
+                "host_present": !node.host.is_empty(),
+                "port": node.port,
+                "from_sdpc_placeholder": node.from_sdpc_placeholder,
+                "outcome": result.outcome.to_string(),
+                "success": result.success(),
+                "elapsed_ms": elapsed_ms,
+            }),
+        )?;
+    }
+    info!(
+        event = "probe.node_tls_summary",
+        attempted,
+        succeeded,
+        failed = attempted - succeeded
+    );
+    append_probe_trace(
+        trace_file,
+        "node_tls_summary",
+        json!({
+            "attempted": attempted,
+            "succeeded": succeeded,
+            "failed": attempted - succeeded,
+        }),
+    )?;
+    Ok(NodeProbeSummary {
+        attempted,
+        succeeded,
+    })
+}
+
+/// Aggregate result of a Phase B TLS-only smoke pass.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct NodeProbeSummary {
+    attempted: usize,
+    succeeded: usize,
+}
+
+fn append_probe_trace(
+    path: Option<&Path>,
+    kind: &str,
+    data: serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(path) = path {
+        append_trace_event(path, kind, data)?;
+    }
+    Ok(())
+}
+
+fn write_zju_client_data(
+    path: &Path,
+    endpoint: &GatewayEndpoint,
+    cookies: &[hermes_transport::GatewayCookie],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    let mut writer = BufWriter::new(file);
+    let host = gateway_authority(endpoint);
+    let value = json!({
+        "cookies": cookies.iter().map(|cookie| json!({
+            "host": host,
+            "scheme": "https",
+            "name": cookie.name,
+            "value": cookie.value,
+        })).collect::<Vec<_>>(),
+        "device_id": "",
+    });
+    serde_json::to_writer(&mut writer, &value)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    Ok(())
 }
 
 fn parse_host_port(value: &str) -> Result<(String, u16), Box<dyn std::error::Error>> {
@@ -647,4 +1030,79 @@ fn random_hex(length: usize) -> String {
     (0..length)
         .map(|_| HEX[rng.random_range(0..HEX.len())] as char)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    fn manual_node(host: String, port: u16) -> (String, atrust_auth::ResolvedNodeEndpoint) {
+        (
+            "major".to_owned(),
+            atrust_auth::ResolvedNodeEndpoint {
+                host,
+                port,
+                address_type: "manual".to_owned(),
+                from_sdpc_placeholder: false,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn phase_b_empty_candidates_is_ok_and_zero() {
+        let summary = probe_nodes_tls(&[], TlsPolicy::Verify, Duration::from_secs(1), None)
+            .await
+            .unwrap();
+        assert_eq!(summary, NodeProbeSummary::default());
+    }
+
+    #[tokio::test]
+    async fn phase_b_plain_tcp_peer_counts_as_failure_never_success() {
+        // A plain-TCP listener speaks no TLS: the TCP connect half succeeds but the
+        // TLS handshake must fail, so Phase B counts it attempted-but-not-succeeded.
+        // This never sends an init frame and needs no session material.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Accept once and drop, giving the client an immediate TLS read EOF.
+            let _ = listener.accept().await;
+        });
+        let candidates = vec![manual_node(addr.ip().to_string(), addr.port())];
+        let summary = probe_nodes_tls(&candidates, TlsPolicy::Verify, Duration::from_secs(3), None)
+            .await
+            .unwrap();
+        assert_eq!(summary.attempted, 1);
+        assert_eq!(summary.succeeded, 0);
+    }
+
+    #[test]
+    fn zju_client_data_export_is_compatible_and_private() {
+        let path = std::env::temp_dir().join(format!(
+            "hermes-zju-client-data-{}-{}.json",
+            std::process::id(),
+            random_hex(8)
+        ));
+        let endpoint = GatewayEndpoint::new("gateway.test", 443).unwrap();
+        let cookies = vec![hermes_transport::GatewayCookie {
+            name: "sid".to_owned(),
+            value: "secret-session".to_owned(),
+            domain: Some("gateway.test".to_owned()),
+            path: Some("/".to_owned()),
+            secure: true,
+            http_only: true,
+        }];
+
+        write_zju_client_data(&path, &endpoint, &cookies).unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["device_id"], "");
+        assert_eq!(value["cookies"][0]["host"], "gateway.test");
+        assert_eq!(value["cookies"][0]["scheme"], "https");
+        assert_eq!(value["cookies"][0]["name"], "sid");
+        assert_eq!(value["cookies"][0]["value"], "secret-session");
+        std::fs::remove_file(path).unwrap();
+    }
 }

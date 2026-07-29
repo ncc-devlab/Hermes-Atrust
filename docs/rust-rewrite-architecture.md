@@ -21,8 +21,9 @@ application
 - `hermes-logging`：应用入口使用的统一 `tracing` 订阅器，支持 compact 与 JSON 输出；
 - `hermes-transport`：可替换的异步 HTTP 接口、受限响应读取和显式 TLS 策略；
 - `atrust-auth`：`authConfig`、RSA 密码主认证、CAS challenge 和严格回调校验；
-- `atrust-probe`：真实对端诊断，以及与协议 crate 解耦的 WebDriver/BiDi 人工 CAS
-  登录编排。
+- `atrust-browser`：可复用的 WebDriver/BiDi 复杂 CAS/MFA 人工登录、网关 Cookie
+  收割和脱敏 trace；
+- `atrust-probe`：组合上述库进行真实对端诊断，不再拥有浏览器协议实现。
 
 只有存在实际实现时才新增 crate，禁止先创建无职责的空壳模块。
 
@@ -41,6 +42,8 @@ application
 8. 所有异步网络状态机必须支持超时、取消和确定性关闭。
 9. 业务模块统一通过 `tracing` 发出结构化事件；只有应用入口可以初始化 logger。
 10. transport 日志只记录方法、主机、状态、耗时和长度，不记录 query、Header 或正文。
+11. 分发应用默认使用 `warn` 过滤器；需要详细诊断时由操作者通过 `HERMES_LOG`
+    显式启用 `info`/`debug`。浏览器 trace 始终脱敏，不依赖日志过滤器保护凭据。
 
 ## 测试层次
 
@@ -89,12 +92,17 @@ authConfig                              [已完成]
 → SessionMaterial                       [sid/device/conn/sign_key/user present；SignKey provisional]
 → clientResource                        [200；~1.3MB/12.5s；1361 IP / 523 域名 / 1 节点组]
 → 节点地址解析（无探测）               [2 endpoints，major 存在]
-→ node-probe TLS-only                   [代码就绪；西电节点尚未 live]
-→ TCP 帧 codec                          [已实现；无 DialTCP 状态机]
+→ node-probe TLS-only                   [已接线并 live；外网 :441 TCP 超时，待校内复跑]
+→ TCP 帧 codec                          [已实现]
+→ TCP DialTCP 握手 + 应用帧             [已实现；对公网参考服务端 live 打通]
 ```
 
-**控制面里程碑已闭环（2026-07-27）。** 数据面仅允许 TLS 冒烟与 codec 单测，禁止默认拨号。
-下一优先：`node-probe` 对西电节点 live。隧道分阶段规划见 [`tunnel-plan.md`](tunnel-plan.md)。
+**控制面里程碑已闭环（2026-07-27）。数据面探测已接上（2026-07-28）。数据面 TCP 隧道已 live
+打通（2026-07-29，公网参考服务端）。** Phase B 已 live（`cas-login --probe-nodes` 同进程），
+外网因网络层不可达超时；节点 `:441` 待校内复跑。Phase C 已用 `atrust-probe tcp-dial` 对
+`Hermes-aTrust-Server` 完成 psw 登录 → SID 导出 → 握手 → 应用数据回环 → 关闭的端到端验证；
+证实临时随机 SignKey 模型正确、帧逐字节互通。**西电真机数据面仍待校内抓包对照**（SID/SignKey
+绑定、`0x0053` 长度语义、`0x94` 双格式）。隧道分阶段规划见 [`tunnel-plan.md`](tunnel-plan.md)。
 
 学校差异（IDS 表单、滑块、SMS UI）只存在于浏览器/UI 适配层。协议层只接受：
 
@@ -183,11 +191,11 @@ cargo run -p atrust-probe -- \
 
 ### TCP 隧道
 
-- 初始化 JSON DTO、确定性签名和 golden vector；
-- IPv4/域名目标地址帧；
-- `05 81`、`53 00` 和 connect status 状态机；
-- 应用数据帧、半关闭、服务端关闭和 short-write 处理；
-- 受控 HTTP 目标的真实联调。
+- ~~初始化 JSON DTO、确定性签名~~（已实现）；golden vector 仍待补（与脱敏抓包逐字节）；
+- ~~IPv4/域名目标地址帧~~（已实现）；
+- ~~`05 81`、`53 00` 和 connect status 状态机~~（已实现并 live 验证）；
+- ~~应用数据帧~~（已实现并 live 回环）；半关闭、服务端关闭、short-write 的对端行为测试仍待补；
+- ~~受控 HTTP 目标的真实联调~~（已对公网参考服务端完成；西电真机仍待）。
 
 ### L3 隧道
 

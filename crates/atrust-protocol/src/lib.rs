@@ -14,6 +14,4 @@ pub use tcp_frame::{
     encode_tcp_probe, encode_tcp_target_domain, encode_tcp_target_ipv4, is_status_ok,
     parse_status_payload,
 };
-pub use tcp_init::{
-    ProcessIdentity, TcpInitError, TcpInitParams, build_signed_tcp_init_json,
-};
+pub use tcp_init::{ProcessIdentity, TcpInitError, TcpInitParams, build_signed_tcp_init_json};

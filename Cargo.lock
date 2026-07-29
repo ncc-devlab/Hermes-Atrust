@@ -99,21 +99,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrust-browser"
+version = "0.1.0"
+dependencies = [
+ "atrust-auth",
+ "futures-util",
+ "hermes-transport",
+ "hex",
+ "reqwest",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "atrust-probe"
 version = "0.1.0"
 dependencies = [
  "atrust-auth",
+ "atrust-browser",
+ "atrust-tcp",
  "clap",
- "futures-util",
  "hermes-logging",
  "hermes-model",
  "hermes-transport",
  "rand 0.9.5",
- "reqwest",
  "serde_json",
- "thiserror",
  "tokio",
- "tokio-tungstenite",
  "tracing",
  "url",
 ]

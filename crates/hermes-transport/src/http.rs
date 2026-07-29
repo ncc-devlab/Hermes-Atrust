@@ -125,6 +125,15 @@ pub trait HttpTransport: Send + Sync {
     fn gateway_cookie_value(&self, _origin: &Url, _name: &str) -> Option<String> {
         None
     }
+
+    /// Returns a cookie value the server itself set on `origin` (Set-Cookie jar), if any.
+    ///
+    /// Unlike `gateway_cookie_value`, this reads the live cookie jar rather than the
+    /// trusted-import map, so it can export a SID established by a non-browser login
+    /// (e.g. password auth). Never log the result.
+    fn session_cookie_value(&self, _origin: &Url, _name: &str) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -451,6 +460,21 @@ impl HttpTransport for ReqwestTransport {
             .get(&name.to_ascii_lowercase())
             .cloned()
     }
+
+    fn session_cookie_value(&self, origin: &Url, name: &str) -> Option<String> {
+        use reqwest::cookie::CookieStore as _;
+        let header = self.jar.cookies(origin)?;
+        let raw = header.to_str().ok()?;
+        // The jar returns a `Cookie:` header value: `a=1; b=2`.
+        for pair in raw.split(';') {
+            if let Some((cookie_name, value)) = pair.trim().split_once('=')
+                && cookie_name.trim().eq_ignore_ascii_case(name)
+            {
+                return Some(value.trim().to_owned());
+            }
+        }
+        None
+    }
 }
 
 fn validate_cookie_token(value: &str) -> Result<(), ()> {
@@ -708,5 +732,25 @@ mod tests {
         );
         assert_eq!(transport.gateway_cookie_value(&origin, "missing"), None);
         assert!(!format!("{transport:?}").contains("session-secret-value"));
+    }
+
+    #[test]
+    fn session_cookie_value_reads_the_live_jar_case_insensitively() {
+        // `import_gateway_cookies` also writes the jar, so the SID is readable back through
+        // the jar path used to export a session established by a non-browser (password) login.
+        let transport = ReqwestTransport::new(&ReqwestTransportConfig::default()).unwrap();
+        let origin = Url::parse("https://atrust.example.edu/").unwrap();
+        transport
+            .import_gateway_cookies(&origin, &[sample_cookie("sid", "SID-from-jar", None)])
+            .unwrap();
+        assert_eq!(
+            transport.session_cookie_value(&origin, "sid").as_deref(),
+            Some("SID-from-jar")
+        );
+        assert_eq!(
+            transport.session_cookie_value(&origin, "SID").as_deref(),
+            Some("SID-from-jar")
+        );
+        assert_eq!(transport.session_cookie_value(&origin, "absent"), None);
     }
 }

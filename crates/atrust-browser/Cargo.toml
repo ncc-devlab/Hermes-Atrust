@@ -1,0 +1,23 @@
+[package]
+name = "atrust-browser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+atrust-auth = { path = "../atrust-auth" }
+futures-util.workspace = true
+hermes-transport = { path = "../hermes-transport" }
+hex.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true

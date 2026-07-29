@@ -173,9 +173,8 @@ where
 
         if self.write_pending.is_empty() {
             let chunk_len = buf.len().min(u16::MAX as usize);
-            let frame = encode_tcp_app_data(&buf[..chunk_len]).map_err(|error| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
-            })?;
+            let frame = encode_tcp_app_data(&buf[..chunk_len])
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
             self.write_pending = frame;
             self.write_offset = 0;
         }
@@ -346,6 +345,9 @@ mod tests {
     #[test]
     fn decode_close_frame() {
         let mut frame = encode_tcp_close().to_vec();
-        assert!(matches!(try_decode_app(&mut frame).unwrap(), Decode::Closed));
+        assert!(matches!(
+            try_decode_app(&mut frame).unwrap(),
+            Decode::Closed
+        ));
     }
 }

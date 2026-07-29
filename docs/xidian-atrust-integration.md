@@ -104,7 +104,22 @@ authConfig → 浏览器 IDS+SMS MFA → 关窗收割 Cookie
   → clientResource 严格解析 → 节点表（无拨号）
 ```
 
-TLS `node-probe` 与 TCP 帧 codec 已落地，**尚未**对西电节点做 TLS 连通实测、发 init 或建隧道。
+TLS `node-probe` 与 TCP 帧 codec 已落地。Phase B 已接线（`cas-login --probe-nodes`
+同进程收割后对 primary 节点 TLS-only 冒烟，不发 init）。
+
+### Phase B 首次 live（2026-07-28，外网）
+
+`cas-login --probe-nodes` 在收割 + `clientResource` 后同进程探测 primary 节点：
+
+| 观察项 | 结果 |
+| --- | --- |
+| `node_tls_probed` | `port=441`、`outcome=timeout`、`elapsed_ms=5001`、`success=false`、`from_sdpc_placeholder=false` |
+| `node_tls_summary` | `attempted=1 / succeeded=0 / failed=1` |
+| 判读 | 卡在 **TCP connect**（非 TLS 握手/证书），即**网络层不可达**；根因为**探测方在外网**，节点 `:441` 为校内地址 |
+| 对照 | 控制面 `:443` 外网可通，数据节点 `:441` 外网不可达 |
+
+脱敏回归：本次 trace 已确认不含学号 / `ticket=` / `Cookie` 头值 / `postData`（修复 `request_id`
+误写整个 RequestData 的漏洞后生效）。**尚未**对西电节点成功 TLS、发 init 或建隧道。
 
 ### 已证伪或应避免的策略
 
@@ -153,6 +168,9 @@ TLS `node-probe` 与 TCP 帧 codec 已落地，**尚未**对西电节点做 TLS 
 ### 推荐联调命令
 
 ```bash
+# 先启动与 Chrome 版本匹配的 ChromeDriver；默认监听 127.0.0.1:9515
+chromedriver --host 127.0.0.1 --port 9515
+
 # 本地 .env（已 gitignore），至少包含：
 # HERMES_ATRUST_HOST=atrust.xidian.edu.cn
 # HERMES_ATRUST_CAS_DOMAIN=cas42187
@@ -176,11 +194,12 @@ cargo run -p atrust-probe -- \
 | --- | --- | --- |
 | authConfig 只读 | 完成 | 2026-07-25 |
 | 浏览器 IDS + SMS 关窗收割 | 完成 | 2026-07-26 / **2026-07-27** |
+| 浏览器认证抽取为 `atrust-browser` | 完成 | 2026-07-29；`atrust-probe` 改为库调用方 |
 | Cookie → LoggedIn + onlineInfo | 完成 | 2026-07-27 |
 | SessionMaterial 导出 | 完成（SignKey provisional） | 2026-07-27 `probe.session_material` |
 | clientResource + 节点解析 | 完成 | 2026-07-27：1361/523/1 组 2 节点，~1.3MB/12.5s |
-| node-probe TLS 冒烟 | 代码就绪，**未对西电 live** | 见 `tunnel-plan.md` Phase B |
-| TCP Dial / init | codec 就绪，无状态机 | Phase C |
+| node-probe TLS 冒烟 | **已接线并 live 跑过（外网）** | 2026-07-28：`cas-login --probe-nodes` 同进程触发；primary 节点 `:441` **TCP connect 超时**（外网网络层不可达，非 TLS/证书失败）；待校内复跑 |
+| TCP Dial / init | codec、拨号状态机和参考对端 live 已完成；Xidian 待校内验证 | Phase C |
 | L3 / TUN / DNS 路由 | 未做 | Phase D |
 
 ## 尚未闭环
@@ -206,6 +225,66 @@ cargo run -p atrust-probe -- \
 3. **Phase C：** mock TLS 对端 + TCP 握手状态机；再 `tcp-dial` 单一受控目标（ignored live）。
 4. 产品化：跨进程 session store、MFA 状态机、日志降噪（document-only URL）。
 5. Phase D（延后）：L3 / VIP / TUN / DNS。
+
+## 双轨实验计划
+
+### 实验一：浏览器会话交给 zju-connect 数据面
+
+`atrust-browser` 是复杂 CAS/MFA 浏览器生命周期的唯一实现。实验桥接只交付 HTTPS
+网关 origin 及完整网关 Cookie 属性，不交付 IDS Cookie、CAS/portal ticket、密码或短信码。
+zju-connect 导入 Cookie 后只能执行 `authConfig(mod=1, needTicket=false)`、`onlineInfo` 和
+`clientResource`，不得再次消费 CAS callback，也不得再次执行 `reportEnv` 或 MFA。
+
+验收顺序：
+
+1. 人工完成 IDS/CAS、滑块和 aTrust SMS，关窗后获得含 `sid` 的网关 Cookie；
+2. zju-connect 导入会话并通过 `onlineInfo`，随后解析 `clientResource`；
+3. 校内网络对 major 节点执行 TCP/TLS-only 探测，不发送 init；
+4. 调用只依赖 SID 的 Get-IP，确认 Cookie SID 与数据面会话一致；
+5. 对一个明确授权的目标建立单 TCP 隧道；L3/TUN 不在本实验中启用。
+
+正式桥接应使用继承文件描述符或权限受限的本地 IPC，在内存中传递 Cookie。受限权限的
+临时文件只用于一次性概念验证，不作为稳定会话格式。
+
+#### 首次实测（2026-07-29）
+
+ChromeDriver 使用 `--ignore-explicit-port` 自动选择高端口，Hermes 将实际端口传给
+`cas-login --webdriver-url`。人工完成 CAS/MFA 并关窗后收割 10 个网关 Cookie，`sid`
+存在，`onlineInfo` 成功；会话以 `0600` 的一次性 zju-connect `client_data` 文件交接。
+
+zju-connect 未指定认证类型，导入后直接报告 `Already logged in`，随后成功执行
+`onlineInfo`、`clientResource` 和资源解析。两个数据端点的 TLS-only 结果为：
+
+- 私网端点 `:441` TCP connect 5 秒超时；
+- 公网端点 `:441` TCP 成功，TLS handshake 成功（约 68 ms）；
+- 汇总：`attempted=2 / tcp_succeeded=1 / tls_succeeded=1`。
+
+探测后进程在 Get-IP、L3、TUN 和路由初始化前退出。该结果证明浏览器 Cookie 会话可以由
+zju-connect 接管，也证明当前网络至少存在一个可达的 Xidian aTrust 数据节点；尚未发送
+aTrust init 或验证 SID 数据面认证。
+
+#### SID-only Get-IP（2026-07-29）
+
+复用同一 `0600` 会话文件再次执行 Cookie adoption，`authConfig` 仍报告已登录；zju-connect
+重新获取资源并选择上一步可达的公网 `:441` 节点。随后只发送 SID 初始化和 Get-IP 请求，
+服务端返回 `OK` 并分配有效的 `10.x` 客户端 IPv4。
+
+进程在收到地址后立即退出，没有创建 L3、TUN、DNS 或路由。该结果确认：
+
+1. 浏览器 Cookie 中的 `sid` 可直接用于 Xidian 数据面认证；
+2. 控制面 Cookie 会话与公网数据节点会话一致；
+3. Get-IP 阶段不依赖浏览器 DeviceID、ConnectionID 或 SignKey；
+4. 下一关可以隔离验证单 TCP init，随后才进入 L3 SID 认证与单流授权。
+
+### 实验二：Hermes 原生数据面与 L3
+
+Hermes 使用同一 `atrust-browser` 会话列出资源和节点，并以 zju-connect 的已授权协议行为
+作为对照，不共享其运行时会话。验收顺序固定为：节点解析、TLS-only、Get-IP、单 TCP、
+L3 SID 认证、单流授权、心跳与关闭，最后才是 TUN/DNS/路由。
+
+每一阶段必须有本地 mock/golden test，并将真实失败区分为 DNS、TCP、TLS、SID、设备绑定、
+签名、策略和目标错误。DeviceID、ConnectionID、SignKey 只在服务端证据要求时逐项纳入，
+不预先假定它们与浏览器会话的绑定方式。
 
 ## 测试门禁
 

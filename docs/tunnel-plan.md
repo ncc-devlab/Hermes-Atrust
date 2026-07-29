@@ -40,10 +40,14 @@
 
 目标：证明「节点 host:port + 严格 TLS」可连，**不发送** init JSON。
 
-1. `atrust-probe node-probe --group <id>|--primary`
+1. `atrust-probe node-probe --group <id>|--primary`，或 `cas-login --probe-nodes`
+   （同进程收割后对 primary 节点冒烟，免去跨进程会话持久化）。
 2. 对每个候选：`TcpStream` + `rustls`（默认 Verify；仅私有网关显式 insecure）
-3. 记录：成功/超时/证书错误；**不**发送 `05 01 81...`
+3. 记录：成功/超时/证书错误；**不**发送 `05 01 81...`（`probe_nodes_tls` 共享实现）
 4. 后续再加 3 次短 TCP 时延选优（对齐 Go `pingNum=3`）
+
+**状态（2026-07-28）：** 已接线，外网跑出 `:441` TCP 超时（网络层不可达）。代码正确，
+待校内网络位置复跑取 `Ok`。
 
 ### Phase C — 最小 TCP 隧道（单一受控目标）
 
@@ -71,6 +75,15 @@ TLS 到节点
 4. 首个联调目标：校内已知 HTTP 端口或用户指定 `host:port`，只验证读写回环。
 5. 超时、取消、半关闭、short-write：本地 mock duplex 握手 + 应用帧回环已单测；live 仍 ignored。
 
+**状态（2026-07-29）：已 live 打通（公网参考服务端）。** `atrust-probe tcp-dial` 对
+`Hermes-aTrust-Server`（`103.99.178.36`，control `:8443` / data `:8444`）完成：
+psw 登录 → jar 导出 SID → `SessionMaterial`（`sign_key_provisional=true`）→ `clientResource`
+200 → 拨号 `:8444` → **握手成功**（init+HMAC 签名帧被接受 → 目标帧 → `53 00 OK` → `01 00 00 00`
+探测 → `05 00`）→ 应用数据回环（`GET /` → 381B，`looks_like_http=true`，服务端侧代拨
+`1.1.1.1:80`）→ 干净关闭。证实：客户端临时随机 SignKey 模型正确（服务端 UnboundAccepted
+兼容放行）、帧与状态机逐字节互通。节点 `--node` 覆盖为必需（`policy.json` 广告的是
+服务端本机 `127.0.0.1:8444`）。拨号 TLS connect+handshake 约 6.3s（链路较慢），超时预算宜放宽。
+
 ### Phase D — L3（延后）
 
 在 TCP 路径稳定后：
@@ -90,7 +103,7 @@ atrust-protocol      帧编解码、签名、wire DTO
 hermes-transport     HTTP + `connect_tls` / `NodeTlsStream`
 atrust-tcp           DialTCP 状态机 + 帧化 TcpTunnel（无默认 live）
 atrust-l3（更后）    L3 总连接与数据帧
-atrust-probe         人工诊断子命令：auth / cas-login / client-resource / node-probe /（tcp-dial 待加）
+atrust-probe         人工诊断子命令：auth / cas-login / client-resource / node-probe / tcp-dial
 ```
 
 ## 测试门禁（按阶段加）
@@ -121,7 +134,13 @@ atrust-probe         人工诊断子命令：auth / cas-login / client-resource 
 3. ~~`node-probe` TLS-only 冒烟（`probe_node_tls` + CLI，默认 Verify；支持 `--address`）。~~
 4. ~~TCP init / target / app 帧 codec（`atrust-protocol`）。~~
 5. ~~TCP 握手状态机 + 应用帧 I/O（`atrust-tcp`，mock duplex 单测）。~~
-6. **下一步：** 西电 `node-probe --primary` live（TLS only，不发 init）。
+6. ~~西电 `node-probe --primary` live（TLS only，不发 init）。~~
+   **已接线并 live（2026-07-28，外网）：** `cas-login --probe-nodes` 同进程收割后
+   探测 primary 节点；`:441` **TCP connect 超时**（外网网络层不可达，非 TLS/证书）。
+   `node-probe --address` 独立路径同样因外网超时。**待校内复跑**取 `outcome=Ok` 与时延基线。
 7. Cookie SID ↔ init JSON SID 抓包对照；SignKey 服务端策略确认。
+   **参考服务端已确认（2026-07-29）：** SID 即 psw 响应 `Set-Cookie: sid=`，`session_cookie_value`
+   从 jar 导出后原样进 init JSON；服务端 `sign_key_hex=None` → UnboundAccepted 放行。西电真机仍待抓包。
 8. 可选：gitignored 会话持久化，支撑跨进程 node-probe / tcp-dial。
-9. 单一目标 `tcp-dial` live（ignored；需 CLI 接线）。
+9. ~~单一目标 `tcp-dial` live（ignored；需 CLI 接线）。~~
+   **已完成（2026-07-29）：** `tcp-dial` 子命令已接线，对公网参考服务端 live 打通（见 Phase C 状态）。

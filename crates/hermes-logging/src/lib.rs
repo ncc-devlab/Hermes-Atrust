@@ -40,7 +40,7 @@ pub struct LoggerConfig {
 impl Default for LoggerConfig {
     fn default() -> Self {
         Self {
-            default_filter: "info".to_owned(),
+            default_filter: "warn".to_owned(),
             filter_env: "HERMES_LOG".to_owned(),
             format: LogFormat::Compact,
             ansi: true,
@@ -204,9 +204,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn logger_defaults_are_safe_for_interactive_use() {
+    fn logger_defaults_are_safe_for_distribution() {
         let config = LoggerConfig::default();
-        assert_eq!(config.default_filter, "info");
+        assert_eq!(config.default_filter, "warn");
         assert_eq!(config.filter_env, "HERMES_LOG");
         assert_eq!(config.format, LogFormat::Compact);
         assert!(config.log_file.is_none());
