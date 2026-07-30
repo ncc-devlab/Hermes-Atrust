@@ -315,6 +315,40 @@ impl AuthClient {
         &self,
         configuration: &AuthConfiguration,
     ) -> Result<ClientResources, AuthError> {
+        let body = self.client_resource_body(configuration).await?;
+        let resources = match ClientResources::parse_bytes(&body) {
+            Ok(resources) => resources,
+            Err(error) => {
+                warn!(
+                    event = "atrust.client_resource.parse_failed",
+                    host = self.endpoint.host(),
+                    response_bytes = body.len(),
+                    error = %error
+                );
+                return Err(error.into());
+            }
+        };
+        debug!(
+            event = "atrust.client_resource.complete",
+            host = self.endpoint.host(),
+            ip_resource_count = resources.ip_resources.len(),
+            domain_resource_count = resources.domain_resources.len(),
+            node_group_count = resources.node_groups.len(),
+            major_node_group_present = resources.major_node_group_id.is_some(),
+            dns_primary_present = resources.dns.primary.is_some()
+        );
+        Ok(resources)
+    }
+
+    /// Fetches the raw `clientResource` body without parsing it.
+    ///
+    /// Exposed so a diagnostic run can save the exact bytes once and then iterate
+    /// on resource matching entirely offline. The body describes server policy
+    /// (apps, address ranges, node groups), not session credentials.
+    pub async fn client_resource_body(
+        &self,
+        configuration: &AuthConfiguration,
+    ) -> Result<Vec<u8>, AuthError> {
         let mut url = self.endpoint_url("/controller/v1/user/clientResource")?;
         self.append_shared_query(&mut url);
         let body = ClientResourceRequest::default_request().to_bytes()?;
@@ -357,28 +391,7 @@ impl AuthClient {
             status = response.status,
             response_bytes = response.body.len()
         );
-        let resources = match ClientResources::parse_bytes(&response.body) {
-            Ok(resources) => resources,
-            Err(error) => {
-                warn!(
-                    event = "atrust.client_resource.parse_failed",
-                    host = self.endpoint.host(),
-                    response_bytes = response.body.len(),
-                    error = %error
-                );
-                return Err(error.into());
-            }
-        };
-        debug!(
-            event = "atrust.client_resource.complete",
-            host = self.endpoint.host(),
-            ip_resource_count = resources.ip_resources.len(),
-            domain_resource_count = resources.domain_resources.len(),
-            node_group_count = resources.node_groups.len(),
-            major_node_group_present = resources.major_node_group_id.is_some(),
-            dns_primary_present = resources.dns.primary.is_some()
-        );
-        Ok(resources)
+        Ok(response.body)
     }
 
     /// Performs exactly one primary password attempt and never retries credentials or captchas.

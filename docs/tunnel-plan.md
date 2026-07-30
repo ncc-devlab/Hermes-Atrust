@@ -119,9 +119,16 @@ EasyConnect 不在本规划内。
 
 **可离线先做完、不被校内网络阻塞：**
 
-1. **资源匹配器（最大一块前置代码）**：`ClientResources` 目前只有解析、没有查询 API。
-   L3 发包前须按 `(dstIP, protocol, dstPort)` 命中 IP 资源选出 `appId` + `nodeGroupId`，
-   未命中则不进 VPN。需 CIDR 最长前缀 + 协议 + 端口区间匹配，纯离线可 golden 测试。
+1. ~~**资源匹配器（最大一块前置代码）**~~ **已完成（2026-07-30）：**
+   `atrust_auth::ResourceIndex`（`routing.rs`）。`(dstIP, protocol, dstPort)` → `appId` +
+   `nodeGroupId`，未命中返回 `None`（即不得进 VPN）；域名目标走域名表且**不**本地先解析，
+   避免丢失域名资源语义（§6.4）。重叠表按「地址范围最窄 → 端口最窄 → 精确协议先于 `all`
+   → 服务端原始顺序」定序，`match_ip_all` / `match_domain_all` 暴露全部候选供抓包对照
+   （服务端真实优先级仍未确认，见架构文档未决项 7）。17 个单测含一条从真实 JSON body
+   解析到匹配的端到端用例。诊断入口：
+   `atrust-probe resource-match --resource-file <body.json> --target <host:port> [--protocol udp|icmp] [--show-all]`，
+   配合 `client-resource --save-body` 可完全离线迭代。`tcp-dial` 会在拨号前记录匹配结果，
+   并在与 `--app-id` 不一致时打 WARN（仅观测，不改变拨号行为）。
 2. ~~会话持久化~~（已完成，见执行清单第 8 项）。
 3. L3 帧 codec：`05 14` 上行编码器与心跳 `05 15 00 00` / `05 95`，配 property/fuzz；
    `0x94` 解码器等第 4 项闸门。
@@ -138,19 +145,20 @@ EasyConnect 不在本规划内。
 ## 建议 crate / 模块边界
 
 ```text
-atrust-auth          会话、clientResource、节点解析（无拨号）
+atrust-auth          会话、会话存储、clientResource、节点解析、资源匹配（无拨号）
 atrust-protocol      帧编解码、签名、wire DTO
 hermes-transport     HTTP + `connect_tls` / `NodeTlsStream`
 atrust-tcp           DialTCP 状态机 + 帧化 TcpTunnel（无默认 live）
 atrust-l3           SID-only Get-IP；后续承载 L3 总连接与数据帧
-atrust-probe         人工诊断子命令：auth / cas-login / client-resource / node-probe / tcp-dial
+atrust-probe         人工诊断子命令：auth / cas-login / client-resource / resource-match
+                     / node-probe / tcp-dial
 ```
 
 ## 测试门禁（按阶段加）
 
 | 阶段 | 必测 |
 | --- | --- |
-| A | 节点解析单测（已有）；资源 golden；可选 live 仅计数 |
+| A | 节点解析单测（已有）；资源 golden；资源匹配单测（已有，17 项）；可选 live 仅计数 |
 | B | mock TCP 可连；TLS 策略默认 Verify；超时 |
 | C | init 帧 golden（与 Go 逐字节或固定 fixture）；握手状态机；应用帧；ignored live |
 | D | codec property / fuzz；L3 模拟对端拆包 |

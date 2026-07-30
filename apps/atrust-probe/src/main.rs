@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use atrust_auth::{
-    AuthClient, AuthConfigOptions, AuthConfiguration, LoginMethod, PasswordCredentials,
-    SessionMaterial, SessionProgress, StoredSession, extract_sid_from_cookies,
+    AuthClient, AuthConfigOptions, AuthConfiguration, FlowProtocol, LoginMethod,
+    PasswordCredentials, SessionMaterial, SessionProgress, StoredSession, extract_sid_from_cookies,
 };
 use atrust_browser::{BrowserKind, WebDriverBrowser, append_trace_event};
 use atrust_tcp::{DialTcpRequest, TunnelTarget, dial_tcp};
@@ -130,6 +130,36 @@ enum Command {
         /// Session saved earlier by `cas-login --session-file` or `password --session-file`.
         #[arg(long)]
         session_file: Option<PathBuf>,
+        /// Save the raw response body so resource matching can be replayed offline
+        /// with `resource-match --resource-file`. Server policy, not credentials.
+        #[arg(long)]
+        save_body: Option<PathBuf>,
+    },
+    /// Ask the resource matcher which app / node group carries a destination.
+    ///
+    /// Pure lookup against `clientResource`: no dial, no init frame, no tunnel.
+    /// An unmatched destination is exactly what the data plane must refuse to
+    /// send, so `matched=false` is a valid, expected result.
+    ///
+    /// With `--resource-file` this runs fully offline against a saved body.
+    ResourceMatch {
+        /// Destination as `host:port`; an IPv4 literal uses the IP table, a name
+        /// uses the domain table (names are not resolved locally first).
+        #[arg(long)]
+        target: String,
+        /// Flow protocol: tcp, udp, or icmp. ICMP ignores the port.
+        #[arg(long, default_value = "tcp")]
+        protocol: String,
+        /// Match against a `clientResource` body saved by `client-resource --save-body`,
+        /// with no session and no network. Takes precedence over `--session-file`.
+        #[arg(long)]
+        resource_file: Option<PathBuf>,
+        /// Session saved earlier by `cas-login --session-file` or `password --session-file`.
+        #[arg(long)]
+        session_file: Option<PathBuf>,
+        /// Also list every lower-ranked candidate, to inspect an ambiguous table.
+        #[arg(long)]
+        show_all: bool,
     },
     /// TLS-only smoke probe of data-plane nodes (no init frame / tunnel).
     ///
@@ -638,7 +668,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let _ = browser.close().await;
             let _ = keep_browser_open;
         }
-        Command::ClientResource { session_file } => {
+        Command::ClientResource {
+            session_file,
+            save_body,
+        } => {
             if let Some(path) = session_file.as_deref() {
                 import_session_file(transport.as_ref(), &endpoint, path)?;
             }
@@ -655,8 +688,59 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 http_timeout_seconds = cli.http_timeout_seconds,
                 max_response_body = cli.max_response_body
             );
-            let resources = client.client_resource(&configuration).await?;
+            let body = client.client_resource_body(&configuration).await?;
+            let resources = atrust_auth::ClientResources::from_json_bytes(&body)?;
             log_client_resources(&endpoint, &resources);
+            if let Some(path) = save_body.as_deref() {
+                std::fs::write(path, &body)?;
+                info!(
+                    event = "probe.client_resource_body_saved",
+                    bytes = body.len(),
+                    path = %path.display()
+                );
+            }
+        }
+        Command::ResourceMatch {
+            target,
+            protocol,
+            resource_file,
+            session_file,
+            show_all,
+        } => {
+            let protocol = FlowProtocol::parse(&protocol)
+                .ok_or("unsupported --protocol; use tcp, udp, or icmp")?;
+            let (host, port) = parse_host_port(&target)?;
+            let resources = if let Some(path) = resource_file.as_deref() {
+                // Fully offline: no session, no gateway request.
+                let body = std::fs::read(path)?;
+                info!(
+                    event = "probe.resource_file_loaded",
+                    bytes = body.len(),
+                    path = %path.display()
+                );
+                atrust_auth::ClientResources::from_json_bytes(&body)?
+            } else {
+                if let Some(path) = session_file.as_deref() {
+                    import_session_file(transport.as_ref(), &endpoint, path)?;
+                }
+                let configuration = client
+                    .auth_config(AuthConfigOptions {
+                        modified: true,
+                        need_ticket: false,
+                    })
+                    .await?;
+                client.client_resource(&configuration).await?
+            };
+            log_client_resources(&endpoint, &resources);
+            report_resource_match(
+                &resources,
+                &endpoint,
+                &host,
+                port,
+                protocol,
+                show_all,
+                cli.browser_trace_file.as_deref(),
+            )?;
         }
         Command::NodeProbe {
             primary,
@@ -768,6 +852,35 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
+            // 3. Report what the resource matcher decides for this target. This is
+            // observability only: the dial still uses --app-id / --node verbatim, so
+            // the matcher's ranking can be confirmed against a live gateway before
+            // anything depends on it.
+            let (target_host, target_port) = parse_host_port(&target)?;
+            if let Some(resources) = resources.as_ref() {
+                report_resource_match(
+                    resources,
+                    &endpoint,
+                    &target_host,
+                    target_port,
+                    FlowProtocol::Tcp,
+                    false,
+                    cli.browser_trace_file.as_deref(),
+                )?;
+                let matched_app_id = resources
+                    .routing_index()
+                    .match_destination(&target_host, target_port, FlowProtocol::Tcp)
+                    .map(|destination| destination.app_id().to_owned());
+                if matched_app_id.as_deref() != Some(app_id.as_str()) {
+                    warn!(
+                        event = "probe.tcp_dial.app_id_mismatch",
+                        supplied_app_id = %app_id,
+                        matched_app_id = matched_app_id.as_deref().unwrap_or("<none>"),
+                        note = "dialing with the supplied --app-id; a strict gateway may reject it"
+                    );
+                }
+            }
+
             // 5. Resolve the node to dial: explicit override wins over advertised primary.
             let (node_host, node_port) = if let Some(node) = node {
                 parse_host_port(&node)?
@@ -786,7 +899,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             };
 
             // 6. Build the server-side destination frame target.
-            let (target_host, target_port) = parse_host_port(&target)?;
             let tunnel_target = build_tunnel_target(&target_host, target_port, &app_id);
 
             // 7. Dial + complete the aTrust TCP handshake.
@@ -857,6 +969,148 @@ fn build_tunnel_target(host: &str, port: u16, app_id: &str) -> TunnelTarget {
             resolved: None,
         },
     }
+}
+
+/// Reports which resource authorizes a destination, and therefore which `appId`
+/// and node group would carry it. Pure lookup: it never dials, sends an init
+/// frame, or opens a tunnel, and `matched=false` is a valid result — that is
+/// exactly the case the data plane must refuse to send.
+///
+/// Resource identifiers (`appId`, `nodeGroupId`, node addresses) are server
+/// policy metadata, not session secrets, and this command is useless without
+/// them, so they are logged in full.
+#[allow(clippy::too_many_arguments)]
+fn report_resource_match(
+    resources: &atrust_auth::ClientResources,
+    gateway: &GatewayEndpoint,
+    host: &str,
+    port: u16,
+    protocol: FlowProtocol,
+    show_all: bool,
+    trace_file: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let index = resources.routing_index();
+    let matched = index.match_destination(host, port, protocol);
+    match matched {
+        Some(destination) => {
+            let (port_min, port_max) = destination.port_range();
+            let endpoints = resources.node_group_endpoints(destination.node_group_id(), gateway);
+            info!(
+                event = "probe.resource_match",
+                matched = true,
+                target_host = %host,
+                target_port = port,
+                flow_protocol = protocol.as_str(),
+                match_kind = destination.kind(),
+                app_id = %destination.app_id(),
+                node_group_id = %destination.node_group_id(),
+                resource_protocol = destination.protocol().as_str(),
+                resource_port_min = port_min,
+                resource_port_max = port_max,
+                node_endpoint_count = endpoints.len()
+            );
+            for endpoint in &endpoints {
+                info!(
+                    event = "probe.resource_match_node",
+                    node_group_id = %destination.node_group_id(),
+                    address = %endpoint.socket_display(),
+                    from_sdpc_placeholder = endpoint.from_sdpc_placeholder
+                );
+            }
+            append_probe_trace(
+                trace_file,
+                "resource_matched",
+                json!({
+                    "target_host": host,
+                    "target_port": port,
+                    "flow_protocol": protocol.as_str(),
+                    "match_kind": destination.kind(),
+                    "app_id": destination.app_id(),
+                    "node_group_id": destination.node_group_id(),
+                    "resource_protocol": destination.protocol().as_str(),
+                    "resource_port_min": port_min,
+                    "resource_port_max": port_max,
+                    "node_endpoints": endpoints
+                        .iter()
+                        .map(|endpoint| endpoint.socket_display())
+                        .collect::<Vec<_>>(),
+                }),
+            )?;
+        }
+        None => {
+            warn!(
+                event = "probe.resource_match",
+                matched = false,
+                target_host = %host,
+                target_port = port,
+                flow_protocol = protocol.as_str(),
+                ip_resource_count = index.ip_len(),
+                domain_resource_count = index.domain_len(),
+                note = "no resource authorizes this destination; the data plane must not send it"
+            );
+            append_probe_trace(
+                trace_file,
+                "resource_unmatched",
+                json!({
+                    "target_host": host,
+                    "target_port": port,
+                    "flow_protocol": protocol.as_str(),
+                }),
+            )?;
+        }
+    }
+
+    if show_all {
+        // Lower-ranked candidates expose an ambiguous table: the gateway's own
+        // precedence rule is unconfirmed, so the full list is the evidence.
+        let candidates: Vec<(String, String, &'static str)> =
+            match host.parse::<std::net::Ipv4Addr>() {
+                Ok(destination) => index
+                    .match_ip_all(atrust_auth::FlowKey {
+                        destination,
+                        port,
+                        protocol,
+                    })
+                    .into_iter()
+                    .map(|resource| {
+                        (
+                            resource.app_id.clone(),
+                            resource.node_group_id.clone(),
+                            "ip",
+                        )
+                    })
+                    .collect(),
+                Err(_) => index
+                    .match_domain_all(atrust_auth::DomainFlow {
+                        host,
+                        port,
+                        protocol,
+                    })
+                    .into_iter()
+                    .map(|resource| {
+                        (
+                            resource.app_id.clone(),
+                            resource.node_group_id.clone(),
+                            "domain",
+                        )
+                    })
+                    .collect(),
+            };
+        for (rank, (app_id, node_group_id, kind)) in candidates.iter().enumerate() {
+            info!(
+                event = "probe.resource_match_candidate",
+                rank,
+                match_kind = kind,
+                app_id = %app_id,
+                node_group_id = %node_group_id
+            );
+        }
+        info!(
+            event = "probe.resource_match_candidates",
+            candidate_count = candidates.len()
+        );
+    }
+    Ok(())
 }
 
 /// A control-plane session ready for data-plane use, however it was established.

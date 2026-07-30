@@ -21,6 +21,8 @@ application
 - `hermes-logging`：应用入口使用的统一 `tracing` 订阅器，支持 compact 与 JSON 输出；
 - `hermes-transport`：可替换的异步 HTTP 接口、受限响应读取和显式 TLS 策略；
 - `atrust-auth`：`authConfig`、RSA 密码主认证、CAS challenge 和严格回调校验；
+  `clientResource` 解析、节点解析、跨进程会话存储，以及纯离线的资源匹配器
+  （五元组 → `appId` / `nodeGroupId`，不拨号）；
 - `atrust-browser`：可复用的 WebDriver/BiDi 复杂 CAS/MFA 人工登录、网关 Cookie
   收割和全保真 trace（`0600`，见强制边界 12）；
 - `atrust-tcp`：单连接 TCP 隧道握手和帧化 I/O；
@@ -86,7 +88,15 @@ cargo test --workspace
 3. SignKey 是客户端生成、服务端下发还是经其它接口注册，以及它与 SID 的绑定关系；
 4. second VIP 的请求条件和用途；
 5. L3 flow key 是否必须包含协议号；
-6. L3 授权 URL 应使用 `tcp:` 还是 `tcp://`。
+6. L3 授权 URL 应使用 `tcp:` 还是 `tcp://`；
+7. **资源表重叠时服务端的优先级规则**。Hermes 的 `ResourceIndex` 目前按「地址范围最窄
+   → 端口范围最窄 → 精确协议先于 `all` → 服务端原始顺序」排序取第一名，并通过
+   `match_ip_all` / `match_domain_all` 暴露全部候选供抓包对照。若证实服务端是
+   first-match-wins，只需改 `ResourceIndex::build` 的排序；
+8. **ICMP 如何命中资源**。资源表只有 `tcp` / `udp` / `all` 三种协议值，Hermes 现规定
+   ICMP 只能命中 `all` 且不做端口比较，这一条尚未经真机验证；
+9. **域名通配符语义**。现按 `*.example.edu` 覆盖任意子域但不含 apex 实现，
+   服务端是否同此仍待确认。
 
 ## 当前里程碑
 

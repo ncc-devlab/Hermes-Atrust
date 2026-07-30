@@ -251,6 +251,38 @@ cargo run -p atrust-probe -- --host atrust.xidian.edu.cn \
 - 恢复时校验存储的网关 host:port 与 `--host/--port` 一致，避免把一处会话发往另一处；
   随后用 `onlineInfo` 验活，过期会话在控制面失败，而不是拖到数据面握手才报错。
 
+## 资源匹配器（2026-07-30）
+
+`atrust_auth::ResourceIndex` 回答「这条流该不该进隧道、进哪个 `appId` / 节点组」。
+西电资源表约 1361 条 IP + 523 条域名，重叠不可避免（`/16` 套 `/32`、端口区间套精确端口），
+匹配器按「地址范围最窄 → 端口最窄 → 精确协议先于 `all` → 服务端原始顺序」取第一名，
+并保留全部候选供抓包对照。**服务端真实优先级规则尚未确认**，若证实是 first-match-wins，
+只需改 `ResourceIndex::build` 的排序。
+
+先存一份 body，之后完全离线迭代：
+
+```bash
+# 存一次（server policy，非凭据）
+cargo run -p atrust-probe -- --host atrust.xidian.edu.cn \
+  client-resource --session-file ~/.cache/hermes/xidian.json \
+  --save-body /tmp/xidian-clientresource.json
+
+# 之后不需要会话、不需要网络
+cargo run -p atrust-probe -- --host atrust.xidian.edu.cn resource-match \
+  --resource-file /tmp/xidian-clientresource.json \
+  --target 202.117.x.y:443 --show-all
+```
+
+`matched=false` 是有效结果：数据面对未命中资源的目标**必须不发**。域名目标走域名表，
+不在本地先解析——域名资源与 IP 资源可能是不同的 `appId` 和节点组（§6.4）。
+
+两条待真机确认的规则已写入架构文档未决项：ICMP 只能命中 `all` 且不比较端口（未决项 8）、
+`*.example.edu` 覆盖任意子域但不含 apex（未决项 9）。
+
+`tcp-dial` 现在会在拨号前记录该目标的匹配结果；若与 `--app-id` 不一致会打一条
+`probe.tcp_dial.app_id_mismatch` WARN，但**仍按 `--app-id` 拨号**——排序规则未经真机确认前
+不改变数据面行为，这条日志正是用来收集确认证据的。
+
 ## 下一阶段任务（建议顺序）
 
 对照 [`tunnel-plan.md`](tunnel-plan.md)：

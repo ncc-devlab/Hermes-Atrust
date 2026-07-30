@@ -441,6 +441,14 @@ impl ClientResources {
         Ok(Self::from_data(data))
     }
 
+    /// Parses a `clientResource` response body captured earlier.
+    ///
+    /// Lets resource matching be developed and replayed offline against a real
+    /// gateway body, with no session and no network.
+    pub fn from_json_bytes(body: &[u8]) -> Result<Self, ResourceError> {
+        Self::parse_bytes(body)
+    }
+
     pub(crate) fn parse_bytes(body: &[u8]) -> Result<Self, ResourceError> {
         let envelope: ClientResourceEnvelope = serde_json::from_slice(body)
             .map_err(|error| ResourceError::InvalidJson(error.to_string()))?;
