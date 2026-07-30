@@ -1,0 +1,20 @@
+[package]
+name = "atrust-l3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hermes-model = { path = "../hermes-model" }
+hermes-transport = { path = "../hermes-transport" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

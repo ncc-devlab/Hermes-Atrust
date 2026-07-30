@@ -26,7 +26,8 @@
 
 1. Cookie 会话后拉 `clientResource`（`cas-login` 已同进程触发）。
 2. `resolve_node_groups(gateway)` 得到每组 `host:port` 列表。
-3. `primary_nodes` 取每组首地址（无探测）；日志只计数量/标志，不打印敏感值。
+3. `all_nodes` 提供每组全部地址用于探测；`primary_nodes` 仅供显式首节点选择。
+   节点地址不是会话秘密，诊断探测会记录组 ID 和完整 `host:port`。
 4. **已完成（代码）：**
    - Cookie 路径 SID 导出（`extract_sid_from_cookies` / `sid` > `sid-legacy` + `*.sig` 存在性）；
    - `SessionMaterial { sid, device_id, connection_id, sign_key, username, … }`；
@@ -40,8 +41,8 @@
 
 目标：证明「节点 host:port + 严格 TLS」可连，**不发送** init JSON。
 
-1. `atrust-probe node-probe --group <id>|--primary`，或 `cas-login --probe-nodes`
-   （同进程收割后对 primary 节点冒烟，免去跨进程会话持久化）。
+1. `atrust-probe node-probe`，或 `cas-login --probe-nodes`，默认探测每组全部端点；
+   `node-probe --primary` 可显式缩减为每组第一个端点。同进程路径免去会话持久化。
 2. 对每个候选：`TcpStream` + `rustls`（默认 Verify；仅私有网关显式 insecure）
 3. 记录：成功/超时/证书错误；**不**发送 `05 01 81...`（`probe_nodes_tls` 共享实现）
 4. 后续再加 3 次短 TCP 时延选优（对齐 Go `pingNum=3`）
@@ -84,14 +85,16 @@ psw 登录 → jar 导出 SID → `SessionMaterial`（`sign_key_provisional=true
 兼容放行）、帧与状态机逐字节互通。节点 `--node` 覆盖为必需（`policy.json` 广告的是
 服务端本机 `127.0.0.1:8444`）。拨号 TLS connect+handshake 约 6.3s（链路较慢），超时预算宜放宽。
 
-### Phase D — L3（延后）
+### Phase D — L3（Get-IP 探针已落地）
 
 在 TCP 路径稳定后：
 
-1. 确认 Get-IP `0x0053` 长度语义、SignKey 绑定、下行 `0x94` 双格式判别；
-2. SID 总连接认证 + VIP；
-3. 五元组鉴权 / conntrack / connectToken；
-4. 再谈 TUN / DNS / 路由。
+1. Get-IP 使用实际 SID JSON 长度编码；典型 73 字节 SID 对应 `0x0053`，待 Xidian
+   原生 live 确认服务端不依赖固定长度；
+2. 确认 SignKey 绑定、下行 `0x94` 双格式判别；
+3. SID 总连接认证 + VIP；
+4. 五元组鉴权 / conntrack / connectToken；
+5. 再谈 TUN / DNS / 路由。
 
 EasyConnect 不在本规划内。
 
@@ -102,7 +105,7 @@ atrust-auth          会话、clientResource、节点解析（无拨号）
 atrust-protocol      帧编解码、签名、wire DTO
 hermes-transport     HTTP + `connect_tls` / `NodeTlsStream`
 atrust-tcp           DialTCP 状态机 + 帧化 TcpTunnel（无默认 live）
-atrust-l3（更后）    L3 总连接与数据帧
+atrust-l3           SID-only Get-IP；后续承载 L3 总连接与数据帧
 atrust-probe         人工诊断子命令：auth / cas-login / client-resource / node-probe / tcp-dial
 ```
 
@@ -144,3 +147,11 @@ atrust-probe         人工诊断子命令：auth / cas-login / client-resource 
 8. 可选：gitignored 会话持久化，支撑跨进程 node-probe / tcp-dial。
 9. ~~单一目标 `tcp-dial` live（ignored；需 CLI 接线）。~~
    **已完成（2026-07-29）：** `tcp-dial` 子命令已接线，对公网参考服务端 live 打通（见 Phase C 状态）。
+10. SID-only Get-IP 原生探针。
+    **代码已完成（2026-07-29）：** `atrust-l3` 使用动态 JSON 长度和有界响应读取；
+    `cas-login --get-ip-node <host:port>` 可在同一 Cookie 会话中执行一次 Get-IP，不启动
+    L3 总连接、TUN、DNS 或路由。mock 对端测试已通过。
+    **解析对齐（2026-07-30）：** Xidian live 返回前导 `05 d0` method ack 时不再
+    `UnexpectedHeader`；循环接受 `05 d0` / `53 00` / `05 00`。失败写 trace
+    `get_ip_failed`。数据节点自签 `CN=sdp` 需 `--insecure-tls` 或 pin。
+    Xidian Get-IP live 成功（`probe.get_ip.succeeded`）仍待人工复跑确认。

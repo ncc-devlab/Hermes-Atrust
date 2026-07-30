@@ -152,6 +152,20 @@ impl ClientResources {
             .collect()
     }
 
+    /// Returns every resolved endpoint from every node group without probing or scoring.
+    pub fn all_nodes(&self, gateway: &GatewayEndpoint) -> Vec<(String, ResolvedNodeEndpoint)> {
+        self.resolve_node_groups(gateway)
+            .into_iter()
+            .flat_map(|group| {
+                let id = group.id;
+                group
+                    .endpoints
+                    .into_iter()
+                    .map(move |endpoint| (id.clone(), endpoint))
+            })
+            .collect()
+    }
+
     /// Picks the first resolved endpoint for each group (no latency scoring yet).
     pub fn primary_nodes(&self, gateway: &GatewayEndpoint) -> Vec<(String, ResolvedNodeEndpoint)> {
         self.resolve_node_groups(gateway)
@@ -799,6 +813,10 @@ mod tests {
         assert_eq!(resolved[0].endpoints[1].port, 442);
         assert!(!resolved[0].endpoints[1].from_sdpc_placeholder);
         assert_eq!(resolved[0].endpoints[2].port, DEFAULT_NODE_PORT);
+        let all = resources.all_nodes(&gateway);
+        assert_eq!(all.len(), 3);
+        assert!(all.iter().all(|(group_id, _)| group_id == "ng-1"));
+        assert_eq!(all[1].1.socket_display(), "10.9.0.1:442");
         let primaries = resources.primary_nodes(&gateway);
         assert_eq!(primaries.len(), 1);
         assert_eq!(primaries[0].1.socket_display(), "atrust.example.edu:441");

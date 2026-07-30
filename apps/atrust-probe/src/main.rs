@@ -88,8 +88,8 @@ enum Command {
         timeout_seconds: u64,
         #[arg(long)]
         keep_browser_open: bool,
-        /// Phase B: after harvest + clientResource, TLS-smoke the primary data-plane
-        /// nodes in this same process (no init frame, no tunnel). Off by default.
+        /// Phase B: after harvest + clientResource, TLS-smoke every advertised data-plane
+        /// endpoint in this same process (no init frame, no tunnel). Off by default.
         #[arg(long)]
         probe_nodes: bool,
         /// Per-node TLS connect timeout (seconds) used by `--probe-nodes`.
@@ -99,6 +99,12 @@ enum Command {
         /// The file contains live gateway cookies and is forced to mode 0600.
         #[arg(long)]
         zju_client_data_file: Option<PathBuf>,
+        /// Perform one SID-only Get-IP exchange against this explicit `host:port` node.
+        /// No L3 packet forwarding, TUN, DNS, routes, or retries are started.
+        #[arg(long)]
+        get_ip_node: Option<String>,
+        #[arg(long, default_value_t = 8)]
+        get_ip_timeout_seconds: u64,
     },
     /// Fetch clientResource after an interactive session exists in this process.
     ///
@@ -111,8 +117,9 @@ enum Command {
     /// Without `--address`, loads `clientResource` from the current process cookie jar
     /// (typically after `cas-login` in the same process once a session store exists).
     NodeProbe {
-        /// Probe every primary node (first endpoint of each group). Ignored with `--address`.
-        #[arg(long, default_value_t = true)]
+        /// Probe only the first endpoint of each group. By default every endpoint is probed.
+        /// Ignored with `--address` or `--group`.
+        #[arg(long)]
         primary: bool,
         /// Restrict to a single node group id when set.
         #[arg(long)]
@@ -294,6 +301,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             probe_nodes,
             node_connect_timeout_seconds,
             zju_client_data_file,
+            get_ip_node,
+            get_ip_timeout_seconds,
         } => {
             let configuration = client
                 .auth_config(AuthConfigOptions {
@@ -488,7 +497,47 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                                     "sign_key_provisional": fields.sign_key_provisional,
                                 }),
                             )?;
-                            let _ = material;
+                            if let Some(node) = get_ip_node.as_deref() {
+                                let (node_host, node_port) = parse_host_port(node)?;
+                                match atrust_l3::get_ipv4(atrust_l3::GetIpv4Request {
+                                    node_host: &node_host,
+                                    node_port,
+                                    tls_policy,
+                                    sid: &material.sid,
+                                    timeout: Duration::from_secs(get_ip_timeout_seconds.max(1)),
+                                })
+                                .await
+                                {
+                                    Ok(address) => {
+                                        info!(
+                                            event = "probe.get_ip.succeeded",
+                                            node_port,
+                                            address_family = "ipv4",
+                                            private = address.is_private()
+                                        );
+                                        append_probe_trace(
+                                            cli.browser_trace_file.as_deref(),
+                                            "get_ip_succeeded",
+                                            json!({
+                                                "node_port": node_port,
+                                                "address_family": "ipv4",
+                                                "private": address.is_private(),
+                                            }),
+                                        )?;
+                                    }
+                                    Err(error) => {
+                                        append_probe_trace(
+                                            cli.browser_trace_file.as_deref(),
+                                            "get_ip_failed",
+                                            json!({
+                                                "node_port": node_port,
+                                                "error": error.to_string(),
+                                            }),
+                                        )?;
+                                        return Err(error.into());
+                                    }
+                                }
+                            }
                         }
                         Err(error) => {
                             warn!(event = "probe.session_material_failed", error = %error)
@@ -506,10 +555,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                                 }),
                             )?;
                             log_client_resources(&endpoint, &resources);
-                            // Phase B: TLS-only reachability smoke of the primary nodes,
+                            // Phase B: TLS-only reachability smoke of every resolved endpoint,
                             // in-process where the harvested cookie jar exists. No init frame.
                             if probe_nodes {
-                                let candidates = resources.primary_nodes(&endpoint);
+                                let candidates = resources.all_nodes(&endpoint);
                                 let connect_timeout =
                                     Duration::from_secs(node_connect_timeout_seconds.max(1));
                                 probe_nodes_tls(
@@ -617,15 +666,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     } else if primary {
                         resources.primary_nodes(&endpoint)
                     } else {
-                        resolved
-                            .into_iter()
-                            .flat_map(|item| {
-                                let id = item.id.clone();
-                                item.endpoints
-                                    .into_iter()
-                                    .map(move |endpoint| (id.clone(), endpoint))
-                            })
-                            .collect()
+                        resources.all_nodes(&endpoint)
                     }
                 };
             probe_nodes_tls(
@@ -688,12 +729,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .session_cookie_value(&origin, "sid")
                 .ok_or("no sid cookie present after password login")?;
             let sid_secret = SecretString::new(sid_value)?;
-            let material_device = DeviceId::new(random_hex(32))?;
             let material = SessionMaterial::from_cookie_sid(
                 &sid_secret,
                 "sid",
                 false,
-                material_device,
+                device_id,
                 username.clone(),
                 None,
             )?;
@@ -829,8 +869,8 @@ fn build_session_material(
 /// Phase B: TLS-only reachability smoke of data-plane nodes. Connects TCP and
 /// completes the TLS handshake to each candidate, then closes. It never sends an
 /// init frame, opens a tunnel, or uses any session material (SID / SignKey), so
-/// it is safe to run before the data-plane protocol is confirmed. Emits only
-/// host/port presence, outcome, and latency to logs and the redacted trace.
+/// it is safe to run before the data-plane protocol is confirmed. Node addresses
+/// are intentionally logged because this command is an explicit diagnostic probe.
 async fn probe_nodes_tls(
     candidates: &[(String, atrust_auth::ResolvedNodeEndpoint)],
     tls_policy: TlsPolicy,
@@ -852,8 +892,9 @@ async fn probe_nodes_tls(
         let elapsed_ms = u64::try_from(result.elapsed.as_millis()).unwrap_or(u64::MAX);
         info!(
             event = "probe.node_tls",
-            group_id_present = !group_id.is_empty(),
-            host_present = !node.host.is_empty(),
+            group_id = %group_id,
+            host = %node.host,
+            address = %node.socket_display(),
             port = node.port,
             from_sdpc_placeholder = node.from_sdpc_placeholder,
             outcome = %result.outcome,
@@ -864,8 +905,9 @@ async fn probe_nodes_tls(
             trace_file,
             "node_tls_probed",
             json!({
-                "group_id_present": !group_id.is_empty(),
-                "host_present": !node.host.is_empty(),
+                "group_id": group_id,
+                "host": node.host,
+                "address": node.socket_display(),
                 "port": node.port,
                 "from_sdpc_placeholder": node.from_sdpc_placeholder,
                 "outcome": result.outcome.to_string(),

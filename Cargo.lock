@@ -117,11 +117,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrust-l3"
+version = "0.1.0"
+dependencies = [
+ "hermes-model",
+ "hermes-transport",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "atrust-probe"
 version = "0.1.0"
 dependencies = [
  "atrust-auth",
  "atrust-browser",
+ "atrust-l3",
  "atrust-tcp",
  "clap",
  "hermes-logging",

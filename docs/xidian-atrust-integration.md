@@ -239,7 +239,7 @@ zju-connect 导入 Cookie 后只能执行 `authConfig(mod=1, needTicket=false)`�
 
 1. 人工完成 IDS/CAS、滑块和 aTrust SMS，关窗后获得含 `sid` 的网关 Cookie；
 2. zju-connect 导入会话并通过 `onlineInfo`，随后解析 `clientResource`；
-3. 校内网络对 major 节点执行 TCP/TLS-only 探测，不发送 init；
+3. 校内网络对 major 组的每个端点执行 TCP/TLS-only 探测，不发送 init；
 4. 调用只依赖 SID 的 Get-IP，确认 Cookie SID 与数据面会话一致；
 5. 对一个明确授权的目标建立单 TCP 隧道；L3/TUN 不在本实验中启用。
 
@@ -275,6 +275,32 @@ aTrust init 或验证 SID 数据面认证。
 2. 控制面 Cookie 会话与公网数据节点会话一致；
 3. Get-IP 阶段不依赖浏览器 DeviceID、ConnectionID 或 SignKey；
 4. 下一关可以隔离验证单 TCP init，随后才进入 L3 SID 认证与单流授权。
+
+Hermes 原生等价探针现已接入同进程 CAS 路径。使用前先从上一轮 TLS-only 结果中选择
+明确可达的公网节点，避免把私网节点超时误判成 SID 拒绝。
+
+数据节点证书常见为深信服私有自签（`CN=sdp`）；默认证书校验会在 TLS 握手失败。
+联调时可加 `--insecure-tls` 做诊断，生产路径应改为固定 CA / 指纹，而非常态 insecure。
+
+响应侧：Xidian 可能先回 L3 method ack `05 d0`，再 `53 00 …OK` 与 `05 00` IPv4；
+`atrust-l3` 按帧循环读取，与 zju-connect Get-IP / L3 auth 行为对齐。
+
+```bash
+HERMES_LOG=info cargo run -p atrust-probe -- \
+  --host atrust.xidian.edu.cn \
+  --insecure-tls \
+  --browser-trace-file /tmp/hermes-browser-trace.jsonl \
+  cas-login \
+  --login-domain cas42187 \
+  --webdriver-url http://127.0.0.1:9515 \
+  --timeout-seconds 1800 \
+  --get-ip-node '<reachable-node>:441' \
+  --get-ip-timeout-seconds 8
+```
+
+该动作只建立一条临时 TLS 连接并发送 SID-only Get-IP。成功日志不会输出分配的 VIP，
+只记录 IPv4 和是否为私网地址；失败写入 trace `get_ip_failed`。没有自动重试，
+也不会创建 TUN、DNS 或路由。
 
 ### 实验二：Hermes 原生数据面与 L3
 

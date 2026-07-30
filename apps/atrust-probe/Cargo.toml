@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 atrust-auth = { path = "../../crates/atrust-auth" }
 atrust-browser = { path = "../../crates/atrust-browser" }
+atrust-l3 = { path = "../../crates/atrust-l3" }
 atrust-tcp = { path = "../../crates/atrust-tcp" }
 clap.workspace = true
 hermes-logging = { path = "../../crates/hermes-logging" }

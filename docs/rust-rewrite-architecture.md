@@ -23,6 +23,8 @@ application
 - `atrust-auth`：`authConfig`、RSA 密码主认证、CAS challenge 和严格回调校验；
 - `atrust-browser`：可复用的 WebDriver/BiDi 复杂 CAS/MFA 人工登录、网关 Cookie
   收割和脱敏 trace；
+- `atrust-tcp`：单连接 TCP 隧道握手和帧化 I/O；
+- `atrust-l3`：SID-only Get-IP 实验探针；尚不包含总连接、单流授权或数据转发；
 - `atrust-probe`：组合上述库进行真实对端诊断，不再拥有浏览器协议实现。
 
 只有存在实际实现时才新增 crate，禁止先创建无职责的空壳模块。
@@ -199,7 +201,7 @@ cargo run -p atrust-probe -- \
 
 ### L3 隧道
 
-- Get-IP codec 及 `0x0053` 长度语义确认；
+- Get-IP codec 已落地并按实际 SID JSON 动态编码长度；Xidian 原生 live 待执行；
 - SID 总连接认证和虚拟 IP 解析；
 - 按五元组鉴权、conntrack 和 connect token 生命周期；
 - L3 数据帧、心跳、多节点组连接和确定性关闭；
