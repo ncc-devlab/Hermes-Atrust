@@ -228,10 +228,7 @@ mod tests {
         let server_task = tokio::spawn(async move {
             drain_request(&mut server).await;
             // Xidian live order observed: 05 d0, then 53 00 OK, then 05 00 IPv4.
-            server
-                .write_all(&[0x05, 0xd0])
-                .await
-                .expect("method ack");
+            server.write_all(&[0x05, 0xd0]).await.expect("method ack");
             server
                 .write_all(&[0x53, 0x00, 0x00, 0x02, b'O', b'K'])
                 .await

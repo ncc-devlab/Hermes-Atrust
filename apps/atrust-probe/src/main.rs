@@ -8,10 +8,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use atrust_auth::{
-    AuthClient, AuthConfigOptions, PasswordCredentials, SessionMaterial, SessionProgress,
-    extract_sid_from_cookies,
+    AuthClient, AuthConfigOptions, AuthConfiguration, LoginMethod, PasswordCredentials,
+    SessionMaterial, SessionProgress, StoredSession, extract_sid_from_cookies,
 };
-use atrust_browser::{BrowserKind, WebDriverBrowser, append_trace_event, sha256_fingerprint};
+use atrust_browser::{BrowserKind, WebDriverBrowser, append_trace_event};
 use atrust_tcp::{DialTcpRequest, TunnelTarget, dial_tcp};
 use clap::{Parser, Subcommand};
 use hermes_logging::{LogFormat, LoggerConfig};
@@ -42,7 +42,13 @@ struct Cli {
     /// Append probe logs to this file (also still printed to stderr).
     #[arg(long)]
     log_file: Option<PathBuf>,
-    /// Append a redacted browser network trace as JSONL.
+    /// Append a full-fidelity browser/control-plane trace as JSONL.
+    ///
+    /// The trace is deliberately NOT redacted: cookies, SID, SignKey, request
+    /// bodies (including the CAS credential POST) and full URLs are written
+    /// verbatim so a line can be diffed against a packet capture. The file is
+    /// created 0600 — treat it as credential material and never attach it to a
+    /// report. Diagnostic logs stay separate and default to `warn`.
     #[arg(long)]
     browser_trace_file: Option<PathBuf>,
     /// Whole-request HTTP timeout in seconds for gateway API calls.
@@ -68,6 +74,10 @@ enum Command {
     Password {
         #[arg(long, default_value = "local")]
         login_domain: String,
+        /// Persist the resulting session so later subcommands can reuse it.
+        /// The file holds live cookies, the SID, and the SignKey; it is forced to 0600.
+        #[arg(long)]
+        session_file: Option<PathBuf>,
     },
     /// Show the server-provided CAS entry point without opening a browser.
     CasStart {
@@ -99,6 +109,12 @@ enum Command {
         /// The file contains live gateway cookies and is forced to mode 0600.
         #[arg(long)]
         zju_client_data_file: Option<PathBuf>,
+        /// Persist the harvested session so `tcp-dial`, `node-probe`, and
+        /// `client-resource` can reuse this CAS login in a later process instead
+        /// of repeating IDS + slider + SMS. Forced to 0600; holds live cookies,
+        /// the SID, the DeviceID/ConnectionID pair, and the SignKey.
+        #[arg(long)]
+        session_file: Option<PathBuf>,
         /// Perform one SID-only Get-IP exchange against this explicit `host:port` node.
         /// No L3 packet forwarding, TUN, DNS, routes, or retries are started.
         #[arg(long)]
@@ -106,16 +122,19 @@ enum Command {
         #[arg(long, default_value_t = 8)]
         get_ip_timeout_seconds: u64,
     },
-    /// Fetch clientResource after an interactive session exists in this process.
+    /// Fetch clientResource for an existing session.
     ///
-    /// Run immediately after cas-login in the same process is not required; this command
-    /// only uses the cookie jar of the current probe process. Prefer chaining after
-    /// cas-login once session harvest lands, or import cookies via a future session store.
-    ClientResource,
+    /// Uses `--session-file` when given, otherwise the cookie jar of the current
+    /// probe process (i.e. chained after `cas-login` in the same invocation).
+    ClientResource {
+        /// Session saved earlier by `cas-login --session-file` or `password --session-file`.
+        #[arg(long)]
+        session_file: Option<PathBuf>,
+    },
     /// TLS-only smoke probe of data-plane nodes (no init frame / tunnel).
     ///
-    /// Without `--address`, loads `clientResource` from the current process cookie jar
-    /// (typically after `cas-login` in the same process once a session store exists).
+    /// Without `--address`, loads `clientResource` from `--session-file` when given,
+    /// otherwise from the current process cookie jar.
     NodeProbe {
         /// Probe only the first endpoint of each group. By default every endpoint is probed.
         /// Ignored with `--address` or `--group`.
@@ -127,17 +146,27 @@ enum Command {
         /// Direct `host:port` TLS probe without loading resources (Phase B smoke).
         #[arg(long)]
         address: Option<String>,
+        /// Session saved earlier by `cas-login --session-file` or `password --session-file`.
+        #[arg(long)]
+        session_file: Option<PathBuf>,
         #[arg(long, default_value_t = 5)]
         timeout_seconds: u64,
     },
-    /// Phase C: password-login, then dial one TCP tunnel and complete the aTrust handshake.
+    /// Phase C: establish a session, then dial one TCP tunnel and complete the aTrust handshake.
     ///
-    /// Reads credentials from `HERMES_ATRUST_USERNAME` / `HERMES_ATRUST_PASSWORD`.
+    /// The login method matches the authentication stage: pass `--session-file` to reuse a
+    /// session already established by `cas-login` (the only workable path on a gateway that
+    /// requires CAS + MFA), or omit it to run one local password login from
+    /// `HERMES_ATRUST_USERNAME` / `HERMES_ATRUST_PASSWORD`.
     /// This is a live data-plane action; it dials only the node you point it at and
     /// completes exactly one handshake to `--target`. Never auto-retries credentials.
     TcpDial {
+        /// Login domain for the password path. Ignored with `--session-file`.
         #[arg(long, default_value = "local")]
         login_domain: String,
+        /// Reuse a session saved by `cas-login --session-file` instead of logging in.
+        #[arg(long)]
+        session_file: Option<PathBuf>,
         /// Data-plane node `host:port`. Overrides the address advertised in clientResource
         /// (which is often a server-side loopback). Point this at the reachable node.
         #[arg(long)]
@@ -175,6 +204,15 @@ async fn main() -> ExitCode {
     if let Err(error) = hermes_logging::init(&logger) {
         eprintln!("failed to initialize logger: {error}");
         return ExitCode::FAILURE;
+    }
+    // Warn level so this is visible under the distribution default filter: the
+    // trace records live credentials verbatim and the operator must know.
+    if let Some(path) = cli.browser_trace_file.as_deref() {
+        warn!(
+            event = "probe.trace_contains_credentials",
+            path = %path.display(),
+            note = "trace records cookies, SID, SignKey, and credential request bodies verbatim (file mode 0600)"
+        );
     }
     info!(
         event = "probe.logger_ready",
@@ -258,25 +296,29 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
-        Command::Password { login_domain } => {
-            let username = env::var("HERMES_ATRUST_USERNAME")?;
-            let password = SecretString::new(env::var("HERMES_ATRUST_PASSWORD")?)?;
-            let credentials = PasswordCredentials::new(username, password, login_domain)?;
-            let device_id = DeviceId::new(random_hex(32))?;
-            let configuration = client
-                .auth_config(AuthConfigOptions {
-                    modified: false,
-                    need_ticket: true,
-                })
-                .await?;
-            let outcome = client
-                .authenticate_password(&configuration, &credentials, &device_id, None)
-                .await?;
-            info!(
-                event = "probe.password_primary_complete",
-                captcha_required = outcome.captcha_required,
-                ticket_received = outcome.ticket.is_some()
-            );
+        Command::Password {
+            login_domain,
+            session_file,
+        } => {
+            let session =
+                password_session(&client, transport.as_ref(), &endpoint, login_domain.clone())
+                    .await?;
+            log_session_material(&session.material);
+            append_probe_trace(
+                cli.browser_trace_file.as_deref(),
+                "session_material_assembled",
+                session_material_trace(&session.material),
+            )?;
+            if let Some(path) = session_file.as_deref() {
+                save_session_file(
+                    path,
+                    &endpoint,
+                    LoginMethod::Password,
+                    Some(login_domain),
+                    &session.cookies,
+                    &session.material,
+                )?;
+            }
         }
         Command::CasStart { login_domain } => {
             let configuration = client
@@ -301,6 +343,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             probe_nodes,
             node_connect_timeout_seconds,
             zju_client_data_file,
+            session_file,
             get_ip_node,
             get_ip_timeout_seconds,
         } => {
@@ -472,31 +515,25 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     match build_session_material(&login.gateway_cookies, username.as_deref()) {
                         Ok(material) => {
-                            let fields = material.log_fields();
-                            info!(
-                                event = "probe.session_material",
-                                sid_present = fields.sid_present,
-                                device_id_present = fields.device_id_present,
-                                connection_id_present = fields.connection_id_present,
-                                sign_key_present = fields.sign_key_present,
-                                username_present = fields.username_present,
-                                sign_key_provisional = fields.sign_key_provisional,
-                                sid_cookie_name = fields.sid_cookie_name,
-                                sid_sig_present = fields.sid_sig_present
-                            );
+                            log_session_material(&material);
                             append_probe_trace(
                                 cli.browser_trace_file.as_deref(),
                                 "session_material_assembled",
-                                json!({
-                                    "sid_fingerprint": sha256_fingerprint(material.sid.as_str().as_bytes()),
-                                    "device_id_fingerprint": sha256_fingerprint(material.device_id.as_str().as_bytes()),
-                                    "connection_id_fingerprint": sha256_fingerprint(material.connection_id.as_str().as_bytes()),
-                                    "sign_key_fingerprint": sha256_fingerprint(material.sign_key.expose()),
-                                    "sid_cookie_name": fields.sid_cookie_name,
-                                    "sid_sig_present": fields.sid_sig_present,
-                                    "sign_key_provisional": fields.sign_key_provisional,
-                                }),
+                                session_material_trace(&material),
                             )?;
+                            if let Some(path) = session_file.as_deref() {
+                                // Persist the live jar, not just the harvested cookie list:
+                                // the gateway may have set further cookies during onlineInfo
+                                // and clientResource after the browser import.
+                                save_session_file(
+                                    path,
+                                    &endpoint,
+                                    LoginMethod::Cas,
+                                    Some(login_domain.clone()),
+                                    &transport.session_cookies(&origin),
+                                    &material,
+                                )?;
+                            }
                             if let Some(node) = get_ip_node.as_deref() {
                                 let (node_host, node_port) = parse_host_port(node)?;
                                 match atrust_l3::get_ipv4(atrust_l3::GetIpv4Request {
@@ -601,7 +638,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let _ = browser.close().await;
             let _ = keep_browser_open;
         }
-        Command::ClientResource => {
+        Command::ClientResource { session_file } => {
+            if let Some(path) = session_file.as_deref() {
+                import_session_file(transport.as_ref(), &endpoint, path)?;
+            }
             let configuration = client
                 .auth_config(AuthConfigOptions {
                     modified: true,
@@ -622,6 +662,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             primary,
             group,
             address,
+            session_file,
             timeout_seconds,
         } => {
             let connect_timeout = Duration::from_secs(timeout_seconds.max(1));
@@ -638,6 +679,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         },
                     )]
                 } else {
+                    if let Some(path) = session_file.as_deref() {
+                        import_session_file(transport.as_ref(), &endpoint, path)?;
+                    }
                     let configuration = client
                         .auth_config(AuthConfigOptions {
                             modified: true,
@@ -679,6 +723,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::TcpDial {
             login_domain,
+            session_file,
             node,
             target,
             app_id,
@@ -686,67 +731,32 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             connect_timeout_seconds,
             handshake_timeout_seconds,
         } => {
-            // 1. One password authentication attempt (no captcha auto-solve, no retry).
-            let username_env = env::var("HERMES_ATRUST_USERNAME")?;
-            let password = SecretString::new(env::var("HERMES_ATRUST_PASSWORD")?)?;
-            let credentials = PasswordCredentials::new(username_env, password, login_domain)?;
-            let device_id = DeviceId::new(random_hex(32))?;
-            let configuration = client
-                .auth_config(AuthConfigOptions {
-                    modified: false,
-                    need_ticket: true,
-                })
-                .await?;
-            let outcome = client
-                .authenticate_password(&configuration, &credentials, &device_id, None)
-                .await?;
-            if outcome.captcha_required {
-                return Err(
-                    "server requires a graphical captcha; aborting without auto-solve".into(),
-                );
-            }
+            // 1. Establish the session the same way the authentication stage did.
+            // A gateway behind CAS + MFA cannot be entered by password login at all,
+            // so the stored-session path is the only usable one there.
+            let session = match session_file.as_deref() {
+                Some(path) => restore_session(&client, transport.as_ref(), &endpoint, path).await?,
+                None => {
+                    password_session(&client, transport.as_ref(), &endpoint, login_domain).await?
+                }
+            };
             info!(
-                event = "probe.tcp_dial.password_ok",
-                ticket_received = outcome.ticket.is_some()
+                event = "probe.tcp_dial.session_ready",
+                login_method = session.login_method.as_str()
             );
-
-            // 2. Refresh authConfig for the logged-in csrf and confirm the session by cookie.
-            let configuration = client
-                .auth_config(AuthConfigOptions {
-                    modified: true,
-                    need_ticket: false,
-                })
-                .await?;
-            let username = client.online_info(&configuration).await.ok();
-            info!(
-                event = "probe.tcp_dial.online_info",
-                username_present = username.is_some()
-            );
-
-            // 3. Export the server-set SID from the jar and assemble session material.
-            let origin = Url::parse(&format!("https://{}/", gateway_authority(&endpoint)))?;
-            let sid_value = transport
-                .session_cookie_value(&origin, "sid")
-                .ok_or("no sid cookie present after password login")?;
-            let sid_secret = SecretString::new(sid_value)?;
-            let material = SessionMaterial::from_cookie_sid(
-                &sid_secret,
-                "sid",
-                false,
-                device_id,
-                username.clone(),
-                None,
+            let EstablishedSession {
+                configuration,
+                material,
+                ..
+            } = session;
+            log_session_material(&material);
+            append_probe_trace(
+                cli.browser_trace_file.as_deref(),
+                "session_material_assembled",
+                session_material_trace(&material),
             )?;
-            let fields = material.log_fields();
-            info!(
-                event = "probe.tcp_dial.material",
-                sid_present = fields.sid_present,
-                sign_key_present = fields.sign_key_present,
-                sign_key_provisional = fields.sign_key_provisional,
-                username_present = fields.username_present
-            );
 
-            // 4. clientResource confirms authorization and can supply the node address.
+            // 2. clientResource confirms authorization and can supply the node address.
             let resources = match client.client_resource(&configuration).await {
                 Ok(resources) => {
                     log_client_resources(&endpoint, &resources);
@@ -847,6 +857,193 @@ fn build_tunnel_target(host: &str, port: u16, app_id: &str) -> TunnelTarget {
             resolved: None,
         },
     }
+}
+
+/// A control-plane session ready for data-plane use, however it was established.
+struct EstablishedSession {
+    configuration: AuthConfiguration,
+    material: SessionMaterial,
+    /// Gateway-scoped jar contents at the time the session became usable.
+    cookies: Vec<hermes_transport::GatewayCookie>,
+    login_method: LoginMethod,
+}
+
+/// Runs one local password login and assembles data-plane material from the
+/// server-set SID. Never auto-solves a captcha and never retries credentials.
+async fn password_session(
+    client: &AuthClient,
+    transport: &ReqwestTransport,
+    endpoint: &GatewayEndpoint,
+    login_domain: String,
+) -> Result<EstablishedSession, Box<dyn std::error::Error>> {
+    let username_env = env::var("HERMES_ATRUST_USERNAME")?;
+    let password = SecretString::new(env::var("HERMES_ATRUST_PASSWORD")?)?;
+    let credentials = PasswordCredentials::new(username_env, password, login_domain)?;
+    let device_id = DeviceId::new(random_hex(32))?;
+    let configuration = client
+        .auth_config(AuthConfigOptions {
+            modified: false,
+            need_ticket: true,
+        })
+        .await?;
+    let outcome = client
+        .authenticate_password(&configuration, &credentials, &device_id, None)
+        .await?;
+    if outcome.captcha_required {
+        return Err("server requires a graphical captcha; aborting without auto-solve".into());
+    }
+    info!(
+        event = "probe.password_primary_complete",
+        captcha_required = outcome.captcha_required,
+        ticket_received = outcome.ticket.is_some()
+    );
+
+    // Refresh authConfig for the logged-in csrf and confirm the session by cookie.
+    let configuration = client
+        .auth_config(AuthConfigOptions {
+            modified: true,
+            need_ticket: false,
+        })
+        .await?;
+    let username = client.online_info(&configuration).await.ok();
+    info!(
+        event = "probe.password_session.online_info",
+        username_present = username.is_some()
+    );
+
+    let origin = gateway_origin(endpoint)?;
+    let sid_value = transport
+        .session_cookie_value(&origin, "sid")
+        .ok_or("no sid cookie present after password login")?;
+    let sid_secret = SecretString::new(sid_value)?;
+    let material =
+        SessionMaterial::from_cookie_sid(&sid_secret, "sid", false, device_id, username, None)?;
+    Ok(EstablishedSession {
+        configuration,
+        material,
+        cookies: transport.session_cookies(&origin),
+        login_method: LoginMethod::Password,
+    })
+}
+
+/// Restores a session persisted by an earlier login, so a CAS + MFA session
+/// harvested in one process can drive the data plane in another.
+///
+/// The stored DeviceID / ConnectionID / SignKey are reused verbatim: a gateway
+/// that binds any of them to the session would reject freshly generated ones.
+async fn restore_session(
+    client: &AuthClient,
+    transport: &ReqwestTransport,
+    endpoint: &GatewayEndpoint,
+    path: &Path,
+) -> Result<EstablishedSession, Box<dyn std::error::Error>> {
+    let stored = import_session_file(transport, endpoint, path)?;
+    let configuration = client
+        .auth_config(AuthConfigOptions {
+            modified: true,
+            need_ticket: false,
+        })
+        .await?;
+    info!(
+        event = "probe.session_file_auth_config",
+        login_state = ?configuration.login_state,
+        csrf_present = !configuration.csrf_token.is_empty()
+    );
+    // onlineInfo is the cheapest proof the restored cookies are still live; a
+    // stale session must fail here rather than during the data-plane handshake.
+    let username = client.online_info(&configuration).await?;
+    info!(
+        event = "probe.session_file_online_info",
+        username_present = !username.is_empty()
+    );
+    let material = stored.to_material()?;
+    let origin = gateway_origin(endpoint)?;
+    Ok(EstablishedSession {
+        configuration,
+        material,
+        cookies: transport.session_cookies(&origin),
+        login_method: stored.login_method,
+    })
+}
+
+/// Loads a stored session and imports its cookies into the process jar.
+fn import_session_file(
+    transport: &ReqwestTransport,
+    endpoint: &GatewayEndpoint,
+    path: &Path,
+) -> Result<StoredSession, Box<dyn std::error::Error>> {
+    let stored = StoredSession::load(path)?;
+    stored.ensure_gateway(endpoint)?;
+    let cookies = stored.gateway_cookies();
+    let origin = gateway_origin(endpoint)?;
+    transport.import_gateway_cookies(&origin, &cookies)?;
+    info!(
+        event = "probe.session_file_loaded",
+        login_method = stored.login_method.as_str(),
+        login_domain = stored.login_domain.as_deref().unwrap_or(""),
+        cookie_count = cookies.len(),
+        saved_unix_ms = stored.saved_unix_ms as u64,
+        sign_key_provisional = stored.sign_key_provisional,
+        path = %path.display()
+    );
+    Ok(stored)
+}
+
+fn save_session_file(
+    path: &Path,
+    endpoint: &GatewayEndpoint,
+    login_method: LoginMethod,
+    login_domain: Option<String>,
+    cookies: &[hermes_transport::GatewayCookie],
+    material: &SessionMaterial,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stored = StoredSession::capture(endpoint, login_method, login_domain, cookies, material);
+    stored.save(path)?;
+    info!(
+        event = "probe.session_file_saved",
+        login_method = login_method.as_str(),
+        cookie_count = cookies.len(),
+        path = %path.display()
+    );
+    Ok(())
+}
+
+fn gateway_origin(endpoint: &GatewayEndpoint) -> Result<Url, url::ParseError> {
+    Url::parse(&format!("https://{}/", gateway_authority(endpoint)))
+}
+
+/// Presence-only session summary for the log stream, which is not owner-only.
+fn log_session_material(material: &SessionMaterial) {
+    let fields = material.log_fields();
+    info!(
+        event = "probe.session_material",
+        sid_present = fields.sid_present,
+        device_id_present = fields.device_id_present,
+        connection_id_present = fields.connection_id_present,
+        sign_key_present = fields.sign_key_present,
+        username_present = fields.username_present,
+        sign_key_provisional = fields.sign_key_provisional,
+        sid_cookie_name = fields.sid_cookie_name,
+        sid_sig_present = fields.sid_sig_present
+    );
+}
+
+/// Full session material for the trace file. Unlike the log stream this records
+/// raw values: the SID, DeviceID, ConnectionID, and SignKey are exactly what the
+/// init JSON carries, and comparing them against a capture is the whole point of
+/// the trace. The trace file is 0600; see `--browser-trace-file`.
+fn session_material_trace(material: &SessionMaterial) -> serde_json::Value {
+    let fields = material.log_fields();
+    json!({
+        "sid": material.sid.as_str(),
+        "device_id": material.device_id.as_str(),
+        "connection_id": material.connection_id.as_str(),
+        "sign_key_hex": material.sign_key.to_hex_lower(),
+        "username": material.username,
+        "sid_cookie_name": fields.sid_cookie_name,
+        "sid_sig_present": fields.sid_sig_present,
+        "sign_key_provisional": fields.sign_key_provisional,
+    })
 }
 
 fn build_session_material(

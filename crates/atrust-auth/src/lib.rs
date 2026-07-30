@@ -8,6 +8,7 @@ mod password;
 mod profile;
 mod resource;
 mod session;
+mod store;
 
 pub use auth_config::{AuthConfigOptions, AuthConfiguration, AuthInfo, LoginState};
 pub use cas::{CasCallbackCredential, CasChallenge, CasError, CasExchange, parse_portal_ticket};
@@ -23,3 +24,6 @@ pub use resource::{
     NodeGroup, ResolvedNodeEndpoint, ResolvedNodeGroup, ResourceError, ResourceProtocol,
 };
 pub use session::{AuthStep, SessionProgress};
+pub use store::{
+    LoginMethod, SESSION_STORE_VERSION, SessionStoreError, StoredCookie, StoredSession,
+};

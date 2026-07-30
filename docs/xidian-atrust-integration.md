@@ -16,8 +16,10 @@ Xidian 的完整登录必须有人工参与，不能作为无人值守流程运�
 2. 用户自行输入账号、密码、滑块、SMS 验证码及后续可能增加的因子；
 3. Hermes **不**实现验证码识别、滑块破解、代填或绕过二次认证；
 4. 不自动重复密码提交、验证码发送或校验，避免账户锁定和发送频率限制；
-5. 日志和测试产物不得包含密码、验证码、Cookie 值、ticket 值、完整回调 URL、
-   敏感 Header 或响应正文；最多记录路径、业务码、Cookie **名**、布尔标志；
+5. **日志流**（stderr / `--log-file`）不得包含密码、验证码、Cookie 值、ticket 值、
+   完整回调 URL、敏感 Header 或响应正文；最多记录路径、业务码、Cookie **名**、布尔标志。
+   `--browser-trace-file` 指向的调试 trace 是例外：它刻意不脱敏（见架构文档强制边界
+   12），文件强制 `0600`，属于凭据材料，不得随报告或 issue 分发；
 6. 自动化只负责打开入口、观察导航/Cookie 名，并在**用户确认流程结束后**收割
    网关 Cookie 会话。
 
@@ -118,8 +120,11 @@ TLS `node-probe` 与 TCP 帧 codec 已落地。Phase B 已接线（`cas-login --
 | 判读 | 卡在 **TCP connect**（非 TLS 握手/证书），即**网络层不可达**；根因为**探测方在外网**，节点 `:441` 为校内地址 |
 | 对照 | 控制面 `:443` 外网可通，数据节点 `:441` 外网不可达 |
 
-脱敏回归：本次 trace 已确认不含学号 / `ticket=` / `Cookie` 头值 / `postData`（修复 `request_id`
-误写整个 RequestData 的漏洞后生效）。**尚未**对西电节点成功 TLS、发 init 或建隧道。
+**尚未**对西电节点成功 TLS、发 init 或建隧道。
+
+> 注（2026-07-30）：此前 trace 做过字段级脱敏（只留长度 + sha256 + 字段名）。该策略已
+> 撤销——脱敏后无法定位字段级差异，反而拖慢协议联调。现在 trace 全保真 + `0600`，
+> 凭据保护交给日志默认 `warn` 级别与目录权限。
 
 ### 已证伪或应避免的策略
 
@@ -205,14 +210,46 @@ cargo run -p atrust-probe -- \
 ## 尚未闭环
 
 1. ~~`clientResource` 客户端请求与严格解析 + 西电实测计数~~
-2. SID / DeviceID / ConnectionID / SignKey 的**服务端绑定确认**与跨进程持久化
+2. SID / DeviceID / ConnectionID / SignKey 的**服务端绑定确认**
    （Cookie SID 与隧道 init JSON 是否同一值仍待抓包；SignKey 仍 provisional）；
 3. 节点 TLS 可达性 live、TCP/L3 隧道、代理与 TUN；
 4. 将 SMS/MFA 建模为可恢复的 `SessionProgress::InteractionRequired` 产品状态机
    （当前 Xidian 路径把 MFA 全部留在浏览器内完成）；
-5. 脱敏 golden fixture 与更多 ignored live tests；
-6. 会话 Cookie 跨进程持久化（当前 jar 仅进程内；`cas-login` 成功后同进程会尝试 `clientResource`）；
+5. golden fixture 与更多 ignored live tests；
+6. ~~会话 Cookie 跨进程持久化~~ **已完成（2026-07-30）：** `--session-file` 会话存储，
+   见下节；
 7. BiDi `browser_url_change` 噪音过大（静态资源也记入），可改为仅 document 导航。
+
+## 会话存储与登录方式一致性（2026-07-30）
+
+网关 Cookie jar 原先只存在于进程内，`tcp-dial` 因此写死了密码登录路径——而西电必须走
+CAS + MFA，密码登录根本拿不到会话。现在登录方式由**会话来源**决定，不再由子命令决定：
+
+```bash
+# 一次 CAS + MFA，把会话落到 0600 文件
+cargo run -p atrust-probe -- --host atrust.xidian.edu.cn \
+  cas-login --login-domain cas42187 --session-file ~/.cache/hermes/xidian.json
+
+# 之后任意进程复用同一会话，无需重做 MFA
+cargo run -p atrust-probe -- --host atrust.xidian.edu.cn \
+  tcp-dial --session-file ~/.cache/hermes/xidian.json --node '<node>:441' --target '<host>:80'
+cargo run -p atrust-probe -- --host atrust.xidian.edu.cn \
+  node-probe --session-file ~/.cache/hermes/xidian.json
+cargo run -p atrust-probe -- --host atrust.xidian.edu.cn \
+  client-resource --session-file ~/.cache/hermes/xidian.json
+```
+
+`password --session-file` 走同样的写入路径，因此 `tcp-dial` 对两种登录方式只有一套消费代码。
+
+存储内容与约束：
+
+- 全部网关 Cookie（值原样）、SID、DeviceID、ConnectionID、SignKey、用户名、登录方式与
+  登录域；文件强制 `0600`。
+- **DeviceID / ConnectionID / SignKey 一并持久化，恢复时原样使用**，不重新随机。
+  `ConnectionId = UPPER(MD5(deviceId)) + "-" + micros`，若服务端把 DeviceID 绑到会话或
+  `reportEnv`，跨进程换 ID 会被拒；同进程路径会掩盖这个问题，持久化后才会暴露。
+- 恢复时校验存储的网关 host:port 与 `--host/--port` 一致，避免把一处会话发往另一处；
+  随后用 `onlineInfo` 验活，过期会话在控制面失败，而不是拖到数据面握手才报错。
 
 ## 下一阶段任务（建议顺序）
 
@@ -220,10 +257,10 @@ cargo run -p atrust-probe -- \
 
 1. **Phase B live：** `node-probe --primary`（或 `--address`）对西电解析出的节点做
    TLS-only 冒烟；记录成功/超时/证书错误，**不发** init。
-2. **Phase A 收尾：** 抓包/对照确认 Cookie `sid` ≡ 隧道 init SID；查 SignKey 注册路径；
-   可选 gitignored 会话落盘，便于跨进程 `client-resource` / `node-probe`。
+2. **Phase A 收尾：** 抓包/对照确认 Cookie `sid` ≡ 隧道 init SID；查 SignKey 注册路径。
+   ~~可选 gitignored 会话落盘~~ 已由 `--session-file` 完成。
 3. **Phase C：** mock TLS 对端 + TCP 握手状态机；再 `tcp-dial` 单一受控目标（ignored live）。
-4. 产品化：跨进程 session store、MFA 状态机、日志降噪（document-only URL）。
+4. 产品化：~~跨进程 session store~~（已完成）、MFA 状态机、日志降噪（document-only URL）。
 5. Phase D（延后）：L3 / VIP / TUN / DNS。
 
 ## 双轨实验计划

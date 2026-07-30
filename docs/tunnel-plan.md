@@ -34,8 +34,10 @@
    - 导入 Cookie 值可按名回读（仅 jar 内，不进日志）。
 5. **仍待：**
    - 确认 Cookie SID 是否即隧道 init JSON 的 SID（抓包对照）；
-   - SignKey 服务端注册/绑定；
-   - 可选：gitignored 会话持久化。
+   - SignKey 服务端注册/绑定。
+6. **已完成（2026-07-30）：** 跨进程会话持久化 `--session-file`（`atrust_auth::StoredSession`，
+   `0600`）。`cas-login` / `password` 写入，`tcp-dial` / `node-probe` / `client-resource` 读取，
+   DeviceID / ConnectionID / SignKey 原样恢复而非重新随机。
 
 ### Phase B — 单节点 TLS 冒烟（无业务隧道）
 
@@ -98,6 +100,41 @@ psw 登录 → jar 导出 SID → `SessionMaterial`（`sign_key_provisional=true
 
 EasyConnect 不在本规划内。
 
+#### 进入 L3 前的闸门（2026-07-30 评估）
+
+**必须先在西电真机确认**（否则 L3 代码形状会猜错）：
+
+1. **SignKey 是否真被校验 —— 1 号闸门。** 目前 `sign_key_provisional=true`，唯一通过的
+   握手来自参考服务端 `sign_key_hex=None → UnboundAccepted`。§3.3 的 `0x13` 逐流鉴权
+   同样以 HMAC-SHA256 覆盖整段 JSON 字节串，若西电真校验，第一个五元组即失败。
+   最便宜的判定：西电 `tcp-dial` 各跑一次正常 key 与改 1 bit 的 key——都通过=不校验；
+   都拒=key 另有来源；一通一拒=必须先解决绑定。
+2. **西电原生 `tcp-dial` live**（Phase C 只对公网参考服务端通过）。带两个未知进 L3
+   无法二分定位。会话持久化落地后此条已无阻塞。
+3. **Get-IP 西电 live 复跑**，并保留 `53 00` 响应 JSON：`atrust-l3` 目前读完即丢，
+   而该 JSON 可能带 VIP / 掩码 / second VIP 线索，应落 trace。
+4. **`0x94` 下行双格式判别字段**（架构文档未决项 2），不得按数值区间猜。
+5. **`tcp:` vs `tcp://`**：TCP init 用 `tcp://`（`tcp_init.rs`），§3.3 的 L3 鉴权写
+   `tcp:10.0.0.1:443`。L3 需独立 wire DTO，不复用 `build_signed_tcp_init_json`。
+
+**可离线先做完、不被校内网络阻塞：**
+
+1. **资源匹配器（最大一块前置代码）**：`ClientResources` 目前只有解析、没有查询 API。
+   L3 发包前须按 `(dstIP, protocol, dstPort)` 命中 IP 资源选出 `appId` + `nodeGroupId`，
+   未命中则不进 VPN。需 CIDR 最长前缀 + 协议 + 端口区间匹配，纯离线可 golden 测试。
+2. ~~会话持久化~~（已完成，见执行清单第 8 项）。
+3. L3 帧 codec：`05 14` 上行编码器与心跳 `05 15 00 00` / `05 95`，配 property/fuzz；
+   `0x94` 解码器等第 4 项闸门。
+4. conntrack + connectToken 状态机：首见五元组建项、8s 超时、驱逐连接、重试一次、
+   仍失败丢包。纯状态机可单测。
+5. IPv4 包解析（atype / protocol / 五元组），只做 IPv4，与 Go `processIPV4` 一致。
+6. 节点时延选优（`pingNum=3`）：L3 每个 node group 缓存一条长连接，选错代价大于 Phase C。
+7. 超时预算复核：实测 TLS connect+handshake 约 6.3s，而鉴权超时 8s，叠加会误判为鉴权失败。
+
+**范围边界：** L3 里程碑止于「总连接认证 + VIP + 一条五元组鉴权 + 一个数据包往返」，
+用手工构造 IP 包验证，**不接 TUN / DNS / 路由**——TUN 一旦接上，故障域从协议扩到内核
+路由表，无法二分。
+
 ## 建议 crate / 模块边界
 
 ```text
@@ -144,7 +181,12 @@ atrust-probe         人工诊断子命令：auth / cas-login / client-resource 
 7. Cookie SID ↔ init JSON SID 抓包对照；SignKey 服务端策略确认。
    **参考服务端已确认（2026-07-29）：** SID 即 psw 响应 `Set-Cookie: sid=`，`session_cookie_value`
    从 jar 导出后原样进 init JSON；服务端 `sign_key_hex=None` → UnboundAccepted 放行。西电真机仍待抓包。
-8. 可选：gitignored 会话持久化，支撑跨进程 node-probe / tcp-dial。
+8. ~~可选：gitignored 会话持久化，支撑跨进程 node-probe / tcp-dial。~~
+   **已完成（2026-07-30）：** `--session-file`（`StoredSession`，`0600`）。`cas-login` /
+   `password` 写，`tcp-dial` / `node-probe` / `client-resource` 读。这也解开了 `tcp-dial`
+   写死密码登录的限制：CAS + MFA 网关现在可以直接复用浏览器收割的会话拨号。
+   DeviceID / ConnectionID / SignKey 恢复时原样使用——若服务端把 DeviceID 绑到会话，
+   同进程路径会掩盖问题，持久化后才会暴露。
 9. ~~单一目标 `tcp-dial` live（ignored；需 CLI 接线）。~~
    **已完成（2026-07-29）：** `tcp-dial` 子命令已接线，对公网参考服务端 live 打通（见 Phase C 状态）。
 10. SID-only Get-IP 原生探针。

@@ -134,6 +134,16 @@ pub trait HttpTransport: Send + Sync {
     fn session_cookie_value(&self, _origin: &Url, _name: &str) -> Option<String> {
         None
     }
+
+    /// Returns every cookie the jar would send to `origin`, shaped for re-import.
+    ///
+    /// Used to persist a live session across processes. Cookie attributes are
+    /// not recoverable from a jar that only exposes the outgoing `Cookie:`
+    /// header, so implementations fill in the origin host, `/`, `Secure`, and
+    /// `HttpOnly`; only the names and values are authoritative.
+    fn session_cookies(&self, _origin: &Url) -> Vec<GatewayCookie> {
+        Vec::new()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -475,6 +485,37 @@ impl HttpTransport for ReqwestTransport {
         }
         None
     }
+
+    fn session_cookies(&self, origin: &Url) -> Vec<GatewayCookie> {
+        use reqwest::cookie::CookieStore as _;
+        let Some(host) = origin.host_str() else {
+            return Vec::new();
+        };
+        let Some(header) = self.jar.cookies(origin) else {
+            return Vec::new();
+        };
+        let Ok(raw) = header.to_str() else {
+            return Vec::new();
+        };
+        raw.split(';')
+            .filter_map(|pair| pair.trim().split_once('='))
+            .filter_map(|(name, value)| {
+                let name = name.trim();
+                let value = value.trim();
+                if name.is_empty() || value.is_empty() {
+                    return None;
+                }
+                Some(GatewayCookie {
+                    name: name.to_owned(),
+                    value: value.to_owned(),
+                    domain: Some(host.to_owned()),
+                    path: Some("/".to_owned()),
+                    secure: true,
+                    http_only: true,
+                })
+            })
+            .collect()
+    }
 }
 
 fn validate_cookie_token(value: &str) -> Result<(), ()> {
@@ -752,5 +793,47 @@ mod tests {
             Some("SID-from-jar")
         );
         assert_eq!(transport.session_cookie_value(&origin, "absent"), None);
+    }
+
+    #[test]
+    fn session_cookies_export_every_jar_entry_for_reimport() {
+        // Persisting a session must capture the whole jar, not just the SID, and
+        // the exported shape must round-trip back through `import_gateway_cookies`.
+        let transport = ReqwestTransport::new(&ReqwestTransportConfig::default()).unwrap();
+        let origin = Url::parse("https://atrust.example.edu/").unwrap();
+        transport
+            .import_gateway_cookies(
+                &origin,
+                &[
+                    sample_cookie("sid", "sid-value", None),
+                    sample_cookie("lang", "zh-CN", None),
+                ],
+            )
+            .unwrap();
+
+        let exported = transport.session_cookies(&origin);
+        let mut pairs = exported
+            .iter()
+            .map(|cookie| (cookie.name.as_str(), cookie.value.as_str()))
+            .collect::<Vec<_>>();
+        pairs.sort();
+        assert_eq!(pairs, vec![("lang", "zh-CN"), ("sid", "sid-value")]);
+        assert!(exported.iter().all(|cookie| cookie.domain.as_deref()
+            == Some("atrust.example.edu")
+            && cookie.path.as_deref() == Some("/")));
+
+        let restored = ReqwestTransport::new(&ReqwestTransportConfig::default()).unwrap();
+        restored.import_gateway_cookies(&origin, &exported).unwrap();
+        assert_eq!(
+            restored.session_cookie_value(&origin, "sid").as_deref(),
+            Some("sid-value")
+        );
+    }
+
+    #[test]
+    fn session_cookies_are_empty_without_a_jar_entry() {
+        let transport = ReqwestTransport::new(&ReqwestTransportConfig::default()).unwrap();
+        let origin = Url::parse("https://atrust.example.edu/").unwrap();
+        assert!(transport.session_cookies(&origin).is_empty());
     }
 }

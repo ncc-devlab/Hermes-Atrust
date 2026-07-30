@@ -22,7 +22,7 @@ application
 - `hermes-transport`：可替换的异步 HTTP 接口、受限响应读取和显式 TLS 策略；
 - `atrust-auth`：`authConfig`、RSA 密码主认证、CAS challenge 和严格回调校验；
 - `atrust-browser`：可复用的 WebDriver/BiDi 复杂 CAS/MFA 人工登录、网关 Cookie
-  收割和脱敏 trace；
+  收割和全保真 trace（`0600`，见强制边界 12）；
 - `atrust-tcp`：单连接 TCP 隧道握手和帧化 I/O；
 - `atrust-l3`：SID-only Get-IP 实验探针；尚不包含总连接、单流授权或数据转发；
 - `atrust-probe`：组合上述库进行真实对端诊断，不再拥有浏览器协议实现。
@@ -45,7 +45,13 @@ application
 9. 业务模块统一通过 `tracing` 发出结构化事件；只有应用入口可以初始化 logger。
 10. transport 日志只记录方法、主机、状态、耗时和长度，不记录 query、Header 或正文。
 11. 分发应用默认使用 `warn` 过滤器；需要详细诊断时由操作者通过 `HERMES_LOG`
-    显式启用 `info`/`debug`。浏览器 trace 始终脱敏，不依赖日志过滤器保护凭据。
+    显式启用 `info`/`debug`。
+12. **日志流与 trace 文件是两类产物，保护方式不同。** 日志流（stderr / `--log-file`）
+    只记录存在性、计数、状态码和耗时，永远不含凭据，因此在任何过滤级别下都安全。
+    `--browser-trace-file` 指向的 trace 则**不做脱敏**：Cookie 值、SID、SignKey、
+    DeviceID、完整 URL、请求正文（含 CAS 凭据 POST）一律原样写入，用途是与抓包逐字节
+    对照。该文件强制 `0600`，由目录权限保护，启用时打一条 `warn` 提示；它是凭据材料，
+    不得随报告分发。脱敏会让协议联调无法定位字段级差异，这一权衡是刻意的。
 
 ## 测试层次
 

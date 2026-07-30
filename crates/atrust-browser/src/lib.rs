@@ -6,6 +6,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -72,20 +73,20 @@ pub struct BrowserLoginResult {
     pub portal_hits: u32,
 }
 
-/// Redacted, append-only browser observability record. Values are deliberately
-/// represented by lengths, hashes, or field names so the trace can be shared.
+/// Append-only browser observability record. Values are recorded verbatim:
+/// cookies, URLs with query values, headers, and request bodies (including
+/// credential POSTs) all land in this file so live captures can be compared
+/// byte for byte. The file is owner-only; treat it as credential material and
+/// never attach it to a report. Diagnostic logs stay non-secret by default
+/// because the logger filters to `warn` unless `HERMES_LOG` opts in.
 struct TraceWriter {
     file: BufWriter<File>,
     sequence: u64,
 }
 
-/// Adds a redacted control-plane lifecycle record to an existing browser trace.
+/// Adds a control-plane lifecycle record to an existing browser trace.
 pub fn append_trace_event(path: &Path, kind: &str, data: Value) -> Result<(), BrowserError> {
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(BrowserError::Trace)?;
+    let file = open_trace_file(path)?;
     let mut file = BufWriter::new(file);
     let record = json!({
         "trace_version": TRACE_VERSION,
@@ -111,13 +112,24 @@ fn next_sequence(path: &Path) -> Result<u64, BrowserError> {
     }
 }
 
+/// Opens the trace for append, creating it as `0600` and tightening an existing
+/// file to `0600`. The trace holds live session cookies and credential bodies,
+/// so a group- or world-readable mode is never acceptable.
+fn open_trace_file(path: &Path) -> Result<File, BrowserError> {
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(BrowserError::Trace)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(BrowserError::Trace)?;
+    Ok(file)
+}
+
 impl TraceWriter {
     fn open(path: &Path) -> Result<Self, BrowserError> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .map_err(BrowserError::Trace)?;
+        let file = open_trace_file(path)?;
         let mut writer = Self {
             file: BufWriter::new(file),
             sequence: 0,
@@ -247,8 +259,8 @@ impl WebDriverBrowser {
             &mut trace,
             "browser_session_attached",
             json!({
-                "session_id_sha256": sha256_hex(self.session_id.as_bytes()),
-                "bidi_endpoint": safe_url(&self.bidi_endpoint),
+                "session_id": self.session_id,
+                "bidi_endpoint": self.bidi_endpoint.as_str(),
             }),
         )?;
         let (mut events, _) = timeout_at(deadline, connect_async(self.bidi_endpoint.as_str()))
@@ -634,48 +646,52 @@ fn trace_bidi_event(trace: &mut Option<TraceWriter>, event: &Value) -> Result<()
         return Ok(());
     };
     let params = event.get("params").unwrap_or(&Value::Null);
-    let Some(data) = redact_bidi_event(method, params) else {
+    let Some(data) = bidi_event_record(method, params) else {
         return Ok(());
     };
     trace_record(trace, method, data)
 }
 
-/// Pure redaction of a subscribed BiDi network/navigation event into a record
-/// that carries only lengths, hashes, header/query names, and the opaque
-/// request-id string. Returns `None` for events that are not traced.
+/// Projects a subscribed BiDi network/navigation event into a trace record.
+/// Returns `None` for events that are not traced.
 ///
-/// Kept side-effect free so tests can assert no raw request/response object,
-/// cookie value, ticket, or callback URL survives.
-fn redact_bidi_event(method: &str, params: &Value) -> Option<Value> {
+/// Values are kept verbatim — full URLs including query values, header values,
+/// and request bodies (CAS credential POSTs included) — so a trace line can be
+/// diffed against a packet capture without re-running the login. The trace file
+/// is `0600` and is credential material; see [`TraceWriter`].
+///
+/// Kept side-effect free so it stays unit-testable.
+fn bidi_event_record(method: &str, params: &Value) -> Option<Value> {
     let data = match method {
         "network.beforeRequestSent" => {
             let request = params.get("request").unwrap_or(&Value::Null);
             json!({
                 "request_id": request_id_field(params.get("request")),
                 "method": request.get("method").and_then(Value::as_str),
-                "url": request.get("url").and_then(Value::as_str).and_then(|url| Url::parse(url).ok()).map(|url| safe_url_with_query_names(&url)),
-                "headers": header_names(request.get("headers")),
-                "body": payload_summary(request.get("postData").or_else(|| request.get("body"))),
+                "url": request.get("url").and_then(Value::as_str),
+                "headers": header_entries(request.get("headers")),
+                "cookies": header_entries(request.get("cookies")),
+                "body": payload_record(request.get("postData").or_else(|| request.get("body"))),
             })
         }
         "network.responseCompleted" => {
             let response = params.get("response").unwrap_or(&Value::Null);
             json!({
                 "request_id": request_id_field(params.get("request")),
-                "url": response.get("url").and_then(Value::as_str).and_then(|url| Url::parse(url).ok()).map(|url| safe_url_with_query_names(&url)),
+                "url": response.get("url").and_then(Value::as_str),
                 "status": response.get("status"),
-                "status_text_present": response.get("statusText").and_then(Value::as_str).is_some_and(|value| !value.is_empty()),
-                "headers": header_names(response.get("headers")),
+                "status_text": response.get("statusText").and_then(Value::as_str),
+                "headers": header_entries(response.get("headers")),
                 "mime_type": response.get("content").and_then(|content| content.get("mimeType")).and_then(Value::as_str),
             })
         }
         "network.fetchError" => json!({
             "request_id": request_id_field(params.get("request")),
-            "url": params.get("url").and_then(Value::as_str).and_then(|url| Url::parse(url).ok()).map(|url| safe_url_with_query_names(&url)),
-            "error_present": params.get("errorText").and_then(Value::as_str).is_some_and(|value| !value.is_empty()),
+            "url": params.get("url").and_then(Value::as_str),
+            "error": params.get("errorText").and_then(Value::as_str),
         }),
         "browsingContext.navigationStarted" | "browsingContext.load" => json!({
-            "url": params.get("url").and_then(Value::as_str).and_then(|url| Url::parse(url).ok()).map(|url| safe_url_with_query_names(&url)),
+            "url": params.get("url").and_then(Value::as_str),
         }),
         _ => return None,
     };
@@ -689,7 +705,7 @@ fn cookie_trace(cookies: &[GatewayCookie]) -> Value {
             .map(|cookie| {
                 json!({
                     "name": cookie.name,
-                    "value_len": cookie.value.len(),
+                    "value": cookie.value,
                     "value_sha256": sha256_hex(cookie.value.as_bytes()),
                     "domain": cookie.domain,
                     "path": cookie.path,
@@ -701,113 +717,56 @@ fn cookie_trace(cookies: &[GatewayCookie]) -> Value {
     )
 }
 
-fn header_names(headers: Option<&Value>) -> Vec<String> {
-    let mut names = headers
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|header| header.get("name").and_then(Value::as_str))
-        .map(str::to_ascii_lowercase)
-        .collect::<Vec<_>>();
-    names.sort();
-    names.dedup();
-    names
+/// Flattens a BiDi header/cookie list into `name` + `value` pairs. BiDi wraps
+/// each value as `{"type":"string","value":...}`; unwrap it so the trace holds
+/// the header text a capture would show.
+fn header_entries(headers: Option<&Value>) -> Value {
+    Value::Array(
+        headers
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|header| {
+                json!({
+                    "name": header.get("name").and_then(Value::as_str),
+                    "value": header
+                        .get("value")
+                        .map(|value| match value.get("value") {
+                            Some(inner) => inner.clone(),
+                            None => value.clone(),
+                        }),
+                })
+            })
+            .collect(),
+    )
 }
 
-fn payload_summary(payload: Option<&Value>) -> Value {
+/// Records a request body verbatim, plus its length and digest for correlating
+/// with a capture. Parsed JSON is kept alongside the raw text for readability.
+fn payload_record(payload: Option<&Value>) -> Value {
     let Some(payload) = payload else {
         return Value::Null;
     };
-    let bytes = payload
+    let text = payload
         .get("value")
         .and_then(Value::as_str)
-        .or_else(|| payload.as_str())
-        .map(str::as_bytes);
-    if let Some(bytes) = bytes {
+        .or_else(|| payload.as_str());
+    if let Some(text) = text {
         return json!({
-            "length": bytes.len(),
-            "sha256": sha256_hex(bytes),
-            "json_keys": serde_json::from_slice::<Value>(bytes).ok().map(|value| json_keys(&value)),
-            "correlation_fingerprints": serde_json::from_slice::<Value>(bytes)
-                .ok()
-                .map(|value| correlation_fingerprints(&value)),
+            "length": text.len(),
+            "sha256": sha256_hex(text.as_bytes()),
+            "raw": text,
+            "json": serde_json::from_str::<Value>(text).ok(),
         });
     }
-    json!({ "present": true, "shape": json_shape(payload) })
+    payload.clone()
 }
 
-fn json_keys(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            Value::Array(map.keys().map(|key| Value::String(key.clone())).collect())
-        }
-        Value::Array(values) => Value::Array(values.iter().map(json_keys).collect()),
-        _ => Value::Null,
-    }
-}
-
-fn json_shape(value: &Value) -> &'static str {
-    match value {
-        Value::Object(_) => "object",
-        Value::Array(_) => "array",
-        Value::String(_) => "string",
-        Value::Number(_) => "number",
-        Value::Bool(_) => "bool",
-        Value::Null => "null",
-    }
-}
-
-fn correlation_fingerprints(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut fields = serde_json::Map::new();
-            for (key, value) in map {
-                if matches!(
-                    key.as_str(),
-                    "sid" | "signKey" | "deviceId" | "connectionId"
-                ) {
-                    if let Some(value) = value.as_str() {
-                        fields.insert(
-                            key.clone(),
-                            json!({
-                                "length": value.len(),
-                                "sha256": sha256_hex(value.as_bytes()),
-                            }),
-                        );
-                    }
-                }
-                let nested = correlation_fingerprints(value);
-                if nested != Value::Null {
-                    fields.insert(format!("{key}.*"), nested);
-                }
-            }
-            if fields.is_empty() {
-                Value::Null
-            } else {
-                Value::Object(fields)
-            }
-        }
-        Value::Array(values) => {
-            let values = values
-                .iter()
-                .map(correlation_fingerprints)
-                .filter(|value| *value != Value::Null)
-                .collect::<Vec<_>>();
-            if values.is_empty() {
-                Value::Null
-            } else {
-                Value::Array(values)
-            }
-        }
-        _ => Value::Null,
-    }
-}
-
-/// Extracts only the opaque request-id string from a BiDi `RequestData`.
+/// Extracts the opaque request-id string from a BiDi `RequestData`.
 ///
-/// Never returns the surrounding object: `RequestData` also carries the full
-/// URL, request/response headers, cookies, and POST body, none of which may
-/// enter the redacted trace. Anything that is not a plain string id is dropped.
+/// The surrounding object is dropped because it duplicates the URL, headers,
+/// cookies, and body that the event arms already record explicitly. Anything
+/// that is not a plain string id collapses to null.
 fn request_id_field(request_data: Option<&Value>) -> Value {
     match request_data
         .and_then(|data| data.get("request"))
@@ -818,29 +777,10 @@ fn request_id_field(request_data: Option<&Value>) -> Value {
     }
 }
 
-fn safe_url(url: &Url) -> String {
-    safe_url_with_query_names(url)
-}
-
-fn safe_url_with_query_names(url: &Url) -> String {
-    let mut value = safe_path(url);
-    let names = url
-        .query_pairs()
-        .map(|(name, _)| name.into_owned())
-        .collect::<Vec<_>>();
-    if !names.is_empty() {
-        value.push('?');
-        value.push_str(&names.join("&"));
-    }
-    value
-}
-
+/// Digest recorded alongside a raw value so a trace line can be matched to a
+/// capture without re-reading the whole body.
 fn sha256_hex(value: &[u8]) -> String {
     hex::encode(Sha256::digest(value))
-}
-
-pub fn sha256_fingerprint(value: &[u8]) -> String {
-    sha256_hex(value)
 }
 
 fn unix_millis() -> u128 {
@@ -977,10 +917,9 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        normalized_endpoint, payload_summary, portal_ticket_harvest_allowed, redact_bidi_event,
-        request_id_field, safe_url_with_query_names,
+        bidi_event_record, normalized_endpoint, payload_record, portal_ticket_harvest_allowed,
+        request_id_field,
     };
-    use url::Url;
 
     #[test]
     fn normalizes_webdriver_endpoint_path() {
@@ -1012,75 +951,76 @@ mod tests {
     }
 
     #[test]
-    fn trace_url_keeps_path_and_query_names_only() {
-        let url = Url::parse("https://gateway.test/passport/v1/auth?sid=secret&code=123").unwrap();
-        assert_eq!(
-            safe_url_with_query_names(&url),
-            "https://gateway.test/passport/v1/auth?sid&code"
-        );
-    }
-
-    #[test]
-    fn response_completed_emits_request_id_string_not_raw_object() {
-        // Realistic BiDi params whose `request` RequestData carries secrets that
-        // must never reach the trace (student id, ticket, cookie header values).
+    fn response_completed_keeps_full_url_and_header_values() {
+        // The trace is a debugging artifact compared against packet captures, so
+        // query values and Set-Cookie values are recorded verbatim.
         let params = json!({
             "request": {
                 "request": "REQ-ID-1234",
-                "url": "https://gw/portal/shortcut.html?username=student-secret-id&ticket=abc-secret",
-                "headers": [{"name": "Cookie", "value": {"type": "string", "value": "sid=cookiesecret"}}],
-                "cookies": [{"name": "sid", "value": {"type": "string", "value": "cookiesecret"}}],
+                "url": "https://gw/portal/shortcut.html?username=student-id&ticket=abc",
             },
             "response": {
-                "url": "https://gw/passport/v1/auth?sid=urlsecret&code=123",
+                "url": "https://gw/passport/v1/auth?sid=urlvalue&code=123",
                 "status": 200,
-                "headers": [{"name": "Set-Cookie", "value": {"type": "string", "value": "sid=cookiesecret"}}],
+                "statusText": "OK",
+                "headers": [{"name": "Set-Cookie", "value": {"type": "string", "value": "sid=cookievalue"}}],
             }
         });
-        let data = redact_bidi_event("network.responseCompleted", &params).unwrap();
+        let data = bidi_event_record("network.responseCompleted", &params).unwrap();
         assert_eq!(
             data.get("request_id").and_then(Value::as_str),
             Some("REQ-ID-1234")
         );
-        let text = data.to_string();
-        for secret in [
-            "student-secret-id",
-            "cookiesecret",
-            "urlsecret",
-            "abc-secret",
-            "ticket=",
-        ] {
-            assert!(!text.contains(secret), "leaked {secret:?} in {text}");
-        }
-        // Response header names survive as observability, values do not.
-        assert!(text.contains("set-cookie"));
+        assert_eq!(
+            data.get("url").and_then(Value::as_str),
+            Some("https://gw/passport/v1/auth?sid=urlvalue&code=123")
+        );
         assert_eq!(data.get("status").and_then(Value::as_i64), Some(200));
+        assert_eq!(data.get("status_text").and_then(Value::as_str), Some("OK"));
+        // BiDi wraps values as {"type":"string","value":...}; the wrapper is unwrapped.
+        assert_eq!(data["headers"][0]["name"], json!("Set-Cookie"));
+        assert_eq!(data["headers"][0]["value"], json!("sid=cookievalue"));
     }
 
     #[test]
-    fn fetch_error_does_not_leak_request_object() {
+    fn before_request_sent_keeps_credential_body_verbatim() {
+        let body = r#"{"username":"student-id","password":"plaintext-pw"}"#;
         let params = json!({
             "request": {
-                "request": "REQ-ID-9",
-                "goog:postData": "{\"token\":\"t\"}",
-                "headers": [{"name": "Referer", "value": {"type": "string", "value": "https://gw/x?username=student-secret-id"}}],
-            },
+                "request": "REQ-ID-7",
+                "method": "POST",
+                "url": "https://ids.test/authserver/login",
+                "headers": [{"name": "Cookie", "value": {"type": "string", "value": "JSESSIONID=abc"}}],
+                "postData": {"type": "string", "value": body},
+            }
+        });
+        let data = bidi_event_record("network.beforeRequestSent", &params).unwrap();
+        assert_eq!(data.get("method").and_then(Value::as_str), Some("POST"));
+        assert_eq!(data["body"]["raw"], json!(body));
+        assert_eq!(data["body"]["json"]["password"], json!("plaintext-pw"));
+        assert_eq!(data["headers"][0]["value"], json!("JSESSIONID=abc"));
+    }
+
+    #[test]
+    fn fetch_error_keeps_url_and_error_text() {
+        let params = json!({
+            "request": {"request": "REQ-ID-9"},
             "url": "https://127.0.0.1:54630/v1/detect",
             "errorText": "net::ERR_CONNECTION_REFUSED",
         });
-        let data = redact_bidi_event("network.fetchError", &params).unwrap();
+        let data = bidi_event_record("network.fetchError", &params).unwrap();
         assert_eq!(
             data.get("request_id").and_then(Value::as_str),
             Some("REQ-ID-9")
         );
         assert_eq!(
-            data.get("error_present").and_then(Value::as_bool),
-            Some(true)
+            data.get("url").and_then(Value::as_str),
+            Some("https://127.0.0.1:54630/v1/detect")
         );
-        let text = data.to_string();
-        for secret in ["student-secret-id", "postData", "token", "errorText"] {
-            assert!(!text.contains(secret), "leaked {secret:?} in {text}");
-        }
+        assert_eq!(
+            data.get("error").and_then(Value::as_str),
+            Some("net::ERR_CONNECTION_REFUSED")
+        );
     }
 
     #[test]
@@ -1099,17 +1039,19 @@ mod tests {
     }
 
     #[test]
-    fn trace_payload_keeps_shape_and_fingerprint_but_not_values() {
-        let payload = json!({"sid": "secret-sid", "signKey": "secret-key"});
-        let summary = payload_summary(Some(&json!({
+    fn trace_payload_keeps_values_alongside_length_and_digest() {
+        let payload = json!({"sid": "live-sid", "signKey": "live-key"});
+        let record = payload_record(Some(&json!({
             "value": payload.to_string()
         })));
-        let text = summary.to_string();
-        assert!(!text.contains("secret-sid"));
-        assert!(!text.contains("secret-key"));
-        assert!(text.contains("sid"));
-        assert!(text.contains("signKey"));
-        assert!(text.contains("correlation_fingerprints"));
-        assert!(summary.get("sha256").is_some());
+        assert_eq!(record["raw"], json!(payload.to_string()));
+        assert_eq!(record["json"]["sid"], json!("live-sid"));
+        assert_eq!(record["json"]["signKey"], json!("live-key"));
+        // Length and digest stay for correlating a body against a capture.
+        assert_eq!(
+            record.get("length").and_then(Value::as_u64),
+            Some(payload.to_string().len() as u64)
+        );
+        assert!(record.get("sha256").is_some());
     }
 }

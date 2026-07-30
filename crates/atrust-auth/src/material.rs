@@ -72,6 +72,35 @@ impl SessionMaterial {
         })
     }
 
+    /// Rebuilds material from already-known parts.
+    ///
+    /// Used by the session store to restore a session across processes: unlike
+    /// [`Self::from_cookie_sid`], it never derives a fresh `connection_id` or
+    /// generates a new SignKey, so a gateway that binds those to the session
+    /// keeps seeing the same values.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        sid: SessionId,
+        device_id: DeviceId,
+        connection_id: ConnectionId,
+        sign_key: SignKey,
+        username: Option<String>,
+        sign_key_provisional: bool,
+        sid_cookie_name: String,
+        sid_sig_present: bool,
+    ) -> Self {
+        Self {
+            sid,
+            device_id,
+            connection_id,
+            sign_key,
+            username,
+            sign_key_provisional,
+            sid_cookie_name,
+            sid_sig_present,
+        }
+    }
+
     /// Presence-only summary safe for structured logs.
     pub fn log_fields(&self) -> SessionMaterialLog<'_> {
         SessionMaterialLog {
