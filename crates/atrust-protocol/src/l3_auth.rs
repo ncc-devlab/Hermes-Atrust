@@ -371,7 +371,10 @@ mod tests {
         let sig_end = text[sig_start..].find('"').expect("closing quote") + sig_start;
         let sig = &text[sig_start..sig_end];
         assert_eq!(sig.len(), 64);
-        assert!(sig.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()));
+        assert!(
+            sig.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase())
+        );
 
         let rebuild = build_signed_l3_auth_json(&params, &key).unwrap();
         assert_eq!(body, rebuild);

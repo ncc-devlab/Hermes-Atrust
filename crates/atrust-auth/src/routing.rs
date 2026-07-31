@@ -339,7 +339,7 @@ fn port_span(min: u16, max: u16) -> u32 {
 
 fn protocol_rank(protocol: ResourceProtocol) -> u8 {
     match protocol {
-        ResourceProtocol::Tcp | ResourceProtocol::Udp => 0,
+        ResourceProtocol::Tcp | ResourceProtocol::Udp | ResourceProtocol::Icmp => 0,
         ResourceProtocol::All => 1,
     }
 }
@@ -379,6 +379,7 @@ fn protocol_matches(resource: ResourceProtocol, flow: FlowProtocol) -> bool {
         (ResourceProtocol::All, _)
             | (ResourceProtocol::Tcp, FlowProtocol::Tcp)
             | (ResourceProtocol::Udp, FlowProtocol::Udp)
+            | (ResourceProtocol::Icmp, FlowProtocol::Icmp)
     )
 }
 
@@ -1110,5 +1111,23 @@ mod tests {
         assert_eq!(FlowProtocol::parse("icmp6"), None);
         assert!(!FlowProtocol::Icmp.has_ports());
         assert!(FlowProtocol::Tcp.has_ports());
+    }
+    /// An `icmp` resource must authorize ICMP flows and nothing else, matching
+    /// zju-connect's `resource.Protocol == protocol || == "all"` check.
+    #[test]
+    fn icmp_resource_authorizes_only_icmp() {
+        let resource = IpResource {
+            ip_min: Ipv4Addr::new(10, 0, 0, 1),
+            ip_max: Ipv4Addr::new(10, 0, 0, 1),
+            port_min: 0,
+            port_max: 65535,
+            protocol: ResourceProtocol::Icmp,
+            app_id: "app-icmp".to_owned(),
+            node_group_id: "ng".to_owned(),
+        };
+        let target = Ipv4Addr::new(10, 0, 0, 1);
+        assert!(ip_resource_matches(&resource, FlowKey::icmp(target)));
+        assert!(!ip_resource_matches(&resource, FlowKey::tcp(target, 80)));
+        assert!(!ip_resource_matches(&resource, FlowKey::udp(target, 80)));
     }
 }

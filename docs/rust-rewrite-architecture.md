@@ -83,18 +83,31 @@ cargo test --workspace
 
 以下事实未经真实对端和抓包确认前，不得当作稳定协议继续向上封装：
 
-1. Go Get-IP 请求中的 `0x0053` 是否为固定值，还是应由 SID JSON 长度动态计算；
+1. ~~Go Get-IP 请求中的 `0x0053` 是否为固定值，还是应由 SID JSON 长度动态计算~~
+   **已决（2026-07-31，zju-connect 对照）：动态。** `authTunnel::wrapAuthReqData` 动态计算，
+   `getIP` 写死的 `0x0053`=83 只是 73 字符 SID 的巧合。Hermes 的动态实现正确；
 2. ~~L3 `0x94` 下行双格式判别~~（已决：body 首 `u16-be n`，`0 < n ≤ 4096` → 长度前缀，否则 token 帧；见 `atrust-protocol::l3_frame`）；
 3. SignKey 是客户端生成、服务端下发还是经其它接口注册，以及它与 SID 的绑定关系；
-4. second VIP 的请求条件和用途；
-5. L3 flow key 是否必须包含协议号；
-6. L3 授权 URL 应使用 `tcp:` 还是 `tcp://`；
-7. **资源表重叠时服务端的优先级规则**。Hermes 的 `ResourceIndex` 目前按「地址范围最窄
-   → 端口范围最窄 → 精确协议先于 `all` → 服务端原始顺序」排序取第一名，并通过
-   `match_ip_all` / `match_domain_all` 暴露全部候选供抓包对照。若证实服务端是
-   first-match-wins，只需改 `ResourceIndex::build` 的排序；
-8. **ICMP 如何命中资源**。资源表只有 `tcp` / `udp` / `all` 三种协议值，Hermes 现规定
-   ICMP 只能命中 `all` 且不做端口比较，这一条尚未经真机验证；
+4. second VIP 的请求条件和用途。addrType=5 的 VIP 帧同时带 IPv4 与 IPv6，
+   `0x16`/`0x96` 是独立的 second-VIP 请求/响应对——两者关系仍未确认；
+5. ~~L3 flow key 是否必须包含协议号~~ **已决：不含。** zju-connect `connTrackKey` =
+   `{atype}:{src}:{sport}-{dst}:{dport}`，与 Hermes `FlowKey` 逐字符一致；
+6. ~~L3 授权 URL 应使用 `tcp:` 还是 `tcp://`~~ **已决：`tcp:`（无 `//`）。**
+   zju-connect `buildAuthRequest` 用 `protoName(proto):dstIP:dstPort`，Hermes 一致；
+7. **资源表重叠时服务端的优先级规则 —— 与 zju-connect 存在已知分歧。**
+   zju-connect `processIPV4` 是**纯 first-match，按服务端原始顺序**遍历 `ipResources`，
+   不做任何排序。Hermes 的 `ResourceIndex` 按「地址范围最窄 → 端口范围最窄 →
+   精确协议先于 `all` → 原始顺序」排序取第一名。表存在重叠时两者会选出不同的
+   `appId`/`nodeGroupId`。注意 zju-connect 可用**不等于**它与官方客户端一致——也可能只是
+   ZJU 的表恰好不重叠。
+   **决定（2026-07-31）：维持 Hermes 现有的 specificity 排序，不跟随 zju-connect 改成
+   first-match**，理由正是「能用」不等于「正确」。代价已知：若西电的表存在重叠，Hermes 会选出
+   与 zju-connect 不同的 `appId`，且症状会长得像协议 bug。判定方法：登录后
+   `client-resource --save-body`，再用 `resource-match --show-all` 统计重叠条数与两种
+   排序分歧的目的地数量。在拿到这个数据前，任何 L3 live 失败都要先排除这一条；
+8. **ICMP 如何命中资源**。zju-connect 的判据是 `resource.Protocol == "icmp" || == "all"`
+   且不比较端口；Hermes 现规定 ICMP 只能命中 `all`。若服务端资源表真的出现 `icmp`
+   协议值，Hermes 会漏匹配。尚未经真机验证；
 9. **域名通配符语义**。现按 `*.example.edu` 覆盖任意子域但不含 apex 实现，
    服务端是否同此仍待确认。
 
@@ -113,6 +126,8 @@ authConfig                              [已完成]
 → node-probe TLS-only                   [已接线并 live；外网 :441 TCP 超时，待校内复跑]
 → TCP 帧 codec                          [已实现]
 → TCP DialTCP 握手 + 应用帧             [已实现；对公网参考服务端 live 打通]
+→ L3 帧 codec + IPv4 包解析             [已实现]
+→ L3 全双工会话（Get-IP→鉴权→数据）    [已实现；仅 mock 对端验证，无任何 live]
 ```
 
 **控制面里程碑已闭环（2026-07-27）。数据面探测已接上（2026-07-28）。数据面 TCP 隧道已 live
@@ -120,7 +135,13 @@ authConfig                              [已完成]
 外网因网络层不可达超时；节点 `:441` 待校内复跑。Phase C 已用 `atrust-probe tcp-dial` 对
 `Hermes-aTrust-Server` 完成 psw 登录 → SID 导出 → 握手 → 应用数据回环 → 关闭的端到端验证；
 证实临时随机 SignKey 模型正确、帧逐字节互通。**西电真机数据面仍待校内抓包对照**（SID/SignKey
-绑定、`0x0053` 长度语义；`0x94` 双格式见 `atrust-protocol::l3_frame`）。隧道分阶段规划见 [`tunnel-plan.md`](tunnel-plan.md)。
+绑定、`0x0053` 长度语义；`0x94` 双格式见 `atrust-protocol::l3_frame`）。
+
+**L3 离线件已到里程碑边界（2026-07-31）：** `atrust-l3::L3Session` 打通「Get-IP → 五元组鉴权 →
+IPv4 包往返 → 关闭」，诊断入口 `atrust-probe l3-session`。**但它一次真实对端都没跑过**——
+覆盖它的 `mock_session.rs` 是照着参考服务端源码写的，因此只能证明实现自洽，不能证伪
+对帧格式的理解。下一步的 live 顺序不变：SignKey 是否真被校验（1 号闸门）→ 西电原生
+`tcp-dial` → Get-IP 复跑 → 才谈 L3 live。隧道分阶段规划见 [`tunnel-plan.md`](tunnel-plan.md)。
 
 学校差异（IDS 表单、滑块、SMS UI）只存在于浏览器/UI 适配层。协议层只接受：
 
@@ -217,13 +238,18 @@ cargo run -p atrust-probe -- \
 
 ### L3 隧道
 
-- ~~Get-IP codec（动态 SID JSON 长度；`05 d0` / `53 00` / 地址循环）~~；Xidian live 待复跑；
-- SID 总连接（Get-IP 之后）长连接保持、多节点组与确定性关闭；
-- ~~按五元组鉴权 JSON（`tcp:` 无 `//`）、conntrack 表、connectToken 状态机骨架~~
-  （`atrust-protocol::l3_auth` + `atrust-l3::{conntrack,auth}`；8s 超时常量；**未**接 I/O 循环）；
-- ~~`0x14` 编码 / 下行 `0x94` 双格式 / 心跳请求常量~~；读循环与心跳任务未接；
-- ICMP、UDP、TCP 的逐阶段真实联调；
-- second VIP 和 IPv6 能力确认。
+- ~~Get-IP codec（动态 SID JSON 长度；`05 d0` / `53 00` / 地址循环）~~；`53 00` body 已保留进
+  `GetIpv4Response::status_bodies` 并落 trace；Xidian live 待复跑（`atrust-probe get-ip --session-file`）；
+- ~~SID 总连接（Get-IP 之后）长连接保持~~（`atrust-l3::L3Session`，读/写/心跳三任务 +
+  watch 停止信号 + `Drop` 兜底 abort）；**多节点组缓存与重连仍未做**——一条连接死掉时会话只报告
+  closed 并唤醒全部等待者，重建属于尚不存在的 node-group 缓存层；
+- ~~按五元组鉴权 JSON（`tcp:` 无 `//`）、conntrack 表、connectToken 状态机~~
+  （`atrust-protocol::l3_auth` + `atrust-l3::{conntrack,auth,session}`；8s 超时已由会话驱动，
+  超时驱逐条目以允许重试一次；并发同流合并为一次 `0x13`）；
+- ~~`0x14` 编码 / 下行 `0x94` 双格式 / 心跳请求常量~~；~~读循环与心跳任务~~（已接，25s）；
+- ~~IPv4 包五元组解析~~（`atrust-l3::parse_ipv4_flow`，按 IHL 定位传输层）；
+- ICMP、UDP、TCP 的逐阶段真实联调（`atrust-probe l3-session --probe icmp-echo|tcp-syn`）；
+- second VIP（`0x96` 已能解出并记录，未主动请求）和 IPv6 能力确认。
 
 ### 上层接入
 

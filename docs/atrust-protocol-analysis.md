@@ -136,6 +136,18 @@ aTrust 的认证代码位于 `client/atrust/auth`。整体顺序是：
 aTrust 的密码登录同样会使用服务端提供的 RSA/反重放参数，但它与 EasyConnect
    的 `/por/login_*.csp` XML 流程不是同一个协议，不能混用 TWFID 和 SID。
 
+### 3.1b 基准来源说明（2026-07-31）
+
+本文的 L3 部分现以 **zju-connect**（`/home/nancunchild/projects/zju-connect`，
+`client/atrust/`）为对照基准。它是已被证实在真实 aTrust 网关上可用的客户端，
+优先级高于 `Hermes-aTrust-Server`——后者是依据抓包和控制台表现重建的服务端推测，
+用它验证客户端属于循环论证。
+
+已逐行核对且**一致**的部分：`connTrackKey` 格式 `{atype}:{src}:{sport}-{dst}:{dport}`、
+鉴权 JSON 字段顺序与 `atype=0x0800`/`protocol=IANA号`、HMAC-SHA256 大写 hex 签名覆盖
+`xRequestSig=""` 的字节串、`0x13`/`0x14` 编码、`0x93`/`0x96` 的 status-在-长度-之前布局、
+`0x94` 的 `0 < n ≤ 4096` 双格式判别、25s 心跳、8s 鉴权超时、CAS 式单次发起鉴权。
+
 ### 3.2 L3 隧道总连接认证
 
 每个节点组缓存一个 L3 TLS 连接。建立 TLS 后，客户端先发送：
@@ -158,6 +170,26 @@ aTrust 的密码登录同样会使用服务端提供的 RSA/反重放参数，�
 
 `53 00` 是一个嵌套的长度包。源码还会忽略或跳过部分 `53 00` 协议消息，因此
 抓包分析时不能只按 `05 <cmd> <len>` 一种格式解析。
+
+**虚拟 IP 帧的长度由 addrType 决定（2026-07-31 由 zju-connect 订正）：**
+
+```text
+05 <status> <reserved> <addrType>        4 字节头
+<vipData>                                长度 = vipPayloadLength(addrType)
+    addrType=1 → 6 字节（前 4 为 IPv4，尾 2 字节用途未知）
+    addrType=4 → 18 字节（IPv6）
+    addrType=5 → 22 字节（IPv4 4 字节 + IPv6 16 字节）
+    其它       → 4 字节
+```
+
+即 addrType=1 时整帧 **10 字节，不是 8 字节**。zju-connect 自身两处不一致：
+`ip.go::getIP` 只读 8 字节（少读 2），`l3tunnelconn.go::authTunnel` 读满 10 字节。
+前者读完即关连接，少读不可见；后者连接要继续用，必须读满。**以 authTunnel 为准。**
+Hermes 原先按 8 字节读，在独立 Get-IP 下无害，但会让保持长连接的 L3 会话从第一帧起错位。
+
+另注：`getIP` 的 `05 01 d0 53 00 00 53` 把长度写死为 `0x0053`=83，恰好等于 73 字符 SID 的
+`{"sid":"..."}` 长度；而 `authTunnel::wrapAuthReqData` 是**动态**计算长度的。
+这解决了架构文档未决项 1——动态才是正确形态，`0x0053` 只是对 73 字符 SID 成立的巧合。
 
 ### 3.3 按连接授权：JSON、conntrack 和 HMAC
 

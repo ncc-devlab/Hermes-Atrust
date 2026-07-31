@@ -23,8 +23,38 @@ pub struct GetIpv4Request<'a> {
     pub timeout: Duration,
 }
 
+/// Outcome of one Get-IP exchange.
+///
+/// `status_bodies` holds every `53 00 <len> <body>` payload seen before the
+/// address reply, in wire order. Xidian sends a bare `OK`, but the envelope is
+/// the only place a mask / second-VIP hint could appear, so it is surfaced for
+/// tracing rather than discarded.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GetIpv4Response {
+    pub address: Ipv4Addr,
+    /// Wire `addrType` from the VIP reply (1 = IPv4, 4 = IPv6, 5 = both).
+    pub address_type: u8,
+    /// Raw VIP body. For `addrType = 5` this also carries the IPv6 VIP, and for
+    /// `addrType = 1` the two bytes trailing the IPv4 — kept because second-VIP
+    /// semantics are still unconfirmed and this is where the evidence would be.
+    pub vip_data: Vec<u8>,
+    pub status_bodies: Vec<Vec<u8>>,
+}
+
+impl GetIpv4Response {
+    /// Status bodies rendered as UTF-8 for logs, lossy on non-text payloads.
+    #[must_use]
+    pub fn status_text(&self) -> String {
+        self.status_bodies
+            .iter()
+            .map(|body| String::from_utf8_lossy(body).into_owned())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+}
+
 /// Opens one TLS connection, performs the SID-only Get-IP exchange, and closes it.
-pub async fn get_ipv4(request: GetIpv4Request<'_>) -> Result<Ipv4Addr, GetIpv4Error> {
+pub async fn get_ipv4(request: GetIpv4Request<'_>) -> Result<GetIpv4Response, GetIpv4Error> {
     timeout(request.timeout, async {
         let mut stream =
             connect_tls(request.node_host, request.node_port, request.tls_policy).await?;
@@ -35,8 +65,12 @@ pub async fn get_ipv4(request: GetIpv4Request<'_>) -> Result<Ipv4Addr, GetIpv4Er
 }
 
 /// Runs the wire exchange over an established stream. Exposed for deterministic
-/// mock-server tests without requiring a live gateway.
-pub async fn request_ipv4<S>(stream: &mut S, sid: &SessionId) -> Result<Ipv4Addr, GetIpv4Error>
+/// mock-server tests without requiring a live gateway, and reused by the L3
+/// session driver, which keeps the same connection open afterwards.
+pub async fn request_ipv4<S>(
+    stream: &mut S,
+    sid: &SessionId,
+) -> Result<GetIpv4Response, GetIpv4Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -57,6 +91,8 @@ where
         .write_all(&[0x05, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
         .await?;
     stream.flush().await?;
+
+    let mut status_bodies = Vec::new();
 
     // Xidian (and zju-connect L3 auth) may first emit method ack `05 d0`, then
     // optional `53 00 <len> <body>` ("OK"), then address `05 00 00 01 <ipv4>`.
@@ -80,21 +116,38 @@ where
             }
             let mut response = vec![0; response_len];
             stream.read_exact(&mut response).await?;
+            status_bodies.push(response);
             continue;
         }
 
         if header == [0x05, 0x00] {
-            let mut address = [0u8; 6];
-            stream.read_exact(&mut address).await?;
-            if address[0] != 0 {
-                return Err(GetIpv4Error::AddressRejected(address[0]));
+            // VIP reply: `05 <status> <reserved> <addrType>` then an
+            // address-type-sized body. The body length is NOT four — for
+            // `addrType = 1` it is six, of which only the first four are the
+            // IPv4 (zju-connect `vipPayloadLength` / `parseVirtualIPData`).
+            // Consuming only four leaves two bytes on the wire, which is
+            // invisible when the connection is closed straight after but
+            // desynchronizes every later frame on a session that stays open.
+            let mut tail = [0u8; 2];
+            stream.read_exact(&mut tail).await?;
+            let status = tail[0];
+            let address_type = tail[1];
+            if status != 0 {
+                return Err(GetIpv4Error::AddressRejected(status));
             }
-            if address[1] != 1 {
-                return Err(GetIpv4Error::UnsupportedAddressType(address[1]));
-            }
-            return Ok(Ipv4Addr::new(
-                address[2], address[3], address[4], address[5],
-            ));
+            let mut vip_data = vec![0; vip_payload_length(address_type)];
+            stream.read_exact(&mut vip_data).await?;
+            // Read the body before rejecting an unsupported type: the caller may
+            // keep using this connection, and a half-consumed frame poisons it.
+            let Some(address) = ipv4_from_vip_data(address_type, &vip_data) else {
+                return Err(GetIpv4Error::UnsupportedAddressType(address_type));
+            };
+            return Ok(GetIpv4Response {
+                address,
+                address_type,
+                vip_data,
+                status_bodies,
+            });
         }
 
         return Err(GetIpv4Error::UnexpectedHeader(header));
@@ -110,6 +163,37 @@ where
     let mut bytes = [0u8; 2];
     stream.read_exact(&mut bytes).await?;
     Ok(u16::from_be_bytes(bytes))
+}
+
+/// Body length that follows `05 <status> <reserved> <addrType>`.
+///
+/// Mirrors zju-connect `vipPayloadLength`: 1 = IPv4, 4 = IPv6, 5 = both. The
+/// unknown-type fallback of four bytes is what keeps the stream in sync when the
+/// server answers with a type this client did not ask for.
+#[must_use]
+pub const fn vip_payload_length(address_type: u8) -> usize {
+    match address_type {
+        1 => 6,
+        4 => 18,
+        5 => 22,
+        _ => 4,
+    }
+}
+
+/// Extracts the IPv4 VIP from a VIP body, if that type carries one.
+///
+/// Mirrors zju-connect `parseVirtualIPData`, which keys off the body length:
+/// 6 = IPv4 (plus two trailing bytes), 18 = IPv6 only, 22 = IPv4 then IPv6.
+fn ipv4_from_vip_data(address_type: u8, vip_data: &[u8]) -> Option<Ipv4Addr> {
+    match address_type {
+        1 | 5 if vip_data.len() >= 4 => Some(Ipv4Addr::new(
+            vip_data[0],
+            vip_data[1],
+            vip_data[2],
+            vip_data[3],
+        )),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Error)]
@@ -188,15 +272,17 @@ mod tests {
                 .await
                 .expect("protocol response");
             server
-                .write_all(&[0x05, 0x00, 0x00, 0x01, 10, 8, 0, 7])
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 10, 8, 0, 7, 0xde, 0xad])
                 .await
                 .expect("address response");
         });
 
-        let address = request_ipv4(&mut client, &sid())
+        let response = request_ipv4(&mut client, &sid())
             .await
             .expect("Get-IP succeeds");
-        assert_eq!(address, Ipv4Addr::new(10, 8, 0, 7));
+        assert_eq!(response.address, Ipv4Addr::new(10, 8, 0, 7));
+        assert_eq!(response.status_bodies, vec![b"OK".to_vec()]);
+        assert_eq!(response.status_text(), "OK");
         server_task.await.expect("mock server task");
     }
 
@@ -207,15 +293,16 @@ mod tests {
             let mut request = vec![0; 7 + 83 + 10];
             server.read_exact(&mut request).await.expect("request");
             server
-                .write_all(&[0x05, 0x00, 0x00, 0x01, 10, 0, 0, 1])
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 10, 0, 0, 1, 0xde, 0xad])
                 .await
                 .expect("address response");
         });
 
-        let address = request_ipv4(&mut client, &sid())
+        let response = request_ipv4(&mut client, &sid())
             .await
             .expect("Get-IP succeeds");
-        assert_eq!(address, Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(response.address, Ipv4Addr::new(10, 0, 0, 1));
+        assert!(response.status_bodies.is_empty());
         server_task.await.expect("mock server task");
     }
 
@@ -231,15 +318,16 @@ mod tests {
                 .await
                 .expect("protocol response");
             server
-                .write_all(&[0x05, 0x00, 0x00, 0x01, 10, 8, 0, 42])
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 10, 8, 0, 42, 0xde, 0xad])
                 .await
                 .expect("address response");
         });
 
-        let address = request_ipv4(&mut client, &sid())
+        let response = request_ipv4(&mut client, &sid())
             .await
             .expect("Get-IP succeeds after method ack");
-        assert_eq!(address, Ipv4Addr::new(10, 8, 0, 42));
+        assert_eq!(response.address, Ipv4Addr::new(10, 8, 0, 42));
+        assert_eq!(response.status_text(), "OK");
         server_task.await.expect("mock server task");
     }
 
@@ -249,15 +337,52 @@ mod tests {
         let server_task = tokio::spawn(async move {
             drain_request(&mut server).await;
             server
-                .write_all(&[0x05, 0xd0, 0x05, 0x00, 0x00, 0x01, 10, 0, 0, 9])
+                .write_all(&[0x05, 0xd0, 0x05, 0x00, 0x00, 0x01, 10, 0, 0, 9, 0xde, 0xad])
                 .await
                 .expect("method ack + address");
         });
 
-        let address = request_ipv4(&mut client, &sid())
+        let response = request_ipv4(&mut client, &sid())
             .await
             .expect("Get-IP succeeds");
-        assert_eq!(address, Ipv4Addr::new(10, 0, 0, 9));
+        assert_eq!(response.address, Ipv4Addr::new(10, 0, 0, 9));
+        server_task.await.expect("mock server task");
+    }
+
+    /// The VIP body is six bytes for `addrType = 1`, not four. Under-reading it
+    /// is invisible when the caller closes the connection, but leaves two bytes
+    /// that desynchronize every later frame on a session that stays open — which
+    /// is exactly how the L3 session driver uses this function.
+    #[tokio::test]
+    async fn get_ip_consumes_the_whole_vip_frame() {
+        let (mut client, mut server) = tokio::io::duplex(512);
+        let server_task = tokio::spawn(async move {
+            drain_request(&mut server).await;
+            server
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 10, 8, 0, 7, 0xde, 0xad])
+                .await
+                .expect("vip");
+            // The next frame on the wire, which must survive intact.
+            server
+                .write_all(&[0x05, 0x95, 0x00, 0x00])
+                .await
+                .expect("heartbeat");
+        });
+
+        let response = request_ipv4(&mut client, &sid())
+            .await
+            .expect("Get-IP succeeds");
+        assert_eq!(response.address, Ipv4Addr::new(10, 8, 0, 7));
+        assert_eq!(response.address_type, 1);
+        assert_eq!(response.vip_data, vec![10, 8, 0, 7, 0xde, 0xad]);
+
+        let mut next = [0u8; 4];
+        client.read_exact(&mut next).await.expect("next frame");
+        assert_eq!(
+            next,
+            [0x05, 0x95, 0x00, 0x00],
+            "the VIP frame must be fully consumed, leaving the stream aligned"
+        );
         server_task.await.expect("mock server task");
     }
 
@@ -268,7 +393,9 @@ mod tests {
             let mut request = vec![0; 7 + 83 + 10];
             server.read_exact(&mut request).await.expect("request");
             server
-                .write_all(&[0x05, 0x00, 0x00, 0x04, 0, 0, 0, 0])
+                .write_all(&[
+                    0x05, 0x00, 0x00, 0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ])
                 .await
                 .expect("address response");
         });

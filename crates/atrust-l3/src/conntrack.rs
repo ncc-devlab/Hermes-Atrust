@@ -21,13 +21,7 @@ pub struct FlowKey(String);
 impl FlowKey {
     /// Builds the Go-compatible flow key string.
     #[must_use]
-    pub fn new(
-        atype: u8,
-        src: &str,
-        src_port: u16,
-        dst: &str,
-        dst_port: u16,
-    ) -> Self {
+    pub fn new(atype: u8, src: &str, src_port: u16, dst: &str, dst_port: u16) -> Self {
         Self(format!("{atype}:{src}:{src_port}-{dst}:{dst_port}"))
     }
 
@@ -198,6 +192,24 @@ impl ConntrackTable {
         Ok(())
     }
 
+    /// Drops one flow so the next packet re-authorizes from scratch.
+    ///
+    /// This is the "retry once" path: an auth timeout evicts the entry, and the
+    /// caller may attempt a single fresh auth. The `auth_id` is not reused, so a
+    /// late `0x93` for the evicted attempt lands on an unknown id and is dropped
+    /// rather than reviving a flow the caller has given up on.
+    pub fn evict(&mut self, key: &FlowKey) -> Option<ConntrackEntry> {
+        let entry = self.by_key.remove(key)?;
+        self.by_id.remove(&entry.auth_id);
+        Some(entry)
+    }
+
+    /// Drops one flow addressed by its auth id.
+    pub fn evict_by_auth_id(&mut self, auth_id: u64) -> Option<ConntrackEntry> {
+        let key = self.by_id.get(&auth_id)?.clone();
+        self.evict(&key)
+    }
+
     /// Records a local error (send failure) without a server body.
     pub fn mark_auth_error(
         &mut self,
@@ -265,6 +277,37 @@ mod tests {
             table.get_by_key(&key2).unwrap().outcome(),
             Some(AuthOutcome::Failed { .. })
         ));
+    }
+
+    #[test]
+    fn evict_frees_the_flow_and_retires_the_auth_id() {
+        let mut table = ConntrackTable::new();
+        let key = FlowKey::new(4, "10.8.0.1", 5, "10.0.0.2", 80);
+        let id = table.get_or_create(key.clone(), "app", "g").auth_id;
+
+        assert!(table.evict(&key).is_some());
+        assert!(table.get_by_key(&key).is_none());
+        // A late response for the retired attempt must not resurrect the flow.
+        assert_eq!(
+            table.mark_auth(id, 0, "", "late-token"),
+            Err(ConntrackError::UnknownAuthId(id))
+        );
+
+        // Re-creating the flow issues a fresh id and a clean auth state.
+        let entry = table.get_or_create(key, "app", "g");
+        assert_ne!(entry.auth_id, id);
+        assert!(entry.outcome().is_none());
+        assert!(entry.try_start_auth());
+    }
+
+    #[test]
+    fn evict_by_auth_id_matches_evict_by_key() {
+        let mut table = ConntrackTable::new();
+        let key = FlowKey::new(4, "10.8.0.1", 6, "10.0.0.2", 443);
+        let id = table.get_or_create(key.clone(), "app", "g").auth_id;
+        assert!(table.evict_by_auth_id(id).is_some());
+        assert!(table.get_by_key(&key).is_none());
+        assert!(table.evict_by_auth_id(id).is_none());
     }
 
     #[test]

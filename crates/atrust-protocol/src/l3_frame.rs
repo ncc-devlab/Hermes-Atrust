@@ -40,12 +40,7 @@ pub mod l3_cmd {
 pub const MAX_LENGTH_PREFIXED_DATA_RESP: u16 = 4096;
 
 /// Fixed heartbeat request: `05 15 00 00`.
-pub const L3_HEARTBEAT_REQ: [u8; 4] = [
-    L3_VERSION,
-    l3_cmd::HEARTBEAT_REQ,
-    0x00,
-    0x00,
-];
+pub const L3_HEARTBEAT_REQ: [u8; 4] = [L3_VERSION, l3_cmd::HEARTBEAT_REQ, 0x00, 0x00];
 
 /// Heartbeat response command header (`05 95`); length-prefixed body follows.
 pub const L3_HEARTBEAT_RESP_HEADER: [u8; 2] = [L3_VERSION, l3_cmd::HEARTBEAT_RESP];
@@ -83,9 +78,7 @@ pub fn classify_data_resp_prefix(prefix: [u8; 2]) -> DataRespLayout {
 /// Wire: `05 13 <u16-be jsonLen> <json>`
 pub fn encode_l3_auth_req(json: &[u8]) -> Result<Vec<u8>, L3FrameError> {
     if json.len() > u16::MAX as usize {
-        return Err(L3FrameError::JsonTooLarge {
-            length: json.len(),
-        });
+        return Err(L3FrameError::JsonTooLarge { length: json.len() });
     }
     let mut out = Vec::with_capacity(4 + json.len());
     out.push(L3_VERSION);
@@ -124,9 +117,7 @@ pub fn encode_l3_data_req(token: &[u8], packets: &[&[u8]]) -> Result<Vec<u8>, L3
     let mut body_len = 1 + token.len() + 2 + 1;
     for pkt in packets {
         if pkt.len() > u16::MAX as usize {
-            return Err(L3FrameError::PacketTooLarge {
-                length: pkt.len(),
-            });
+            return Err(L3FrameError::PacketTooLarge { length: pkt.len() });
         }
         body_len += 2 + pkt.len();
     }
@@ -210,10 +201,7 @@ pub fn parse_l3_token_data_body(body: &[u8]) -> Result<Vec<&[u8]>, L3FrameError>
 /// Bytes consumed while parsing a token-framed body from a prefix of a stream buffer.
 fn token_body_len(body: &[u8]) -> Result<usize, L3FrameError> {
     if body.is_empty() {
-        return Err(L3FrameError::Truncated {
-            needed: 1,
-            got: 0,
-        });
+        return Err(L3FrameError::Truncated { needed: 1, got: 0 });
     }
     let token_len = body[0] as usize;
     let mut idx = 1 + token_len;
@@ -248,9 +236,7 @@ fn token_body_len(body: &[u8]) -> Result<usize, L3FrameError> {
 /// Decodes the body after `05 94`.
 ///
 /// Returns the packets and the number of body bytes consumed (for stream buffers).
-pub fn decode_l3_data_resp_body(
-    body: &[u8],
-) -> Result<(DataRespPackets<'_>, usize), L3FrameError> {
+pub fn decode_l3_data_resp_body(body: &[u8]) -> Result<(DataRespPackets<'_>, usize), L3FrameError> {
     if body.len() < 2 {
         return Err(L3FrameError::Truncated {
             needed: 2,
@@ -344,8 +330,8 @@ mod tests {
         assert_eq!(
             frame,
             vec![
-                0x05, 0x14, 3, b't', b'o', b'k', 0x00, 0x00, 2, 0x00, 0x02, b'A', b'B', 0x00,
-                0x01, b'C',
+                0x05, 0x14, 3, b't', b'o', b'k', 0x00, 0x00, 2, 0x00, 0x02, b'A', b'B', 0x00, 0x01,
+                b'C',
             ]
         );
     }

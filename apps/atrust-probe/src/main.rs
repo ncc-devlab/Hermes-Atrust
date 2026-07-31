@@ -215,6 +215,75 @@ enum Command {
         #[arg(long, default_value_t = 8)]
         handshake_timeout_seconds: u64,
     },
+    /// Phase D: one SID-only Get-IP exchange against a node, then disconnect.
+    ///
+    /// Unlike `cas-login --get-ip-node`, this reuses a stored session, so a
+    /// Get-IP rerun costs one TLS connection instead of a full IDS + slider +
+    /// SMS login. Starts no L3 session, TUN, DNS, or routes.
+    GetIp {
+        /// Login domain for the password path. Ignored with `--session-file`.
+        #[arg(long, default_value = "local")]
+        login_domain: String,
+        /// Reuse a session saved by `cas-login --session-file`.
+        #[arg(long)]
+        session_file: Option<PathBuf>,
+        /// Data-plane node `host:port`. Falls back to the advertised primary.
+        #[arg(long)]
+        node: Option<String>,
+        #[arg(long, default_value_t = 15)]
+        timeout_seconds: u64,
+    },
+    /// Phase D milestone: one L3 session — Get-IP, one flow authorization, and
+    /// one hand-built IP packet round trip.
+    ///
+    /// Deliberately stops there: no TUN, no DNS, no route changes. The packet is
+    /// constructed in-process so a failure stays inside the protocol rather than
+    /// spreading into the kernel routing table.
+    L3Session {
+        /// Login domain for the password path. Ignored with `--session-file`.
+        #[arg(long, default_value = "local")]
+        login_domain: String,
+        /// Reuse a session saved by `cas-login --session-file`.
+        #[arg(long)]
+        session_file: Option<PathBuf>,
+        /// Data-plane node `host:port`. Falls back to the advertised primary.
+        #[arg(long)]
+        node: Option<String>,
+        /// Destination `host:port` for the authorized flow. Must be an IPv4
+        /// literal: L3 carries packets, and resolving a name here would invent a
+        /// destination the resource table never authorized.
+        #[arg(long)]
+        target: String,
+        /// appId for the flow. Defaults to whatever the resource matcher picks.
+        #[arg(long)]
+        app_id: Option<String>,
+        /// Source port for the synthetic flow.
+        #[arg(long, default_value_t = 40000)]
+        src_port: u16,
+        /// Packet to send after authorization.
+        #[arg(long, value_enum, default_value_t = L3Probe::IcmpEcho)]
+        probe: L3Probe,
+        /// Skip the packet round trip and stop after authorization.
+        #[arg(long)]
+        auth_only: bool,
+        /// Budget for TCP + TLS + Get-IP. Live Xidian TLS connect alone has been
+        /// measured at ~6.3s, so keep this well above the 8s auth timeout.
+        #[arg(long, default_value_t = 20)]
+        connect_timeout_seconds: u64,
+        /// How long to wait for one inbound packet after sending.
+        #[arg(long, default_value_t = 10)]
+        reply_timeout_seconds: u64,
+    },
+}
+
+/// Which hand-built packet `l3-session` sends.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum L3Probe {
+    /// ICMP echo request. Round trips against any peer that answers ping, and
+    /// needs no listening service at the destination.
+    IcmpEcho,
+    /// TCP SYN. Proves the five-tuple path but needs a listener to answer.
+    TcpSyn,
 }
 
 #[tokio::main]
@@ -575,21 +644,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                                 })
                                 .await
                                 {
-                                    Ok(address) => {
-                                        info!(
-                                            event = "probe.get_ip.succeeded",
+                                    Ok(response) => {
+                                        report_get_ip(
+                                            &response,
                                             node_port,
-                                            address_family = "ipv4",
-                                            private = address.is_private()
-                                        );
-                                        append_probe_trace(
                                             cli.browser_trace_file.as_deref(),
-                                            "get_ip_succeeded",
-                                            json!({
-                                                "node_port": node_port,
-                                                "address_family": "ipv4",
-                                                "private": address.is_private(),
-                                            }),
                                         )?;
                                     }
                                     Err(error) => {
@@ -949,8 +1008,386 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             tunnel.close().await?;
             info!(event = "probe.tcp_dial.closed");
         }
+
+        Command::GetIp {
+            login_domain,
+            session_file,
+            node,
+            timeout_seconds,
+        } => {
+            let session = match session_file.as_deref() {
+                Some(path) => restore_session(&client, transport.as_ref(), &endpoint, path).await?,
+                None => {
+                    password_session(&client, transport.as_ref(), &endpoint, login_domain).await?
+                }
+            };
+            let (node_host, node_port) =
+                resolve_data_node(&client, &session.configuration, &endpoint, node).await?;
+            info!(
+                event = "probe.get_ip.begin",
+                node_port,
+                login_method = session.login_method.as_str()
+            );
+            match atrust_l3::get_ipv4(atrust_l3::GetIpv4Request {
+                node_host: &node_host,
+                node_port,
+                tls_policy,
+                sid: &session.material.sid,
+                timeout: Duration::from_secs(timeout_seconds.max(1)),
+            })
+            .await
+            {
+                Ok(response) => {
+                    report_get_ip(&response, node_port, cli.browser_trace_file.as_deref())?;
+                }
+                Err(error) => {
+                    append_probe_trace(
+                        cli.browser_trace_file.as_deref(),
+                        "get_ip_failed",
+                        json!({ "node_port": node_port, "error": error.to_string() }),
+                    )?;
+                    return Err(error.into());
+                }
+            }
+        }
+
+        Command::L3Session {
+            login_domain,
+            session_file,
+            node,
+            target,
+            app_id,
+            src_port,
+            probe,
+            auth_only,
+            connect_timeout_seconds,
+            reply_timeout_seconds,
+        } => {
+            // 1. Session material, exactly as the TCP path establishes it.
+            let session = match session_file.as_deref() {
+                Some(path) => restore_session(&client, transport.as_ref(), &endpoint, path).await?,
+                None => {
+                    password_session(&client, transport.as_ref(), &endpoint, login_domain).await?
+                }
+            };
+            let EstablishedSession {
+                configuration,
+                material,
+                ..
+            } = session;
+            log_session_material(&material);
+
+            // 2. L3 carries IP packets, so the destination must already be an
+            // address. Resolving a name here would authorize a five-tuple the
+            // server's domain resource never covered.
+            let (target_host, target_port) = parse_host_port(&target)?;
+            let target_ip: std::net::Ipv4Addr = target_host.parse().map_err(|_| {
+                format!("--target must be an IPv4 literal for L3, got {target_host}")
+            })?;
+
+            // 3. Resource match decides appId and node group unless overridden.
+            let resources = client.client_resource(&configuration).await.ok();
+            let flow_protocol = match probe {
+                L3Probe::IcmpEcho => FlowProtocol::Icmp,
+                L3Probe::TcpSyn => FlowProtocol::Tcp,
+            };
+            let mut node_group_id = String::new();
+            let mut matched_app_id = None;
+            if let Some(resources) = resources.as_ref() {
+                log_client_resources(&endpoint, resources);
+                report_resource_match(
+                    resources,
+                    &endpoint,
+                    &target_host,
+                    target_port,
+                    flow_protocol,
+                    false,
+                    cli.browser_trace_file.as_deref(),
+                )?;
+                if let Some(destination) = resources.routing_index().match_destination(
+                    &target_host,
+                    target_port,
+                    flow_protocol,
+                ) {
+                    node_group_id = destination.node_group_id().to_owned();
+                    matched_app_id = Some(destination.app_id().to_owned());
+                }
+            }
+            let Some(app_id) = app_id.or(matched_app_id) else {
+                return Err(
+                    "no --app-id given and the resource table does not authorize this target"
+                        .into(),
+                );
+            };
+
+            let (node_host, node_port) =
+                resolve_data_node(&client, &configuration, &endpoint, node).await?;
+
+            // 4. Establish the session: Get-IP on a connection that stays open.
+            info!(
+                event = "probe.l3_session.begin",
+                node_port,
+                target_port,
+                protocol = flow_protocol.as_str(),
+                app_id_present = !app_id.is_empty()
+            );
+            let l3 = atrust_l3::L3Session::establish(atrust_l3::L3SessionConfig {
+                node_host: &node_host,
+                node_port,
+                tls_policy,
+                sid: &material.sid,
+                connect_timeout: Duration::from_secs(connect_timeout_seconds.max(1)),
+                heartbeat_interval: atrust_l3::L3_HEARTBEAT_INTERVAL,
+            })
+            .await?;
+            report_get_ip(l3.get_ip(), node_port, cli.browser_trace_file.as_deref())?;
+
+            // 5. Authorize exactly one five-tuple.
+            let vip = l3.vip();
+            let packet = match probe {
+                L3Probe::IcmpEcho => build_icmp_echo(vip, target_ip),
+                L3Probe::TcpSyn => build_tcp_syn(vip, src_port, target_ip, target_port),
+            };
+            let flow = atrust_l3::parse_ipv4_flow(&packet)?;
+            let process = atrust_l3::ProcessIdentity::default_for_port(target_port);
+            let ctx = atrust_l3::L3AuthContext {
+                sid: &material.sid,
+                device_id: &material.device_id,
+                connection_id: &material.connection_id,
+                sign_key: &material.sign_key,
+                process: &process,
+                lang: "en-US",
+            };
+            let token = match l3
+                .authorize_flow(&ctx, &app_id, &node_group_id, &flow)
+                .await
+            {
+                Ok(token) => token,
+                Err(error) => {
+                    append_probe_trace(
+                        cli.browser_trace_file.as_deref(),
+                        "l3_flow_auth_failed",
+                        json!({
+                            "flow": flow.flow_key().as_str(),
+                            "app_id": app_id,
+                            "error": error.to_string(),
+                        }),
+                    )?;
+                    l3.close().await;
+                    return Err(error.into());
+                }
+            };
+            info!(
+                event = "probe.l3_session.flow_authorized",
+                flow = %flow.flow_key(),
+                connect_token_present = !token.is_empty()
+            );
+            append_probe_trace(
+                cli.browser_trace_file.as_deref(),
+                "l3_flow_authorized",
+                json!({
+                    "flow": flow.flow_key().as_str(),
+                    "app_id": app_id,
+                    "node_group_id": node_group_id,
+                    "connect_token": token,
+                }),
+            )?;
+
+            // 6. One packet out, one packet in.
+            if !auth_only {
+                l3.send_packet(&token, &packet).await?;
+                info!(
+                    event = "probe.l3_session.packet_sent",
+                    bytes = packet.len(),
+                    probe = ?probe
+                );
+                match tokio::time::timeout(
+                    Duration::from_secs(reply_timeout_seconds.max(1)),
+                    l3.recv_packet(),
+                )
+                .await
+                {
+                    Ok(Some(reply)) => {
+                        let parsed = atrust_l3::parse_ipv4_flow(&reply).ok();
+                        info!(
+                            event = "probe.l3_session.packet_received",
+                            bytes = reply.len(),
+                            parsed_as_ipv4 = parsed.is_some(),
+                            protocol = parsed
+                                .as_ref()
+                                .map(|flow| flow.protocol.scheme())
+                                .unwrap_or("<unparsed>")
+                        );
+                    }
+                    Ok(None) => warn!(event = "probe.l3_session.closed_before_reply"),
+                    Err(_) => warn!(
+                        event = "probe.l3_session.reply_timeout",
+                        seconds = reply_timeout_seconds
+                    ),
+                }
+            }
+
+            l3.close().await;
+            info!(event = "probe.l3_session.closed");
+        }
     }
     Ok(())
+}
+
+/// Resolves the data-plane node: explicit override wins, otherwise the first
+/// advertised primary. Gateways commonly advertise a server-side loopback, so
+/// the override is the normal case during bring-up.
+async fn resolve_data_node(
+    client: &AuthClient,
+    configuration: &AuthConfiguration,
+    endpoint: &GatewayEndpoint,
+    node: Option<String>,
+) -> Result<(String, u16), Box<dyn std::error::Error>> {
+    if let Some(node) = node {
+        return parse_host_port(&node);
+    }
+    let resources = client.client_resource(configuration).await?;
+    let primary = resources.primary_nodes(endpoint).into_iter().next();
+    match primary {
+        Some((_, endpoint)) => Ok((endpoint.host, endpoint.port)),
+        None => Err("no --node override and no primary node could be resolved".into()),
+    }
+}
+
+/// Logs and traces a Get-IP outcome.
+///
+/// The VIP is session-scoped, not a credential, and the `53 00` status body is
+/// the one place a mask or second-VIP hint could appear — it is recorded verbatim
+/// so a live Xidian run can be compared against a capture.
+fn report_get_ip(
+    response: &atrust_l3::GetIpv4Response,
+    node_port: u16,
+    trace_file: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!(
+        event = "probe.get_ip.succeeded",
+        node_port,
+        address_family = "ipv4",
+        vip = %response.address,
+        private = response.address.is_private(),
+        address_type = response.address_type,
+        vip_data_len = response.vip_data.len(),
+        status_bodies = response.status_bodies.len(),
+        status_text = %response.status_text()
+    );
+    append_probe_trace(
+        trace_file,
+        "get_ip_succeeded",
+        json!({
+            "node_port": node_port,
+            "address_family": "ipv4",
+            "vip": response.address.to_string(),
+            "private": response.address.is_private(),
+            "address_type": response.address_type,
+            // Raw body: for addrType 5 this carries the IPv6 VIP, and the bytes
+            // trailing an IPv4 VIP are still unexplained. Keep them verbatim.
+            "vip_data_hex": response
+                .vip_data
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            "status_bodies": response
+                .status_bodies
+                .iter()
+                .map(|body| String::from_utf8_lossy(body).into_owned())
+                .collect::<Vec<_>>(),
+        }),
+    )?;
+    Ok(())
+}
+
+/// Builds an ICMP echo request from `src` to `dst`.
+fn build_icmp_echo(src: std::net::Ipv4Addr, dst: std::net::Ipv4Addr) -> Vec<u8> {
+    let mut icmp = vec![
+        8, 0, // echo request, code 0
+        0, 0, // checksum placeholder
+        0x13, 0x37, // identifier
+        0x00, 0x01, // sequence
+    ];
+    icmp.extend_from_slice(b"hermes-l3-probe");
+    let checksum = ones_complement_sum(&icmp);
+    icmp[2..4].copy_from_slice(&checksum.to_be_bytes());
+    ipv4_packet(src, dst, 1, &icmp)
+}
+
+/// Builds a bare TCP SYN from `src:src_port` to `dst:dst_port`.
+fn build_tcp_syn(
+    src: std::net::Ipv4Addr,
+    src_port: u16,
+    dst: std::net::Ipv4Addr,
+    dst_port: u16,
+) -> Vec<u8> {
+    let mut tcp = Vec::with_capacity(20);
+    tcp.extend_from_slice(&src_port.to_be_bytes());
+    tcp.extend_from_slice(&dst_port.to_be_bytes());
+    tcp.extend_from_slice(&0x1234_5678_u32.to_be_bytes()); // sequence
+    tcp.extend_from_slice(&0u32.to_be_bytes()); // ack
+    tcp.push(5 << 4); // data offset 5 words, no flags in low nibble
+    tcp.push(0x02); // SYN
+    tcp.extend_from_slice(&64240u16.to_be_bytes()); // window
+    tcp.extend_from_slice(&[0, 0]); // checksum placeholder
+    tcp.extend_from_slice(&[0, 0]); // urgent pointer
+
+    // TCP checksum covers a pseudo-header of the IP addresses, protocol and length.
+    let mut pseudo = Vec::with_capacity(12 + tcp.len());
+    pseudo.extend_from_slice(&src.octets());
+    pseudo.extend_from_slice(&dst.octets());
+    pseudo.push(0);
+    pseudo.push(6);
+    pseudo.extend_from_slice(&(tcp.len() as u16).to_be_bytes());
+    pseudo.extend_from_slice(&tcp);
+    let checksum = ones_complement_sum(&pseudo);
+    tcp[16..18].copy_from_slice(&checksum.to_be_bytes());
+
+    ipv4_packet(src, dst, 6, &tcp)
+}
+
+/// Wraps `payload` in an IPv4 header with a valid header checksum.
+fn ipv4_packet(
+    src: std::net::Ipv4Addr,
+    dst: std::net::Ipv4Addr,
+    protocol: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    let total_len = (20 + payload.len()) as u16;
+    let mut header = vec![
+        0x45, // version 4, IHL 5
+        0x00, // DSCP / ECN
+    ];
+    header.extend_from_slice(&total_len.to_be_bytes());
+    header.extend_from_slice(&0xbeef_u16.to_be_bytes()); // identification
+    header.extend_from_slice(&[0x40, 0x00]); // don't fragment
+    header.push(64); // TTL
+    header.push(protocol);
+    header.extend_from_slice(&[0, 0]); // checksum placeholder
+    header.extend_from_slice(&src.octets());
+    header.extend_from_slice(&dst.octets());
+    let checksum = ones_complement_sum(&header);
+    header[10..12].copy_from_slice(&checksum.to_be_bytes());
+
+    header.extend_from_slice(payload);
+    header
+}
+
+/// Internet checksum (RFC 1071): one's complement of the one's complement sum.
+fn ones_complement_sum(data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut chunks = data.chunks_exact(2);
+    for chunk in &mut chunks {
+        sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+    }
+    if let [last] = chunks.remainder() {
+        sum += u32::from(u16::from_be_bytes([*last, 0]));
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
 }
 
 /// Builds a data-plane destination: raw IPv4 target when `host` parses as an IPv4

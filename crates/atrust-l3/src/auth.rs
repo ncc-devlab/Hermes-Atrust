@@ -63,22 +63,22 @@ pub fn apply_auth_response_json(
 
 /// Applies a non-zero wire status from `05 93 <status> ...` when JSON may still
 /// identify the flow via `conntrackHash`.
+///
+/// Returns the `conntrackHash` the response settled, so a read loop can wake the
+/// waiter for that flow without parsing the body a second time.
 pub fn apply_auth_wire_status(
     table: &mut ConntrackTable,
     status: u8,
     json: &[u8],
-) -> Result<(), FlowAuthError> {
+) -> Result<u64, FlowAuthError> {
     if status == 0 {
-        apply_auth_response_json(table, json)?;
-        return Ok(());
+        let resp = apply_auth_response_json(table, json)?;
+        return Ok(resp.conntrack_hash);
     }
     if let Ok(resp) = parse_l3_auth_response(json) {
         if resp.conntrack_hash != 0 {
-            table.mark_auth_error(
-                resp.conntrack_hash,
-                format!("auth status {status:#04x}"),
-            )?;
-            return Ok(());
+            table.mark_auth_error(resp.conntrack_hash, format!("auth status {status:#04x}"))?;
+            return Ok(resp.conntrack_hash);
         }
     }
     Err(FlowAuthError::WireStatus(status))
@@ -145,6 +145,30 @@ mod tests {
         let json = std::str::from_utf8(&frame[4..]).unwrap();
         assert!(json.contains(r#""conntrackHash":3"#));
         assert!(json.contains(r#""url":"tcp:10.0.0.9:443""#));
+    }
+
+    #[test]
+    fn wire_status_failure_still_reports_the_flow() {
+        let mut table = ConntrackTable::new();
+        let key = FlowKey::new(4, "10.8.0.1", 1, "10.0.0.9", 443);
+        let id = table.get_or_create(key.clone(), "app", "g").auth_id;
+        let json = format!(r#"{{"code":0,"data":{{"conntrackHash":{id}}}}}"#);
+
+        let hash = apply_auth_wire_status(&mut table, 0x01, json.as_bytes()).unwrap();
+        assert_eq!(hash, id);
+        assert!(matches!(
+            table.get_by_key(&key).unwrap().outcome(),
+            Some(AuthOutcome::Failed { .. })
+        ));
+    }
+
+    #[test]
+    fn wire_status_failure_without_hash_is_unattributable() {
+        let mut table = ConntrackTable::new();
+        assert!(matches!(
+            apply_auth_wire_status(&mut table, 0x02, b"not json"),
+            Err(FlowAuthError::WireStatus(0x02))
+        ));
     }
 
     #[test]

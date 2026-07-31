@@ -111,8 +111,10 @@ EasyConnect 不在本规划内。
    都拒=key 另有来源；一通一拒=必须先解决绑定。
 2. **西电原生 `tcp-dial` live**（Phase C 只对公网参考服务端通过）。带两个未知进 L3
    无法二分定位。会话持久化落地后此条已无阻塞。
-3. **Get-IP 西电 live 复跑**，并保留 `53 00` 响应 JSON：`atrust-l3` 目前读完即丢，
-   而该 JSON 可能带 VIP / 掩码 / second VIP 线索，应落 trace。
+3. **Get-IP 西电 live 复跑**。~~并保留 `53 00` 响应 JSON~~ **已落地（2026-07-31）：**
+   `GetIpv4Response { address, status_bodies }` 保留全部 `53 00` body 并写 trace
+   （`get_ip_succeeded.status_bodies`），VIP / 掩码 / second VIP 线索不再被丢弃。
+   复跑不再需要重走浏览器登录：`atrust-probe get-ip --session-file <file> --node <host:port>`。
 4. **`0x94` 下行双格式**：已落地为 body 首 `u16-be n`，`0 < n ≤ 4096` 为长度前缀、否则 token 帧（见 `atrust-protocol::l3_frame`）。
 5. **`tcp:` vs `tcp://`**：TCP init 用 `tcp://`（`tcp_init.rs`），§3.3 的 L3 鉴权写
    `tcp:10.0.0.1:443`。~~L3 独立 wire DTO~~（`build_signed_l3_auth_json`）；真机 `url` 形态仍待抓包。
@@ -132,17 +134,60 @@ EasyConnect 不在本规划内。
 2. ~~会话持久化~~（已完成，见执行清单第 8 项）。
 3. ~~L3 帧 codec~~：`encode_l3_data_req` / `encode_l3_auth_req` / `encode_l3_heartbeat_req` /
    `0x94` 双格式解码 / `05 95` 头判定（`atrust-protocol::l3_frame`）。property/fuzz 仍待。
-4. ~~conntrack + connectToken 状态机骨架~~：`FlowKey` / `auth_id` / `try_start_auth` /
-   `mark_auth` / `L3_AUTH_TIMEOUT=8s`（`atrust-l3::conntrack`）。**未**接读循环、驱逐、
-   重试一次、超时丢包。
-5. IPv4 包解析（atype / protocol / 五元组），只做 IPv4，与 Go `processIPV4` 一致。
+4. ~~conntrack + connectToken 状态机骨架~~ **已接线（2026-07-31）：** `FlowKey` / `auth_id` /
+   `try_start_auth` / `mark_auth` / `L3_AUTH_TIMEOUT=8s`（`atrust-l3::conntrack`），并新增
+   `evict` / `evict_by_auth_id`。读循环、驱逐、重试一次已由 `atrust-l3::session` 驱动：
+   鉴权超时 → 驱逐条目 → 下次调用重新发 `0x13`（对齐 Go「驱逐并重试一次」）。
+   被驱逐条目的 `auth_id` 不复用，迟到的 `0x93` 落在未知 id 上丢弃，不会复活已放弃的流。
+5. ~~IPv4 包解析（atype / protocol / 五元组）~~ **已完成（2026-07-31）：**
+   `atrust-l3::parse_ipv4_flow`，按 IHL 定位传输层（含 options），TCP/UDP 取端口、ICMP 端口为 0，
+   IPv6 与未知协议号显式拒绝。`Ipv4Flow::to_five_tuple()` 出 `atype=0x0800` 的签名五元组，
+   `Ipv4Flow::flow_key()` 出 `atype=4` 的 conntrack key——两个 atype 各有出处，不是笔误。
 6. 节点时延选优（`pingNum=3`）：L3 每个 node group 缓存一条长连接，选错代价大于 Phase C。
-7. 超时预算复核：实测 TLS connect+handshake 约 6.3s，而鉴权超时 8s，叠加会误判为鉴权失败。
-8. 全双工 L3 会话：TLS 长连接 + 读循环分发 `0x93`/`0x94`/`0x95` + 心跳任务 + 手工 IP 包往返。
+7. ~~超时预算复核~~ **已处理：** `L3SessionConfig::connect_timeout` 独立于 8s 鉴权超时，
+   `l3-session --connect-timeout-seconds` 默认 20s（实测 TLS connect+handshake 约 6.3s），
+   慢链路不再被误判为鉴权失败。
+8. ~~全双工 L3 会话~~ **已完成（2026-07-31）：** `atrust-l3::L3Session`——TLS 长连接 +
+   读循环分发 `0x93`/`0x94`/`0x95`/`0x96` + 25s 心跳任务 + 写任务串行化出帧。
+   所有方法取 `&self`，可放进 `Arc` 多任务驱动；`close()` 经 watch 广播停止信号，
+   不必等心跳定时器到点；`Drop` 兜底 abort，避免弃用的会话残留三个任务握着 socket。
+   连接死亡时**丢弃**等待者的 sender（而非伪造 `Failed`），使「连接断了」与「服务端拒绝了」
+   在调用方看来是两种结果。未知命令字**报错而非跳过**：`0x93` 的长度前有 status 字节而 `0x95` 没有，
+   猜长度会重同步到垃圾数据上；西电联调时新帧应当立刻暴露，而不是被静默吞掉。
 
 **范围边界：** L3 里程碑止于「总连接认证 + VIP + 一条五元组鉴权 + 一个数据包往返」，
 用手工构造 IP 包验证，**不接 TUN / DNS / 路由**——TUN 一旦接上，故障域从协议扩到内核
 路由表，无法二分。
+
+**离线部分已到边界（2026-07-31）。** 诊断入口 `atrust-probe l3-session`：会话恢复 →
+资源匹配定 `appId`/`nodeGroupId` → `L3Session::establish`（Get-IP 后连接不关）→ 授权一条五元组 →
+发一个进程内构造的 IPv4 包（`--probe icmp-echo|tcp-syn`，IP/ICMP/TCP 校验和均正确计算）→
+收一个下行包 → 关闭。`--auth-only` 可停在鉴权。`--target` 只收 IPv4 字面量：L3 搬的是包，
+在这里做域名解析等于自造一个资源表从未授权的目的地。
+
+**zju-connect 对照订正（2026-07-31）。** 以 `/home/nancunchild/projects/zju-connect`
+（`client/atrust/`，已验证可用的真实客户端）逐行对照后修掉三处：
+
+1. **VIP 帧长度**——`addrType=1` 的整帧是 **10 字节**（4 字节头 + 6 字节 body，前 4 为 IPv4），
+   Hermes 原按 8 字节读。独立 Get-IP 下不可见（读完即关连接），但会让保持长连接的
+   L3 会话从第一帧起错位。这是 mock 测试**不可能**发现的——mock 是照着 Hermes 自己的
+   理解写的。已按 `vipPayloadLength` 实现 addrType 驱动的长度，并加回归测试断言
+   VIP 帧后的下一帧仍对齐。
+2. **`53 00` 可以出现在会话中途**（不只 Get-IP 阶段），zju-connect `readFrame` 跳过它；
+   Hermes 原会判成版本错乱直接杀死会话。
+3. **未知 `05 <cmd>` 按通用 `<u16 len>` 跳过**，不再报错杀会话——原设计想让新帧「立刻暴露」，
+   但代价是一条本来健康的隧道死掉，而通用布局正是已验证客户端赖以保持同步的机制。
+   改为 WARN 记录 + 跳过。
+
+顺带修掉两处会**静默丢资源**的解析问题：`icmp` 协议值原本解析失败被整条丢弃
+（连 `--show-all` 都看不见），端口 `0` 与倒置区间同样被丢弃——而 ICMP 资源的端口通常正是 `0`。
+zju-connect 两者都保留。
+
+对端行为已用 `crates/atrust-l3/tests/mock_session.rs`（8 项）覆盖：包往返、
+已授权流走缓存不重发、并发同流只发一个 `0x13`、服务端拒绝、对端断开立即唤醒等待者、
+鉴权超时后驱逐并允许重试一次（`start_paused` 虚拟时钟，不真等 8 秒）、心跳周期、
+`0x94` token 分支。**注意这个 mock 是照着参考服务端源码写的，与参考服务端 live 对拨不是一回事**——
+后者才能证伪我对帧格式的理解。
 
 ## 建议 crate / 模块边界
 
@@ -151,9 +196,9 @@ atrust-auth          会话、会话存储、clientResource、节点解析、资
 atrust-protocol      帧编解码、签名、wire DTO
 hermes-transport     HTTP + `connect_tls` / `NodeTlsStream`
 atrust-tcp           DialTCP 状态机 + 帧化 TcpTunnel（无默认 live）
-atrust-l3           Get-IP + conntrack/auth；后续全双工 L3 会话（无 TUN）
+atrust-l3            Get-IP + IPv4 包解析 + conntrack/auth + 全双工 L3 会话（无 TUN/DNS/路由）
 atrust-probe         人工诊断子命令：auth / cas-login / client-resource / resource-match
-                     / node-probe / tcp-dial
+                     / node-probe / tcp-dial / get-ip / l3-session
 ```
 
 ## 测试门禁（按阶段加）
@@ -163,7 +208,7 @@ atrust-probe         人工诊断子命令：auth / cas-login / client-resource 
 | A | 节点解析单测（已有）；资源 golden；资源匹配单测（已有，17 项）；可选 live 仅计数 |
 | B | mock TCP 可连；TLS 策略默认 Verify；超时 |
 | C | init 帧 golden（与 Go 逐字节或固定 fixture）；握手状态机；应用帧；ignored live |
-| D | codec property / fuzz；L3 模拟对端拆包 |
+| D | L3 模拟对端会话（已有 8 项 `mock_session`）；IPv4 解析边界（已有）；codec property / fuzz 仍待 |
 
 真实登录、真实拨号：**永不**进入默认 CI。
 

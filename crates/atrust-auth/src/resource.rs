@@ -263,6 +263,10 @@ pub struct DomainResource {
 pub enum ResourceProtocol {
     Tcp,
     Udp,
+    /// Seen in zju-connect's matcher (`resource.Protocol == "icmp"`). Without
+    /// this variant an `icmp` resource fails to parse and is dropped from the
+    /// table entirely — invisible even to `--show-all` diagnostics.
+    Icmp,
     All,
 }
 
@@ -271,6 +275,7 @@ impl ResourceProtocol {
         match value.to_ascii_lowercase().as_str() {
             "tcp" => Some(Self::Tcp),
             "udp" => Some(Self::Udp),
+            "icmp" => Some(Self::Icmp),
             "all" => Some(Self::All),
             _ => None,
         }
@@ -280,6 +285,7 @@ impl ResourceProtocol {
         match self {
             Self::Tcp => "tcp",
             Self::Udp => "udp",
+            Self::Icmp => "icmp",
             Self::All => "all",
         }
     }
@@ -580,6 +586,14 @@ fn first_non_empty(values: [&str; 2]) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Parses a `"80"` or `"80-443"` port field.
+///
+/// Only an unparseable value drops the resource. Port `0` and an inverted range
+/// are kept, matching zju-connect, which validates nothing beyond `Atoi`.
+/// Dropping them silently removed real policy from the table: an ICMP resource
+/// commonly carries port `0`, and ICMP never compares ports anyway. A kept
+/// inverted range simply matches nothing, which is the same outcome as dropping
+/// it — except the resource stays visible to `resource-match --show-all`.
 fn parse_port_range(value: &str) -> Option<(u16, u16)> {
     let value = value.trim();
     if value.is_empty() {
@@ -588,15 +602,9 @@ fn parse_port_range(value: &str) -> Option<(u16, u16)> {
     if let Some((left, right)) = value.split_once('-') {
         let min = left.trim().parse::<u16>().ok()?;
         let max = right.trim().parse::<u16>().ok()?;
-        if min == 0 || max == 0 || min > max {
-            return None;
-        }
         return Some((min, max));
     }
     let port = value.parse::<u16>().ok()?;
-    if port == 0 {
-        return None;
-    }
     Some((port, port))
 }
 
@@ -737,9 +745,10 @@ mod tests {
                 "appList":{"data":{"appInfo":[{"apps":[
                     {"id":"","nodeGroupId":"ng","addressList":[{"protocol":"tcp","port":"80","host":"1.1.1.1"}]},
                     {"id":"app","nodeGroupId":"ng","addressList":[
-                        {"protocol":"icmp","port":"80","host":"1.1.1.1"},
-                        {"protocol":"tcp","port":"0","host":"1.1.1.1"},
-                        {"protocol":"tcp","port":"90-80","host":"1.1.1.1"}
+                        {"protocol":"gre","port":"80","host":"1.1.1.1"},
+                        {"protocol":"tcp","port":"","host":"1.1.1.1"},
+                        {"protocol":"tcp","port":"http","host":"1.1.1.1"},
+                        {"protocol":"tcp","port":"80","host":"  "}
                     ]}
                 ]}]}}
             }
@@ -747,6 +756,50 @@ mod tests {
         let resources = ClientResources::parse_bytes(body).unwrap();
         assert!(resources.ip_resources.is_empty());
         assert!(resources.domain_resources.is_empty());
+    }
+
+    /// Port `0` and inverted ranges are policy the gateway sent, not parse
+    /// errors: zju-connect keeps both. Dropping them removed an ICMP resource
+    /// (which typically carries port `0`) from the table entirely.
+    #[test]
+    fn keeps_zero_and_inverted_port_ranges() {
+        let body = br#"{
+            "code":0,
+            "data":{
+                "appList":{"data":{"appInfo":[{"apps":[
+                    {"id":"app","nodeGroupId":"ng","addressList":[
+                        {"protocol":"icmp","port":"0","host":"10.0.0.1"},
+                        {"protocol":"tcp","port":"90-80","host":"10.0.0.2"}
+                    ]}
+                ]}]}}
+            }
+        }"#;
+        let resources = ClientResources::parse_bytes(body).unwrap();
+        assert_eq!(resources.ip_resources.len(), 2);
+        assert_eq!(resources.ip_resources[0].protocol, ResourceProtocol::Icmp);
+        assert_eq!(resources.ip_resources[0].port_min, 0);
+        assert_eq!(resources.ip_resources[1].port_min, 90);
+        assert_eq!(resources.ip_resources[1].port_max, 80);
+    }
+
+    /// zju-connect matches `resource.Protocol == "icmp"` directly, so an `icmp`
+    /// resource is real policy, not a parse error. Dropping it at parse time
+    /// hid such a resource even from `--show-all` diagnostics.
+    #[test]
+    fn keeps_icmp_protocol_resources() {
+        let body = br#"{
+            "code":0,
+            "data":{
+                "appList":{"data":{"appInfo":[{"apps":[
+                    {"id":"app","nodeGroupId":"ng","addressList":[
+                        {"protocol":"icmp","port":"0","host":"10.0.0.1"}
+                    ]}
+                ]}]}}
+            }
+        }"#;
+        let resources = ClientResources::parse_bytes(body).unwrap();
+        assert_eq!(resources.ip_resources.len(), 1);
+        assert_eq!(resources.ip_resources[0].protocol, ResourceProtocol::Icmp);
     }
 
     #[test]
