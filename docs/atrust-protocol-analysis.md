@@ -201,8 +201,13 @@ xRequestSig = UPPERCASE(hex(digest))
     <原始IP包: packetLen字节>
 ```
 
-服务端响应命令为 `0x94`。源码兼容两种读法：一种先出现 16 位总长度，另一种
-直接出现 token 长度、保留字段、包数量和逐包长度。服务端返回的 IP 包进入
+服务端响应命令为 `0x94`。`05 94` 之后的 body 按首 2 字节 `n = u16-be` 分帧
+（与 zju-connect `readDataRespPayload` / Hermes `atrust-protocol::l3_frame` 一致）：
+
+- `0 < n ≤ 4096`：**长度前缀** — 随后 `n` 字节为一整包原始 IP；
+- 否则：**token 帧** — 与 `0x14` 相同的 `tokenLen | token | reserved | count | 包…`。
+
+该阈值为 wire 判别字段，不是对 IP 内容的扫描。服务端返回的 IP 包进入
 `dataChan`，再由 TUN 或内部栈处理。
 
 客户端在发送前从 IPv4 包提取：

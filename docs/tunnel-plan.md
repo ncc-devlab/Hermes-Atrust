@@ -93,7 +93,7 @@ psw 登录 → jar 导出 SID → `SessionMaterial`（`sign_key_provisional=true
 
 1. Get-IP 使用实际 SID JSON 长度编码；典型 73 字节 SID 对应 `0x0053`，待 Xidian
    原生 live 确认服务端不依赖固定长度；
-2. 确认 SignKey 绑定、下行 `0x94` 双格式判别；
+2. 确认 SignKey 绑定；`0x94` 双格式已编码在 `atrust-protocol::l3_frame`；
 3. SID 总连接认证 + VIP；
 4. 五元组鉴权 / conntrack / connectToken；
 5. 再谈 TUN / DNS / 路由。
@@ -113,7 +113,7 @@ EasyConnect 不在本规划内。
    无法二分定位。会话持久化落地后此条已无阻塞。
 3. **Get-IP 西电 live 复跑**，并保留 `53 00` 响应 JSON：`atrust-l3` 目前读完即丢，
    而该 JSON 可能带 VIP / 掩码 / second VIP 线索，应落 trace。
-4. **`0x94` 下行双格式判别字段**（架构文档未决项 2），不得按数值区间猜。
+4. **`0x94` 下行双格式**：已落地为 body 首 `u16-be n`，`0 < n ≤ 4096` 为长度前缀、否则 token 帧（见 `atrust-protocol::l3_frame`）。
 5. **`tcp:` vs `tcp://`**：TCP init 用 `tcp://`（`tcp_init.rs`），§3.3 的 L3 鉴权写
    `tcp:10.0.0.1:443`。L3 需独立 wire DTO，不复用 `build_signed_tcp_init_json`。
 
@@ -131,7 +131,7 @@ EasyConnect 不在本规划内。
    并在与 `--app-id` 不一致时打 WARN（仅观测，不改变拨号行为）。
 2. ~~会话持久化~~（已完成，见执行清单第 8 项）。
 3. L3 帧 codec：`05 14` 上行编码器与心跳 `05 15 00 00` / `05 95`，配 property/fuzz；
-   `0x94` 解码器等第 4 项闸门。
+   `0x94` 解码可直接用 `decode_l3_data_resp_*`。
 4. conntrack + connectToken 状态机：首见五元组建项、8s 超时、驱逐连接、重试一次、
    仍失败丢包。纯状态机可单测。
 5. IPv4 包解析（atype / protocol / 五元组），只做 IPv4，与 Go `processIPV4` 一致。

@@ -84,7 +84,7 @@ cargo test --workspace
 以下事实未经真实对端和抓包确认前，不得当作稳定协议继续向上封装：
 
 1. Go Get-IP 请求中的 `0x0053` 是否为固定值，还是应由 SID JSON 长度动态计算；
-2. L3 `0x94` 下行数据两种格式应通过哪个明确字段区分，不能沿用数值区间猜测；
+2. ~~L3 `0x94` 下行双格式判别~~（已决：body 首 `u16-be n`，`0 < n ≤ 4096` → 长度前缀，否则 token 帧；见 `atrust-protocol::l3_frame`）；
 3. SignKey 是客户端生成、服务端下发还是经其它接口注册，以及它与 SID 的绑定关系；
 4. second VIP 的请求条件和用途；
 5. L3 flow key 是否必须包含协议号；
@@ -120,7 +120,7 @@ authConfig                              [已完成]
 外网因网络层不可达超时；节点 `:441` 待校内复跑。Phase C 已用 `atrust-probe tcp-dial` 对
 `Hermes-aTrust-Server` 完成 psw 登录 → SID 导出 → 握手 → 应用数据回环 → 关闭的端到端验证；
 证实临时随机 SignKey 模型正确、帧逐字节互通。**西电真机数据面仍待校内抓包对照**（SID/SignKey
-绑定、`0x0053` 长度语义、`0x94` 双格式）。隧道分阶段规划见 [`tunnel-plan.md`](tunnel-plan.md)。
+绑定、`0x0053` 长度语义；`0x94` 双格式见 `atrust-protocol::l3_frame`）。隧道分阶段规划见 [`tunnel-plan.md`](tunnel-plan.md)。
 
 学校差异（IDS 表单、滑块、SMS UI）只存在于浏览器/UI 适配层。协议层只接受：
 
@@ -221,7 +221,7 @@ cargo run -p atrust-probe -- \
 - SID 总连接认证和虚拟 IP 解析；
 - 按五元组鉴权、conntrack 和 connect token 生命周期；
 - L3 数据帧、心跳、多节点组连接和确定性关闭；
-- 下行 `0x94` 两种格式的明确判别；
+- ~~下行 `0x94` 两种格式判别~~（`u16-be n`，`0 < n ≤ 4096` / 否则 token）；
 - ICMP、UDP、TCP 的逐阶段真实联调；
 - second VIP 和 IPv6 能力确认。
 
