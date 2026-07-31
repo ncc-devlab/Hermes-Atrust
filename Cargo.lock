@@ -120,6 +120,7 @@ dependencies = [
 name = "atrust-l3"
 version = "0.1.0"
 dependencies = [
+ "atrust-protocol",
  "hermes-model",
  "hermes-transport",
  "serde",

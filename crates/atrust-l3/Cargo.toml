@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+atrust-protocol = { path = "../atrust-protocol" }
 hermes-model = { path = "../hermes-model" }
 hermes-transport = { path = "../hermes-transport" }
 serde.workspace = true

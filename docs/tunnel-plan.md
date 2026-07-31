@@ -115,7 +115,7 @@ EasyConnect 不在本规划内。
    而该 JSON 可能带 VIP / 掩码 / second VIP 线索，应落 trace。
 4. **`0x94` 下行双格式**：已落地为 body 首 `u16-be n`，`0 < n ≤ 4096` 为长度前缀、否则 token 帧（见 `atrust-protocol::l3_frame`）。
 5. **`tcp:` vs `tcp://`**：TCP init 用 `tcp://`（`tcp_init.rs`），§3.3 的 L3 鉴权写
-   `tcp:10.0.0.1:443`。L3 需独立 wire DTO，不复用 `build_signed_tcp_init_json`。
+   `tcp:10.0.0.1:443`。~~L3 独立 wire DTO~~（`build_signed_l3_auth_json`）；真机 `url` 形态仍待抓包。
 
 **可离线先做完、不被校内网络阻塞：**
 
@@ -130,13 +130,15 @@ EasyConnect 不在本规划内。
    配合 `client-resource --save-body` 可完全离线迭代。`tcp-dial` 会在拨号前记录匹配结果，
    并在与 `--app-id` 不一致时打 WARN（仅观测，不改变拨号行为）。
 2. ~~会话持久化~~（已完成，见执行清单第 8 项）。
-3. L3 帧 codec：`05 14` 上行编码器与心跳 `05 15 00 00` / `05 95`，配 property/fuzz；
-   `0x94` 解码可直接用 `decode_l3_data_resp_*`。
-4. conntrack + connectToken 状态机：首见五元组建项、8s 超时、驱逐连接、重试一次、
-   仍失败丢包。纯状态机可单测。
+3. ~~L3 帧 codec~~：`encode_l3_data_req` / `encode_l3_auth_req` / `encode_l3_heartbeat_req` /
+   `0x94` 双格式解码 / `05 95` 头判定（`atrust-protocol::l3_frame`）。property/fuzz 仍待。
+4. ~~conntrack + connectToken 状态机骨架~~：`FlowKey` / `auth_id` / `try_start_auth` /
+   `mark_auth` / `L3_AUTH_TIMEOUT=8s`（`atrust-l3::conntrack`）。**未**接读循环、驱逐、
+   重试一次、超时丢包。
 5. IPv4 包解析（atype / protocol / 五元组），只做 IPv4，与 Go `processIPV4` 一致。
 6. 节点时延选优（`pingNum=3`）：L3 每个 node group 缓存一条长连接，选错代价大于 Phase C。
 7. 超时预算复核：实测 TLS connect+handshake 约 6.3s，而鉴权超时 8s，叠加会误判为鉴权失败。
+8. 全双工 L3 会话：TLS 长连接 + 读循环分发 `0x93`/`0x94`/`0x95` + 心跳任务 + 手工 IP 包往返。
 
 **范围边界：** L3 里程碑止于「总连接认证 + VIP + 一条五元组鉴权 + 一个数据包往返」，
 用手工构造 IP 包验证，**不接 TUN / DNS / 路由**——TUN 一旦接上，故障域从协议扩到内核
@@ -149,7 +151,7 @@ atrust-auth          会话、会话存储、clientResource、节点解析、资
 atrust-protocol      帧编解码、签名、wire DTO
 hermes-transport     HTTP + `connect_tls` / `NodeTlsStream`
 atrust-tcp           DialTCP 状态机 + 帧化 TcpTunnel（无默认 live）
-atrust-l3           SID-only Get-IP；后续承载 L3 总连接与数据帧
+atrust-l3           Get-IP + conntrack/auth；后续全双工 L3 会话（无 TUN）
 atrust-probe         人工诊断子命令：auth / cas-login / client-resource / resource-match
                      / node-probe / tcp-dial
 ```

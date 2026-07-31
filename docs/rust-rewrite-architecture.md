@@ -26,7 +26,7 @@ application
 - `atrust-browser`：可复用的 WebDriver/BiDi 复杂 CAS/MFA 人工登录、网关 Cookie
   收割和全保真 trace（`0600`，见强制边界 12）；
 - `atrust-tcp`：单连接 TCP 隧道握手和帧化 I/O；
-- `atrust-l3`：SID-only Get-IP 实验探针；尚不包含总连接、单流授权或数据转发；
+- `atrust-l3`：Get-IP、conntrack/`connectToken`、每流 `0x13` 帧组装；全双工读循环 / TUN 未做；
 - `atrust-probe`：组合上述库进行真实对端诊断，不再拥有浏览器协议实现。
 
 只有存在实际实现时才新增 crate，禁止先创建无职责的空壳模块。
@@ -217,11 +217,11 @@ cargo run -p atrust-probe -- \
 
 ### L3 隧道
 
-- Get-IP codec 已落地并按实际 SID JSON 动态编码长度；Xidian 原生 live 待执行；
-- SID 总连接认证和虚拟 IP 解析；
-- 按五元组鉴权、conntrack 和 connect token 生命周期；
-- L3 数据帧、心跳、多节点组连接和确定性关闭；
-- ~~下行 `0x94` 两种格式判别~~（`u16-be n`，`0 < n ≤ 4096` / 否则 token）；
+- ~~Get-IP codec（动态 SID JSON 长度；`05 d0` / `53 00` / 地址循环）~~；Xidian live 待复跑；
+- SID 总连接（Get-IP 之后）长连接保持、多节点组与确定性关闭；
+- ~~按五元组鉴权 JSON（`tcp:` 无 `//`）、conntrack 表、connectToken 状态机骨架~~
+  （`atrust-protocol::l3_auth` + `atrust-l3::{conntrack,auth}`；8s 超时常量；**未**接 I/O 循环）；
+- ~~`0x14` 编码 / 下行 `0x94` 双格式 / 心跳请求常量~~；读循环与心跳任务未接；
 - ICMP、UDP、TCP 的逐阶段真实联调；
 - second VIP 和 IPv6 能力确认。
 

@@ -1,4 +1,4 @@
-//! L3 tunnel binary frames (`0x13`/`0x93` auth is out of scope here).
+//! L3 tunnel binary frames.
 //!
 //! # `0x94` body framing
 //!
@@ -12,6 +12,12 @@
 //!   (`tokenLen`, token, reserved, packetCount, length-prefixed packets).
 //!
 //! This threshold is the wire discriminant, not a content scan of IP packets.
+//!
+//! # Auth / heartbeat
+//!
+//! - Per-flow auth request: `05 13 <u16-be jsonLen> <json>`
+//! - Heartbeat request: `05 15 00 00` (`L3_HEARTBEAT_REQ`)
+//! - Heartbeat response header: `05 95` (payload length follows on the wire)
 
 use thiserror::Error;
 
@@ -20,6 +26,8 @@ pub const L3_VERSION: u8 = 0x05;
 
 /// L3 command codes used on the data plane.
 pub mod l3_cmd {
+    pub const AUTH_REQ: u8 = 0x13;
+    pub const AUTH_RESP: u8 = 0x93;
     pub const DATA_REQ: u8 = 0x14;
     pub const DATA_RESP: u8 = 0x94;
     pub const HEARTBEAT_REQ: u8 = 0x15;
@@ -38,6 +46,9 @@ pub const L3_HEARTBEAT_REQ: [u8; 4] = [
     0x00,
     0x00,
 ];
+
+/// Heartbeat response command header (`05 95`); length-prefixed body follows.
+pub const L3_HEARTBEAT_RESP_HEADER: [u8; 2] = [L3_VERSION, l3_cmd::HEARTBEAT_RESP];
 
 /// Which body layout follows `05 94`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,6 +76,35 @@ pub fn classify_data_resp_prefix(prefix: [u8; 2]) -> DataRespLayout {
     } else {
         DataRespLayout::TokenFramed
     }
+}
+
+/// Encodes one per-flow auth request frame (`0x13`).
+///
+/// Wire: `05 13 <u16-be jsonLen> <json>`
+pub fn encode_l3_auth_req(json: &[u8]) -> Result<Vec<u8>, L3FrameError> {
+    if json.len() > u16::MAX as usize {
+        return Err(L3FrameError::JsonTooLarge {
+            length: json.len(),
+        });
+    }
+    let mut out = Vec::with_capacity(4 + json.len());
+    out.push(L3_VERSION);
+    out.push(l3_cmd::AUTH_REQ);
+    out.extend_from_slice(&(json.len() as u16).to_be_bytes());
+    out.extend_from_slice(json);
+    Ok(out)
+}
+
+/// Returns the fixed heartbeat request bytes (`05 15 00 00`).
+#[must_use]
+pub fn encode_l3_heartbeat_req() -> [u8; 4] {
+    L3_HEARTBEAT_REQ
+}
+
+/// True when `header` is a heartbeat response command (`05 95`).
+#[must_use]
+pub fn is_l3_heartbeat_resp(header: [u8; 2]) -> bool {
+    header == L3_HEARTBEAT_RESP_HEADER
 }
 
 /// Encodes one `0x14` data request frame.
@@ -264,6 +304,8 @@ pub enum L3FrameError {
     TooManyPackets { count: usize },
     #[error("packet length {length} exceeds framing limit")]
     PacketTooLarge { length: usize },
+    #[error("auth JSON length {length} exceeds u16")]
+    JsonTooLarge { length: usize },
     #[error("length-prefixed 0x94 packet must be non-empty")]
     EmptyLengthPrefixedPacket,
     #[error("frame truncated: need {needed} bytes, got {got}")]
@@ -365,6 +407,18 @@ mod tests {
     #[test]
     fn heartbeat_constant() {
         assert_eq!(L3_HEARTBEAT_REQ, [0x05, 0x15, 0x00, 0x00]);
+        assert_eq!(encode_l3_heartbeat_req(), L3_HEARTBEAT_REQ);
+        assert!(is_l3_heartbeat_resp([0x05, 0x95]));
+        assert!(!is_l3_heartbeat_resp([0x05, 0x15]));
+    }
+
+    #[test]
+    fn encode_auth_req_matches_documented_layout() {
+        let json = br#"{"sid":"x"}"#;
+        let frame = encode_l3_auth_req(json).unwrap();
+        assert_eq!(&frame[..2], &[0x05, 0x13]);
+        assert_eq!(u16::from_be_bytes([frame[2], frame[3]]), json.len() as u16);
+        assert_eq!(&frame[4..], json);
     }
 
     #[test]

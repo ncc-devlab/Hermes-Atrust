@@ -3,16 +3,22 @@
 //! This crate intentionally has no network, runtime, configuration, or logging dependencies.
 
 mod json;
+mod l3_auth;
 mod l3_frame;
 mod signing;
 mod tcp_frame;
 mod tcp_init;
 
 pub use json::{ProtocolJsonError, to_wire_json};
+pub use l3_auth::{
+    L3AuthError, L3AuthFiveTuple, L3AuthParams, L3AuthResponse, L3IpProtocol,
+    build_signed_l3_auth_json, parse_l3_auth_response,
+};
 pub use l3_frame::{
-    DataRespLayout, DataRespPackets, L3FrameError, L3_HEARTBEAT_REQ, L3_VERSION,
-    MAX_LENGTH_PREFIXED_DATA_RESP, classify_data_resp_prefix, decode_l3_data_resp_body,
-    decode_l3_data_resp_frame, encode_l3_data_req, encode_l3_data_resp_length_prefixed, l3_cmd,
+    DataRespLayout, DataRespPackets, L3FrameError, L3_HEARTBEAT_REQ, L3_HEARTBEAT_RESP_HEADER,
+    L3_VERSION, MAX_LENGTH_PREFIXED_DATA_RESP, classify_data_resp_prefix, decode_l3_data_resp_body,
+    decode_l3_data_resp_frame, encode_l3_auth_req, encode_l3_data_req,
+    encode_l3_data_resp_length_prefixed, encode_l3_heartbeat_req, is_l3_heartbeat_resp, l3_cmd,
     parse_l3_token_data_body,
 };
 pub use signing::{RequestSignature, calculate_request_signature};
