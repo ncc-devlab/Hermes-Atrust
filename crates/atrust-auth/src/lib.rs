@@ -4,6 +4,7 @@ mod auth_config;
 mod cas;
 mod client;
 mod material;
+mod node_select;
 mod password;
 mod profile;
 mod resource;
@@ -17,6 +18,10 @@ pub use client::{AuthClient, AuthError};
 pub use material::{
     MaterialError, SessionMaterial, SessionMaterialLog, SidCookieSource, extract_sid_from_cookies,
     generate_provisional_sign_key,
+};
+pub use node_select::{
+    NodeMeasurement, NodeSelectError, NodeSelection, SelectionSource, UnadvertisedNode,
+    select_node, select_node_with,
 };
 pub use password::{PasswordAuthOutcome, PasswordCredentials, PasswordError};
 pub use profile::AuthProtocolProfile;

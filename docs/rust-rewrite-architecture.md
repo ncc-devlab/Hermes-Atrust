@@ -81,6 +81,9 @@ cargo test --workspace
 
 ## 未确认协议关卡
 
+**完整登记（含二义区间、误判症状、判定实验和命令）见
+[`open-questions.md`](open-questions.md)。** 本节只保留结论条目。
+
 以下事实未经真实对端和抓包确认前，不得当作稳定协议继续向上封装：
 
 1. ~~Go Get-IP 请求中的 `0x0053` 是否为固定值，还是应由 SID JSON 长度动态计算~~
@@ -123,7 +126,7 @@ authConfig                              [已完成]
 → SessionMaterial                       [sid/device/conn/sign_key/user present；SignKey provisional]
 → clientResource                        [200；~1.3MB/12.5s；1361 IP / 523 域名 / 1 节点组]
 → 节点地址解析（无探测）               [2 endpoints，major 存在]
-→ node-probe TLS-only                   [已接线并 live；外网 :441 TCP 超时，待校内复跑]
+→ node-probe TLS-only                   [已接线并 live；61.150.43.94:441 外网可达，81ms]
 → TCP 帧 codec                          [已实现]
 → TCP DialTCP 握手 + 应用帧             [已实现；对公网参考服务端 live 打通]
 → L3 帧 codec + IPv4 包解析             [已实现]
@@ -131,17 +134,23 @@ authConfig                              [已完成]
 ```
 
 **控制面里程碑已闭环（2026-07-27）。数据面探测已接上（2026-07-28）。数据面 TCP 隧道已 live
-打通（2026-07-29，公网参考服务端）。** Phase B 已 live（`cas-login --probe-nodes` 同进程），
-外网因网络层不可达超时；节点 `:441` 待校内复跑。Phase C 已用 `atrust-probe tcp-dial` 对
+打通（2026-07-29，公网参考服务端）。** Phase B 已 live（`cas-login --probe-nodes` 同进程）。
+
+**2026-07-31 更正：此前记录的「外网 `:441` 不可达 / 待校内复跑」是误判。** 真实数据面节点是
+`61.150.43.94:441`（自签 `CN=sdp`，TLS 握手 81 ms，公网当前可达）；DNS 里的 `.99:441` 才是死端口，
+且**任何 SNI 都会让节点静默不响应**。这两条见 [`open-questions.md`](open-questions.md) D1/D2。
+后果是**西电 live 验证不再需要进校**，实验序列 E1–E5 见同一文档。Phase C 已用 `atrust-probe tcp-dial` 对
 `Hermes-aTrust-Server` 完成 psw 登录 → SID 导出 → 握手 → 应用数据回环 → 关闭的端到端验证；
-证实临时随机 SignKey 模型正确、帧逐字节互通。**西电真机数据面仍待校内抓包对照**（SID/SignKey
-绑定、`0x0053` 长度语义；`0x94` 双格式见 `atrust-protocol::l3_frame`）。
+证实帧与该服务端逐字节互通。注意「临时随机 SignKey 模型成立」只在那个**重建**服务端上成立，
+属于循环论证，西电是否硬校验由实验 E3 判定。**西电真机数据面仍待实测对照**（SID/SignKey
+绑定、`0x0053` 长度语义；`0x94` 双格式见 `atrust-protocol::l3_frame` 与 open-questions A1）。
 
 **L3 离线件已到里程碑边界（2026-07-31）：** `atrust-l3::L3Session` 打通「Get-IP → 五元组鉴权 →
 IPv4 包往返 → 关闭」，诊断入口 `atrust-probe l3-session`。**但它一次真实对端都没跑过**——
 覆盖它的 `mock_session.rs` 是照着参考服务端源码写的，因此只能证明实现自洽，不能证伪
-对帧格式的理解。下一步的 live 顺序不变：SignKey 是否真被校验（1 号闸门）→ 西电原生
-`tcp-dial` → Get-IP 复跑 → 才谈 L3 live。隧道分阶段规划见 [`tunnel-plan.md`](tunnel-plan.md)。
+对帧格式的理解。下一步的 live 顺序不变，但**已不再被地理位置阻塞**：资源表重叠量化（E2，离线）
+→ SignKey 是否真被校验（E3，1 号闸门）→ Get-IP 复跑（E4）→ 才谈 L3 live（E5）。
+实验命令见 [`open-questions.md`](open-questions.md)，隧道分阶段规划见 [`tunnel-plan.md`](tunnel-plan.md)。
 
 学校差异（IDS 表单、滑块、SMS UI）只存在于浏览器/UI 适配层。协议层只接受：
 

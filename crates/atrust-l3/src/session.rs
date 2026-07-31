@@ -54,6 +54,14 @@ const L3_SECOND_VIP_RESP: u8 = 0x96;
 /// make the reader buffer without bound.
 const MAX_PENDING_READ: usize = 1024 * 1024;
 
+/// Shortest `connectToken` for which the `0x94` layout discriminant is safe.
+///
+/// A token-framed body opens with `tokenLen` followed by the token, so its
+/// leading `u16-be` is `tokenLen * 256 + token[0]`. The length-prefixed branch
+/// claims `(0, 4096]`, which a token of 15 bytes or fewer always lands inside.
+/// The gateway never declares this invariant; see `docs/open-questions.md` A1.
+const MIN_UNAMBIGUOUS_CONNECT_TOKEN: usize = 17;
+
 const READ_CHUNK: usize = 16 * 1024;
 const WRITE_QUEUE_DEPTH: usize = 64;
 const PACKET_QUEUE_DEPTH: usize = 256;
@@ -611,8 +619,24 @@ fn dispatch(
                         debug!(
                             event = "atrust_l3.session.auth_settled",
                             auth_id,
-                            ready = outcome.connect_token().is_some()
+                            ready = outcome.connect_token().is_some(),
+                            connect_token_len = outcome.connect_token().map_or(0, str::len)
                         );
+                        // The `0x94` token-framed branch is only distinguishable
+                        // from the length-prefixed one because `tokenLen` is large
+                        // enough to push the leading u16 past 4096. A short token
+                        // makes the discriminant misfire and desynchronizes the
+                        // stream far from here, so it is reported at the one point
+                        // where the length is known.
+                        if let Some(token) = outcome.connect_token()
+                            && token.len() < MIN_UNAMBIGUOUS_CONNECT_TOKEN
+                        {
+                            warn!(
+                                event = "atrust_l3.session.connect_token_ambiguous",
+                                connect_token_len = token.len(),
+                                minimum = MIN_UNAMBIGUOUS_CONNECT_TOKEN
+                            );
+                        }
                         shared.notify(auth_id, &outcome);
                     }
                 }
@@ -625,9 +649,26 @@ fn dispatch(
             }
             Dispatch::Continue
         }
+        // Which branch the gateway actually uses is unconfirmed against the real
+        // gateway, and the two are told apart only by a numeric threshold, so the
+        // choice is recorded on every frame rather than inferred after a failure.
         Inbound::Data(packets) => match packets {
-            DataRespPackets::LengthPrefixed(packet) => Dispatch::Send(packet.to_vec()),
+            DataRespPackets::LengthPrefixed(packet) => {
+                debug!(
+                    event = "atrust_l3.session.data_resp",
+                    layout = "length_prefixed",
+                    packets = 1,
+                    bytes = packet.len()
+                );
+                Dispatch::Send(packet.to_vec())
+            }
             DataRespPackets::TokenFramed(packets) => {
+                debug!(
+                    event = "atrust_l3.session.data_resp",
+                    layout = "token_framed",
+                    packets = packets.len(),
+                    bytes = packets.iter().map(|packet| packet.len()).sum::<usize>()
+                );
                 Dispatch::SendMany(packets.into_iter().map(<[u8]>::to_vec).collect())
             }
         },

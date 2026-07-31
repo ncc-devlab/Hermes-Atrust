@@ -1,0 +1,544 @@
+# 协议二义性与未决问题登记
+
+本文件收纳 Hermes 中**依据不足、存在二义、或与参考实现存在已知分歧**的每一处判断。
+架构文档的「未确认协议关卡」只列结论，这里列**理由、二义区间、误判后的症状、以及判定实验**。
+
+任何 live 失败在归因到「实现 bug」之前，先在本表里找是否已有对应条目。
+
+## 依据强度分级
+
+| 级别 | 含义 |
+|---|---|
+| **L0** | 官方网关 `atrust.xidian.edu.cn` 实测/抓包确认 |
+| **L1** | zju-connect（`/home/nancunchild/projects/zju-connect`，已被证实可用于真实 aTrust 网关） |
+| **L2** | `Hermes-aTrust-Server`——由抓包和控制台表现**重建**的服务端推测，**不是证据** |
+| **L3** | 纯推断／从帧结构自洽性倒推，无外部依据 |
+
+L2 单独出现时等同于「未验证」：该服务端与 Hermes 客户端互通只证明两个实现一致，
+不证明任何一个正确。2026-07-31 的 VIP 长度 bug 就是这样被 L2 掩盖了两天的。
+
+---
+
+## A. L3 帧层
+
+### A1 — `0x94` 下行双格式的切分依据 <a id="a1"></a>
+
+**依据：L1**（zju-connect `l3tunnelconn.go::readDataRespPayload`，Hermes
+`atrust-protocol::l3_frame::classify_data_resp_prefix`，两者逐行等价）
+
+**现状实现。** `05 94` 之后不存在格式标志位。判别完全依赖 body 头两字节的数值：
+
+```text
+n = u16::from_be(body[0..2])
+0 < n <= 4096   →  长度前缀分支：其后 n 字节是一个完整 IP 包
+否则            →  token 帧分支：tokenLen | token | reserved(2) | count | [u16 len][pkt]...
+```
+
+**为什么是这个判据，而不是别的。** 三条约束把它逼成唯一可行解：
+
+1. **服务端确实会用两种布局下发同一个 `0x94` 命令**，且不带任何区分字段。这是协议的
+   既成事实，不是客户端的选择；
+2. **不能靠「像不像 IP 包」判别。** 一个 IPv4 包以 `45 00` 开头，作为 u16-be 是 17664，
+   已经落在 token 分支区间。也就是说「裸 IP 包」和「长度前缀 + IP 包」在数值上天然可分，
+   但代价是判据必须信任长度前缀恒存在（见下方二义区间 3）；
+3. **4096 这个上界是隧道 MTU 的上界假设**，不是协议声明的常量。zju-connect 写作
+   `maxDataPayload = 4096`，来源同样未知。
+
+**二义区间（三处，全部真实可达）：**
+
+| # | 条件 | 后果 |
+|---|---|---|
+| 1 | token 帧且 `tokenLen ≤ 15` | 头两字节 = `tokenLen*256 + token[0]` ≤ 4095，落入长度前缀区间 → **误判**，其后按 token 首字节起算长度，流立即错位 |
+| 2 | token 帧且 `tokenLen == 16 && token[0] == 0` | 数值恰为 4096，同上 **误判** |
+| 3 | 长度前缀分支且 `n == 0` 或 `n > 4096` | 落入 token 分支 → **误判**。即隧道下行单包超过 4096 字节时协议直接失同步 |
+
+**因此判据成立的前提是两条服务端不变量，而服务端从未声明过它们：**
+
+- `connectToken` 的字节长度 **≥ 17**（或 = 16 且首字节非零）；
+- 下行 IP 包长度恒 **≤ 4096**。
+
+**误判后的症状。** 不是解析报错，而是**流错位**：后续每一帧的边界都偏移，
+表现为「跑一会儿之后帧头不是 `05`」「随机 UnexpectedVersion」「隧道无征兆卡死」。
+症状离原因很远，所以这一条必须在排查表最前面。
+
+**L0（2026-07-31 E5）：** 西电 `connect_token_len=32`（≥17，判据安全）；
+下行 `data_resp layout=length_prefixed`（TCP SYN 应答 44 字节 IP 包）。
+未见 `connect_token_ambiguous`。**A1 在西电首样本上成立。**
+
+**判定实验：** [E5](#e5)——token 长度已决；大包/token 分支样本仍待。
+
+**已加固（2026-07-31）：** `L3Session` 拿到 `connectToken` 时若长度 < 17
+（`MIN_UNAMBIGUOUS_CONNECT_TOKEN`）立即发 `connect_token_ambiguous` WARN，
+把「未来某天错位」提前成「握手时就报警」。
+
+### A2 — VIP 应答体的长度表 <a id="a2"></a>
+
+**依据：L1**（zju-connect `l3tunnelconn.go::authTunnel` / `vipPayloadLength`）
+
+VIP 帧为 `05 <status> <reserved> <addrType>` + `vipPayloadLength(addrType)` 字节。
+现表：`1 → 6`，`4 → 18`，`5 → 22`，其它 `→ 4`。
+
+**L0（2026-07-31 E4）：** 西电 `addrType=1`，`vip_data_len=6`，
+`vip_data_hex=0ad21dc80000` → IPv4 `10.210.29.200`，**尾 2 字节为 `00 00`**
+（不是 `18 00` 掩码位数假说的正例；仍可能是保留/零填充）。长度表 `1 → 6` 在西电成立。
+
+**仍未决：**
+
+- 尾 2 字节语义（零是否恒定、非零时是否掩码/其它）；
+- `addrType = 4`（18）和 `5`（22）**西电仍未观察到**，长度仍来自 zju-connect；
+- 默认分支的 4 字节是纯兜底，用途是**保持流同步**而不是解析地址——未知类型时先把
+  body 读完再报错，否则半消费的帧会毒化这条连接；
+- zju-connect **自身两处不一致**：`ip.go::getIP` 只读 8 字节整帧，
+  `l3tunnelconn.go::authTunnel` 读 10。以 `authTunnel` 为准，因为它的连接要继续用。
+  Hermes 曾照 `getIP` 实现，导致长连接从第一帧起错位（2026-07-31 修复）。
+
+**判定实验：** [E4](#e4)（`vip_data_hex` trace）——长度已决；尾字节语义仍开。
+
+### A3 — 每命令的帧头不对称 <a id="a3"></a>
+
+**依据：L1 + L2**
+
+`0x93`（AUTH_RESP）和 `0x96`（SECOND_VIP_RESP）在 u16 长度**之前**多一个 status 字节
+（5 字节头）；`0x95` 和所有未知命令用通用 `<u16 len>`（4 字节头）；`0x94` 用 [A1](#a1) 的双格式。
+
+**未决：** 这个「哪些命令带 status」的名单是**枚举出来的，不是规则**。没有任何依据说明
+下一个新命令属于哪一类。Hermes 现在对未知命令按通用 4 字节头跳过（见 [A4](#a4)），
+若某个未知命令实际是 status-先于-长度 布局，跳过会读少 1 字节并错位。
+
+### A4 — 未知 `05 <cmd>` 的处理策略 <a id="a4"></a>
+
+**依据：L1**（zju-connect `readFrame` 对未知命令用通用长度布局跳过）
+
+**现状：** WARN 记录 + 按 `<u16 len>` 跳过，会话继续。
+
+**这是一次被推翻的设计决定。** 早期实现选择「未知命令直接杀会话，让新帧在联调期立刻暴露」。
+该权衡是错的：代价是一条健康隧道死掉，而通用长度布局的宽容正是已验证客户端能保持同步的机制。
+2026-07-31 改为跳过。
+
+**残留风险：** 见 [A3](#a3)。跳过一个实际带 status 的未知命令会静默错位。
+
+### A5 — 会话中途的 `53 00` 嵌套协议消息 <a id="a5"></a>
+
+**依据：L1**
+
+`53 00 <u16 len> <body>` 不只出现在 Get-IP 阶段，**会话中途也会出现**。Hermes 早期把它
+判为版本错乱并杀会话，现已按嵌套消息消费。
+
+**L0 样本（2026-07-31 E4 Get-IP）：**
+`{"code":0,"data":{"deviceID":"644B123B"},"message":"OK"}`
+（`deviceID` 为短十六进制串，与会话内 32 字节 `device_id` 形态不同）。
+
+**仍未决：** body 内容 **Hermes 一律不解析**。若其中某类消息携带的是可操作状态
+（会话被踢下线、策略变更、需要重新鉴权），Hermes 会当作噪声丢掉，表现为
+「隧道还在但所有流突然不通」。Get-IP 阶段的 body 已存入 `status_bodies` 可 trace；
+会话中途的目前只计数。
+
+### A6 — `0x95` 心跳应答体 <a id="a6"></a>
+
+**依据：L1**。body 被完整消费但内容忽略。是否携带服务端侧的会话计时/配额信息未知。
+
+### A7 — `0x16` / `0x96` second VIP <a id="a7"></a>
+
+**依据：L3**。请求触发条件和用途均未确认。已知 `addrType = 5` 的 VIP 帧本身就同时带
+IPv4 和 IPv6，与 second-VIP 是否互斥、还是分别服务不同场景，无依据。
+Hermes 能解码 `0x96` 但从不主动发 `0x16`。
+
+---
+
+## B. 鉴权与会话
+
+### B1 — SignKey 的来源与绑定关系 <a id="b1"></a>
+
+**依据：L2 only**——这是当前最薄的一环。
+
+参考服务端的模型是：客户端生成、不上传；服务端若已绑定 `sign_key_hex` 则硬校验 HMAC，
+否则从 wire JSON 的 `signKey` 字段 first-write-wins 学习，再否则放行。
+**这个模型完全来自那个重建服务端，没有任何 L0/L1 佐证。**
+
+Hermes 现在用一个临时随机 SignKey，对参考服务端能打通——但那恰恰是 L2 循环论证的典型：
+服务端「不绑定就放行」的行为如果是重建时猜的，西电可能根本不是这样。
+
+**L0（2026-07-31 E3）：** 同一 CAS 会话下，正确 `sign_key_hex` 与仅翻转首字符的坏 key，
+对 TCP 隧道握手**均成功**（目标 `202.117.115.138:80` / 新OA）。按判读表：
+**西电当前不硬校验 TCP init 的 HMAC**（或等价于未绑定 + 不学习）。
+临时随机 SignKey 模型在西电 TCP 路径上**不阻塞**；[B1](#b1) 降级为非阻塞。
+
+**仍未决：** 是否存在独立注册接口；L3 `0x13` 路径是否与 TCP 不同策略
+（E5 用同一 provisional key 的 L3 flow auth 已成功，至少「随机 key + HMAC 可算」可过）。
+
+**判定实验：** [E3](#e3)——已跑；L3 侧见 [E5](#e5)。
+
+### B2 — Get-IP 请求中的 `0x0053` <a id="b2"></a>
+
+**依据：L1（已决）**，但需要一次 L0 复核。
+
+`0x0053` = 83 是**动态长度**，`authTunnel::wrapAuthReqData` 动态计算；`getIP` 里写死
+只是 73 字符 SID 的巧合。Hermes 的动态实现正确。
+
+**残留：** 西电的 SID 若恰好也是 73 字符，这条 live 不具备区分力。复核需要一个
+**长度不等于 73** 的 SID。若拿不到，就只能维持 L1。
+
+### B3 — flow key 不含协议号 <a id="b3"></a>
+
+**依据：L1（逐字符一致）**
+
+`connTrackKey` = `{atype}:{src}:{sport}-{dst}:{dport}`，没有协议号。
+
+**未决：** 这意味着**同四元组的 TCP 流和 UDP 流会共用一条 conntrack 表项**。这是服务端
+的真实语义，还是 zju-connect 的一个恰好没被踩到的简化？无依据。真踩到时的症状是
+「UDP 流复用了 TCP 流的 connectToken」——服务端大概率拒绝或静默丢包。
+
+注意 `atype` 在两处是**不同的命名空间**：鉴权 JSON 里是 `0x0800`（EtherType），
+flow key 里是 `4`。两者都是经验值。
+
+### B4 — 8 秒鉴权超时 / 25 秒心跳 <a id="b4"></a>
+
+**依据：L1**。两个常量都来自 zju-connect 源码，**服务端从未声明**。西电的实际容忍窗口未知。
+心跳过慢会被服务端静默断开，过快在大规模部署下可能触发限流。
+
+### B5 — 鉴权失败后的重试语义分歧 <a id="b5"></a>
+
+**已知分歧，已记录未修。**
+
+zju-connect 的「重试一次」是**整条连接作废**：新建 TLS + 全新 conntrack。
+Hermes 只驱逐 conntrack 表项，**复用同一条连接**。
+
+Hermes 的做法是弱化版本：如果失败的真实原因在连接层（服务端侧状态已脏、token 已失效），
+只重建表项不重建连接会一直失败。选择保留是因为重建连接的代价高且暂无证据表明必要。
+**live 出现「重试也一直失败」时，这一条排在 [A1](#a1) 之后第二位。**
+
+---
+
+## C. 资源匹配
+
+### C1 — 资源表重叠时的优先级（**已知故意分歧**） <a id="c1"></a>
+
+zju-connect `processIPV4` 是**纯 first-match，按服务端原始顺序**，不排序。
+Hermes `ResourceIndex` 按「地址范围最窄 → 端口范围最窄 → 精确协议先于 `all` → 原始顺序」排序。
+
+**表存在重叠时两者选出不同的 `appId` / `nodeGroupId`。**
+
+**决定（2026-07-31，用户）：维持 Hermes 的 specificity 排序**，理由是「zju-connect 能用」
+不等于「zju-connect 正确」——也可能只是 ZJU 的表恰好不重叠。
+
+**代价已接受且症状具有欺骗性**：选错 `appId` 的表现是服务端拒绝或静默丢包，
+**长得和协议 bug 一模一样**。因此**任何 L3 live 失败都必须先排除这一条**。
+
+**判定实验：** [E2](#e2)（离线，不需要数据面，登录后立刻可做）。
+
+### C2 — ICMP 如何命中资源 <a id="c2"></a>
+
+**依据：L1**。zju-connect 判据是 `Protocol == "icmp" || == "all"` 且不比较端口。
+Hermes 已跟随（2026-07-31 之前只允许命中 `all`，会漏匹配）。西电的表是否真的出现
+`icmp` 协议值，未验证。
+
+### C3 — 域名通配符语义 <a id="c3"></a>
+
+**依据：L3**。现按 `*.example.edu` 覆盖任意子域**但不含 apex** 实现。服务端是否同此未知。
+
+### C4 — 端口 `0` 与倒置区间 <a id="c4"></a>
+
+**依据：L1**。zju-connect 除 `Atoi` 外不做任何校验，因此保留。Hermes 曾把它们整条丢弃，
+造成**静默丢失真实策略**（ICMP 资源的端口通常就是 `0`），2026-07-31 改为保留。
+
+**未决：** 保留之后这些条目的**匹配语义**仍未定义——端口 `0` 是「任意端口」还是「仅端口 0」？
+倒置区间（min > max）是空集还是应当交换？现实现按字面比较，即两者都近似于空集
+（ICMP 不比较端口所以不受影响）。
+
+---
+
+## D. 端点与网络路径
+
+### D1 — 数据面节点的真实地址 <a id="d1"></a>
+
+**2026-07-31 实测（L0），推翻了此前文档中「外网 :441 TCP 超时」的记录：**
+
+| 目标 | TCP | TLS | 结论 |
+|---|---|---|---|
+| `atrust.xidian.edu.cn` → `61.150.43.99:443` | ✅ | ✅ 有效证书 `*.xidian.edu.cn` | **控制面**，`authConfig` 正常 |
+| `61.150.43.99:441` | ✅ 接受 | ❌ 无 ServerHello（无论是否带 SNI） | 死端口 |
+| `61.150.43.94:443` | ✅ | ✅ `*.xidian.edu.cn` | 另一个 vhost，aTrust API 返回 **404**，非控制面 |
+| **`61.150.43.94:441`** | ✅ | **✅ 81 ms**，自签证书 `C=CN, ST=Hunan, O=Sangfor, OU=SSL, CN=sdp` | **真实数据面节点，公网当前可达** |
+
+`atrust.xidian.edu.cn` 只有一条 A 记录（`.99`），`.94` 不在 DNS 中，
+因此它必然来自 `clientResource` 的节点组或官方客户端下发。
+
+**未决：** `10.255.57.11` 是内网地址，外网不可达。**两个端点各自从哪里来、
+`clientResource` 里的原始形态是什么，尚未确认**（见 [E1](#e1)）。
+特别注意 Hermes 会把 `{{sdpcHost}}` 占位符替换为**控制面主机名**（`atrust.xidian.edu.cn`）。
+
+**端点选择已改为实测驱动（2026-07-31）：** 旧行为是 `primary_nodes()`——取第一组的第一个端点，
+**完全不做可达性检查**。这在西电这种「内网地址 + 公网地址同组」的配置下必然选错，
+且失败长得像协议超时。新实现 `atrust_auth::select_node`：并行探测每一个已广告端点，
+按「可达优先 → 握手时延升序」排序取第一名；探测失败的端点其 elapsed 是超时值，
+不代表时延，因此永不参与竞争。显式 `--node` 优先于时延，但**必须在广告列表内且必须应答**，
+否则报错而不是回退（见 [D3](#d3)）。
+
+### D2 — 数据面节点对 SNI 的行为（**新发现，影响实现**） <a id="d2"></a>
+
+**依据：L0，2026-07-31 实测，四组对照：**
+
+| ClientHello | 结果 |
+|---|---|
+| 不带 SNI | ✅ 握手成功（TLS 1.3 或 1.2 均可） |
+| `servername = atrust.xidian.edu.cn` | ❌ 服务端静默丢弃，无任何响应 |
+| `servername = sdp` | ❌ 同上 |
+| `servername = 61.150.43.94`（作为名字） | ❌ 同上 |
+
+**结论：任何 SNI 扩展都会让 `61.150.43.94:441` 静默不响应**，与名字内容无关，与 TLS 版本无关。
+
+**这解释了此前所有「441 不可达」的误判**——那些探测要么打在 `.99`，要么带了 SNI。
+
+**此前 Hermes 只是恰好正确：** `hermes-transport::connect_tls` 用
+`ServerName::try_from(host)`，rustls 对 **IP 字面量不发送 SNI**（RFC 6066），
+所以按 IP 指定节点能通；但只要节点地址是主机名（`{{sdpcHost}}` 占位符路径正是如此），
+rustls 就会发 SNI，连接静默挂死且无任何错误。
+
+**已修（2026-07-31）：** `client_config` 显式设 `enable_sni = false`，两种 `TlsPolicy` 都覆盖，
+由单测 `data_plane_tls_never_sends_sni` 守住。证书名校验不受影响——它用的是传给
+`connect` 的 `ServerName`，与该开关无关。控制面走 reqwest 独立配置，不受影响。
+
+**这条修复是端点延迟测量正确性的前提**：不修的话，任何主机名端点都会被测成 timeout，
+从而在排序里被判为不可达，而真实原因只是我们发了 SNI。
+
+### D3 — 显式 `--node` 的 fail-closed 语义 <a id="d3"></a>
+
+**这是一条实现决定，不是协议未决项**，记在这里是因为它会直接改变实验的可判读性。
+
+`select_node` 对显式端点有三种拒绝，都不回退：
+
+| 情况 | 行为 | 理由 |
+|---|---|---|
+| 不在广告列表 | `NotAdvertised` 报错，**且不发起任何探测** | fail-closed 的意义就是根本不去碰它。服务端没广告的地址要么是过期笔记要么是误导，向它发起连接就是把会话材料送去网关从未指过的地方 |
+| 在列表内但探测失败 | `RequestedUnreachable` 报错 | 静默换一个节点会让此后所有测量**不可归因**——你以为测的是 `.94`，实际测的是 `.11` |
+| 格式非法 | `MalformedAddress` 报错 | — |
+
+主机名比较**大小写不敏感但不做 DNS 解析**：一个解析到广告 IP 的名字仍然是另一个地址，
+把它当成同一个会重新引入 fail-closed 正要消除的那种模糊。
+
+**逃生舱：`--allow-unadvertised-node`。** 它把第一种情况降级为 WARN 并仍然探测。
+存在的理由很具体：广告列表本身正在被调查（[E1](#e1) 还没跑），而已知可用的
+`61.150.43.94:441` 可能根本不在列表里。**跑完 E1 之后就不应该再需要它**——
+如果还需要，那本身就是一条要记录的发现。
+
+---
+
+## E. 判定实验
+
+**[D1](#d1) 改变了整个测试计划的前提：数据面节点 `61.150.43.94:441` 当前公网可达，
+因此 E1–E5 全部不需要进校。** 唯一不能远程完成的是 CAS 交互登录里的人工环节
+（IDS 表单 + 滑块 + 短信），但那本来也不受地理位置限制。
+
+### 通用前置与纪律
+
+```bash
+cargo build -p atrust-probe          # 后续所有命令用 ./target/debug/atrust-probe
+chromedriver --port=9515 &           # 仅 E1 的 cas-login 需要
+```
+
+三条硬性纪律，违反其一实验结果就不可信或不安全：
+
+1. **节点地址写 IP。** SNI 本身已经在客户端侧关掉（[D2](#d2)），但 `atrust.xidian.edu.cn`
+   解析到的 `.99:441` 是死端口，所以 `--node atrust.xidian.edu.cn:441` 仍然打不通；
+2. **数据面必须 `--insecure-tls`。** 节点证书是自签的 `CN=sdp`，默认 `Verify` 策略必然失败。
+   注意这是全局开关，同时也放松了控制面校验；
+3. **`--session-file` 和 `--browser-trace-file` 内含实时凭据**（cookies、SID、SignKey、
+   登录 POST body），文件权限 0600。**不得贴进任何报告、issue 或聊天记录。**
+   诊断只贴 `--log-file` 的内容。
+
+### E1 — 节点组原始形态与两个端点的来源 <a id="e1"></a>
+
+**回答：** [D1](#d1)。`61.150.43.94` 与 `10.255.57.11` 在 `clientResource` 里各自长什么样，
+谁是 major，Hermes 默认会选中哪一个。
+
+```bash
+# 1) CAS 登录并落盘会话（人工完成 IDS + 滑块 + 短信，然后关闭浏览器窗口）
+./target/debug/atrust-probe --host atrust.xidian.edu.cn \
+  --log-file /tmp/e1-login.log \
+  cas-login --login-domain cas42187 \
+  --session-file ~/.hermes/xidian-session.json
+
+# 2) 保存资源体（服务端策略，不含凭据，可以离线反复分析）
+./target/debug/atrust-probe --host atrust.xidian.edu.cn \
+  client-resource --session-file ~/.hermes/xidian-session.json \
+  --save-body /tmp/xidian-resource.json
+
+# 3) 节点组原始形态
+jq '.data.appList.data.config.nodeGroupConf' /tmp/xidian-resource.json
+
+# 4) 实测排序：并行探测每个已广告端点，报告时延与最终选择
+./target/debug/atrust-probe --host atrust.xidian.edu.cn --insecure-tls \
+  --log-file /tmp/e1-nodes.log \
+  node-probe --session-file ~/.hermes/xidian-session.json --timeout-seconds 10
+
+grep -E "node_select.candidate|node_select.chosen" /tmp/e1-nodes.log
+```
+
+**要读出的四个事实：**
+
+- `majorNodeGroup.id` 是哪个组；
+- `nodeGroupList[].addressInfo[]` 里两个端点的 **原始 `address` 字符串**——
+  是 IP 字面量、主机名，还是 `{{sdpcHost}}` 占位符；
+- 两者的 **先后顺序**：`primary_nodes()` 取的是每组第一个，没有延迟评分。
+  若 `10.255.57.11` 排在前面，则**不带 `--node` 的所有命令都会连到不可达地址**；
+- 是否存在第三个此前没注意到的端点。
+
+**若 `.94` 根本不在 `clientResource` 里**，那它的来源就只能是官方客户端下发或历史配置，
+这本身是一条需要记录的新事实——意味着还有一条 Hermes 没走过的节点下发路径。
+**此时 E3–E5 的 `--node 61.150.43.94:441` 会被 fail-closed 拒绝**（[D3](#d3)），
+必须显式加 `--allow-unadvertised-node`，并把「用了逃生舱」记进实验记录。
+
+### E2 — 资源表重叠量化（[C1](#c1)） <a id="e2"></a>
+
+**纯离线，不碰网络，不需要会话。** 拿到 `/tmp/xidian-resource.json` 之后随时可做，
+而且**应当在任何数据面实验之前做完**——否则后面每一次失败都要重新怀疑这一条。
+
+```bash
+# 单个目的地：看排名第一的 appId，以及所有被压下去的候选
+./target/debug/atrust-probe --host atrust.xidian.edu.cn \
+  resource-match --resource-file /tmp/xidian-resource.json \
+  --target 202.117.112.1:80 --protocol tcp --show-all
+```
+
+`--show-all` 输出多于一条候选的目的地，就是 Hermes 的 specificity 排序与
+zju-connect 的 first-match **可能分歧**的点。要统计的量：
+
+- 有多少个目的地命中 **> 1** 条资源（重叠总数）；
+- 其中**第一名与「原始顺序第一条」不同**的有多少个（真正分歧数）。
+
+分歧数为 0 → [C1](#c1) 在西电这张表上不可达，后续 live 失败可以放心排除它。
+分歧数 > 0 → 记下具体目的地，E3/E5 的 `--target` **必须避开**它们，否则实验结果不可解释。
+
+### E3 — SignKey 是否真被校验（[B1](#b1)，**1 号闸门**） <a id="e3"></a>
+
+**为什么排第一：** 它的答案决定后面所有失败往哪个方向查。如果西电硬校验 SignKey，
+而 Hermes 用的是临时随机 key，那么 E4/E5 会全部失败，且症状会伪装成帧格式问题。
+
+**做法：同一会话跑两次，只差一个十六进制字符。**
+
+```bash
+# 用 E2 的结果挑一个「无重叠」的授权目的地和它的 appId
+TARGET=<ip>:80
+APPID=<E2 输出的 app_id>
+
+# A 组：正确的 SignKey
+./target/debug/atrust-probe --host atrust.xidian.edu.cn --insecure-tls \
+  --log-file /tmp/e3-good.log \
+  tcp-dial --session-file ~/.hermes/xidian-session.json \
+  --node 61.150.43.94:441 --target "$TARGET" --app-id "$APPID" --send-http
+
+# B 组：翻掉 sign_key_hex 的第一个字符
+jq '.sign_key_hex |= ((if .[0:1] == "0" then "1" else "0" end) + .[1:])' \
+  ~/.hermes/xidian-session.json > ~/.hermes/xidian-session-badsig.json
+chmod 600 ~/.hermes/xidian-session-badsig.json
+
+./target/debug/atrust-probe --host atrust.xidian.edu.cn --insecure-tls \
+  --log-file /tmp/e3-bad.log \
+  tcp-dial --session-file ~/.hermes/xidian-session-badsig.json \
+  --node 61.150.43.94:441 --target "$TARGET" --app-id "$APPID" --send-http
+```
+
+**判读表：**
+
+| A 组 | B 组 | 结论 |
+|---|---|---|
+| 成功 | 失败 | **SignKey 被硬校验。** Hermes 的临时随机 key 模型不成立，必须先解决 SignKey 来源才谈 L3 |
+| 成功 | 成功 | **未校验**（或首次写入即学习）。[B1](#b1) 降级为非阻塞项，可直接进 E4 |
+| 失败 | 失败 | **不可判读。** 失败在更早的环节（会话过期、appId 不对、目的地未授权），先修这个再重跑，**不要**据此下任何 SignKey 结论 |
+| 失败 | 成功 | 实验有误，检查是不是两次用错了文件 |
+
+**跑完立即删除** `xidian-session-badsig.json`。
+
+### E4 — VIP 帧真实布局（[A2](#a2)） <a id="e4"></a>
+
+一次 TLS 连接的代价，不启动 L3 会话、不动 TUN／DNS／路由。
+
+```bash
+./target/debug/atrust-probe --host atrust.xidian.edu.cn --insecure-tls \
+  --log-file /tmp/e4.log --browser-trace-file /tmp/e4-trace.jsonl \
+  get-ip --session-file ~/.hermes/xidian-session.json \
+  --node 61.150.43.94:441 --timeout-seconds 20
+
+jq 'select(.event=="get_ip_succeeded")' /tmp/e4-trace.jsonl
+```
+
+**要读出的：**
+
+- `address_type` —— 西电实际用 1 还是 5。若是 5，则 VIP 同时带 IPv6，
+  [A7](#a7) 的 second-VIP 问题可能因此有解；
+- `vip_data_hex` 的**字节数**：`addrType=1` 应为 **6**。若实际是 4 或 8，
+  [A2](#a2) 的长度表就是错的，且这条连接后续必然错位；
+- **IPv4 之后那 2 个字节的值** —— 这是 [A2](#a2) 唯一悬而未决的部分。
+  若形如 `18 00`（24 = 掩码位数）就基本可以定性了；
+- `status_bodies` —— `53 00` 消息的文本，[A5](#a5) 的唯一可观察样本。
+
+`/tmp/e4-trace.jsonl` 含凭据，读完即删。
+
+### E5 — `0x94` 真实分支、token 长度与端到端回环（[A1](#a1)） <a id="e5"></a>
+
+**只有 E3 判定为「未校验」或 SignKey 问题已解决后才做。**
+
+```bash
+HERMES_LOG=debug ./target/debug/atrust-probe \
+  --host atrust.xidian.edu.cn --insecure-tls \
+  --log-file /tmp/e5.log \
+  l3-session --session-file ~/.hermes/xidian-session.json \
+  --node 61.150.43.94:441 \
+  --target <E2 选定的目的地 IP>:0 \
+  --probe icmp-echo \
+  --connect-timeout-seconds 20 --reply-timeout-seconds 10
+```
+
+先跑 `--auth-only` 确认鉴权本身能过，再去掉它跑回环——把「鉴权失败」和「数据面失败」
+分成两次可判读的实验，而不是一次混在一起。
+
+**要 grep 的三行：**
+
+```bash
+grep -E "connect_token_len|connect_token_ambiguous" /tmp/e5.log   # A1 的前提是否成立
+grep "data_resp" /tmp/e5.log                                       # layout= 是哪一支
+grep "ignored_command" /tmp/e5.log                                 # A3/A4：出现未知命令就是新发现
+```
+
+**判读：**
+
+- `connect_token_len` **≥ 17** → [A1](#a1) 的第一条不变量在西电成立，判据安全；
+  **< 17** → 判据在西电**必然误判**，`0x94` 的双格式实现要立即重做（这正是新加的
+  `connect_token_ambiguous` 告警存在的理由）；
+- `layout=length_prefixed` 且 `bytes` 逼近 4096 → 第三条二义区间迫近，需要确认隧道 MTU；
+- 出现 `ignored_command` → 记录 `cmd` 值，这是 [A3](#a3)/[A4](#a4) 的第一手证据。
+
+### 实验索引
+
+| ID | 目标 | 依赖 | 需在校内 |
+|---|---|---|---|
+| [E1](#e1) | 节点组原始形态与两个端点来源（[D1](#d1)） | 人工 CAS 登录 | **否** |
+| [E2](#e2) | 资源表重叠量化（[C1](#c1)） | E1 的 `--save-body` | **否**（纯离线） |
+| [E3](#e3) | SignKey 是否真被校验（[B1](#b1)） | E1、E2 | **否** |
+| [E4](#e4) | VIP 帧真实布局（[A2](#a2)、[A5](#a5)） | E1 | **否** |
+| [E5](#e5) | `0x94` 分支与 token 长度（[A1](#a1)、[A3](#a3)、[A4](#a4)） | E3 判定通过 | **否** |
+
+**关于 `10.255.57.11`：它外网不可达是预期的，不构成阻塞。** 它是内网侧地址，
+真正的问题不是「能不能直连它」，而是「Hermes 会不会默认选中它」——由 [E1](#e1) 回答。
+只有当它被服务端标为 major 且排在前面时，才需要在配置层加显式的端点优选。
+它作为**隧道内目的地**的可达性是另一回事，属于 E5 之后的验证。
+
+---
+
+## 变更记录
+
+- **2026-07-31** 建档。收纳 A1–A7、B1–B5、C1–C4、D1–D3，实验 E1–E5。
+  D1/D2 为当日新实测结果，推翻了架构文档中「外网 `:441` 不可达」的旧记录。
+  同日为 [A1](#a1) 增加 `connect_token_len` / `data_resp layout` 两处埋点，
+  在此之前 E5 不具备可观测性。
+- **2026-07-31（同日，端点选择）** [D2](#d2) 的 SNI 抑制已实现（`enable_sni = false`）；
+  端点选择由「取第一个」改为并行探测 + 时延排序（`atrust_auth::select_node`），
+  显式 `--node` 按 [D3](#d3) fail-closed。
+- **2026-07-31（同日，E3–E5 live）** 重登 CAS 后：
+  - **E3：** good/bad SignKey 对 TCP 均握手成功 → [B1](#b1) 西电 TCP **不硬校验**；
+  - **E4：** `addrType=1`，`vip=10.210.29.200`，`vip_data_hex=0ad21dc80000`（6 字节，尾 `00 00`），
+    status `{"code":0,"data":{"deviceID":"644B123B"},"message":"OK"}` → [A2](#a2)/[A5](#a5) 首样本；
+  - **E5：** L3 `tcp-syn` 鉴权 `ready=true`，`connect_token_len=32`（≥17，[A1](#a1) 安全），
+    下行 `data_resp layout=length_prefixed` bytes=44，回环成功。
+  注意：`icmp-echo` 对仅 `tcp:80` 资源会 `auth status 0x82`；E2 的 C1 目标
+  `202.117.112.1:80` 在节点侧 TCP connect `0x03`（可达性/策略），换「新OA」后通。

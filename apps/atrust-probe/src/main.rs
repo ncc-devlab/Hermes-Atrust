@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use atrust_auth::{
     AuthClient, AuthConfigOptions, AuthConfiguration, FlowProtocol, LoginMethod,
-    PasswordCredentials, SessionMaterial, SessionProgress, StoredSession, extract_sid_from_cookies,
+    PasswordCredentials, SessionMaterial, SessionProgress, StoredSession, UnadvertisedNode,
+    extract_sid_from_cookies, select_node,
 };
 use atrust_browser::{BrowserKind, WebDriverBrowser, append_trace_event};
 use atrust_tcp::{DialTcpRequest, TunnelTarget, dial_tcp};
@@ -197,10 +198,18 @@ enum Command {
         /// Reuse a session saved by `cas-login --session-file` instead of logging in.
         #[arg(long)]
         session_file: Option<PathBuf>,
-        /// Data-plane node `host:port`. Overrides the address advertised in clientResource
-        /// (which is often a server-side loopback). Point this at the reachable node.
+        /// Data-plane node `host:port`. Must be one of the endpoints advertised in
+        /// clientResource unless `--allow-unadvertised-node` is set. Without it,
+        /// every advertised endpoint is probed and the lowest-latency one wins.
         #[arg(long)]
         node: Option<String>,
+        /// Permit a `--node` that the gateway never advertised.
+        ///
+        /// Selection is fail-closed by default: an address the server did not
+        /// offer is either a stale note or a misdirection. Use this only while
+        /// the advertised list is itself under investigation.
+        #[arg(long)]
+        allow_unadvertised_node: bool,
         /// Server-side destination the tunnel connects to, as `host:port`.
         #[arg(long)]
         target: String,
@@ -227,9 +236,17 @@ enum Command {
         /// Reuse a session saved by `cas-login --session-file`.
         #[arg(long)]
         session_file: Option<PathBuf>,
-        /// Data-plane node `host:port`. Falls back to the advertised primary.
+        /// Data-plane node `host:port`. Without it, every advertised endpoint is
+        /// probed and the lowest-latency one wins.
         #[arg(long)]
         node: Option<String>,
+        /// Permit a `--node` that the gateway never advertised.
+        ///
+        /// Selection is fail-closed by default: an address the server did not
+        /// offer is either a stale note or a misdirection. Use this only while
+        /// the advertised list is itself under investigation.
+        #[arg(long)]
+        allow_unadvertised_node: bool,
         #[arg(long, default_value_t = 15)]
         timeout_seconds: u64,
     },
@@ -246,9 +263,17 @@ enum Command {
         /// Reuse a session saved by `cas-login --session-file`.
         #[arg(long)]
         session_file: Option<PathBuf>,
-        /// Data-plane node `host:port`. Falls back to the advertised primary.
+        /// Data-plane node `host:port`. Without it, every advertised endpoint is
+        /// probed and the lowest-latency one wins.
         #[arg(long)]
         node: Option<String>,
+        /// Permit a `--node` that the gateway never advertised.
+        ///
+        /// Selection is fail-closed by default: an address the server did not
+        /// offer is either a stale note or a misdirection. Use this only while
+        /// the advertised list is itself under investigation.
+        #[arg(long)]
+        allow_unadvertised_node: bool,
         /// Destination `host:port` for the authorized flow. Must be an IPv4
         /// literal: L3 carries packets, and resolving a name here would invent a
         /// destination the resource table never authorized.
@@ -863,11 +888,31 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 cli.browser_trace_file.as_deref(),
             )
             .await?;
+            // Then rank them the way the data-plane commands will. Reported even
+            // when nothing is reachable, because "which endpoint would have been
+            // chosen, and what did the others cost" is the question E1 asks.
+            match select_node(
+                &candidates,
+                None,
+                UnadvertisedNode::Reject,
+                tls_policy,
+                connect_timeout,
+            )
+            .await
+            {
+                Ok(selection) => {
+                    report_node_selection(&selection, cli.browser_trace_file.as_deref())?;
+                }
+                Err(error) => {
+                    warn!(event = "probe.node_select.failed", error = %error);
+                }
+            }
         }
         Command::TcpDial {
             login_domain,
             session_file,
             node,
+            allow_unadvertised_node,
             target,
             app_id,
             send_http,
@@ -940,22 +985,24 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // 5. Resolve the node to dial: explicit override wins over advertised primary.
-            let (node_host, node_port) = if let Some(node) = node {
-                parse_host_port(&node)?
-            } else {
-                let primary = resources
-                    .as_ref()
-                    .and_then(|resources| resources.primary_nodes(&endpoint).into_iter().next());
-                match primary {
-                    Some((_, endpoint)) => (endpoint.host, endpoint.port),
-                    None => {
-                        return Err(
-                            "no --node override and no primary node could be resolved".into()
-                        );
-                    }
-                }
+            // 5. Resolve the node to dial. Every advertised endpoint is probed so
+            // the choice is measured rather than assumed; an explicit --node wins
+            // but must be advertised and must answer.
+            let Some(resources) = resources.as_ref() else {
+                return Err("clientResource failed, so no node could be selected".into());
             };
+            let (node_host, node_port) = select_data_node(
+                resources,
+                &endpoint,
+                NodeChoice {
+                    node: node.as_deref(),
+                    allow_unadvertised: allow_unadvertised_node,
+                    tls_policy,
+                    connect_timeout: Duration::from_secs(connect_timeout_seconds.max(1)),
+                    trace_file: cli.browser_trace_file.as_deref(),
+                },
+            )
+            .await?;
 
             // 6. Build the server-side destination frame target.
             let tunnel_target = build_tunnel_target(&target_host, target_port, &app_id);
@@ -1013,6 +1060,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             login_domain,
             session_file,
             node,
+            allow_unadvertised_node,
             timeout_seconds,
         } => {
             let session = match session_file.as_deref() {
@@ -1021,8 +1069,19 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     password_session(&client, transport.as_ref(), &endpoint, login_domain).await?
                 }
             };
-            let (node_host, node_port) =
-                resolve_data_node(&client, &session.configuration, &endpoint, node).await?;
+            let (node_host, node_port) = resolve_data_node(
+                &client,
+                &session.configuration,
+                &endpoint,
+                NodeChoice {
+                    node: node.as_deref(),
+                    allow_unadvertised: allow_unadvertised_node,
+                    tls_policy,
+                    connect_timeout: Duration::from_secs(timeout_seconds.max(1)),
+                    trace_file: cli.browser_trace_file.as_deref(),
+                },
+            )
+            .await?;
             info!(
                 event = "probe.get_ip.begin",
                 node_port,
@@ -1055,6 +1114,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             login_domain,
             session_file,
             node,
+            allow_unadvertised_node,
             target,
             app_id,
             src_port,
@@ -1120,8 +1180,19 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
             };
 
-            let (node_host, node_port) =
-                resolve_data_node(&client, &configuration, &endpoint, node).await?;
+            let (node_host, node_port) = resolve_data_node(
+                &client,
+                &configuration,
+                &endpoint,
+                NodeChoice {
+                    node: node.as_deref(),
+                    allow_unadvertised: allow_unadvertised_node,
+                    tls_policy,
+                    connect_timeout: Duration::from_secs(connect_timeout_seconds.max(1)),
+                    trace_file: cli.browser_trace_file.as_deref(),
+                },
+            )
+            .await?;
 
             // 4. Establish the session: Get-IP on a connection that stays open.
             info!(
@@ -1241,17 +1312,97 @@ async fn resolve_data_node(
     client: &AuthClient,
     configuration: &AuthConfiguration,
     endpoint: &GatewayEndpoint,
-    node: Option<String>,
+    request: NodeChoice<'_>,
 ) -> Result<(String, u16), Box<dyn std::error::Error>> {
-    if let Some(node) = node {
-        return parse_host_port(&node);
-    }
     let resources = client.client_resource(configuration).await?;
-    let primary = resources.primary_nodes(endpoint).into_iter().next();
-    match primary {
-        Some((_, endpoint)) => Ok((endpoint.host, endpoint.port)),
-        None => Err("no --node override and no primary node could be resolved".into()),
+    select_data_node(&resources, endpoint, request).await
+}
+
+/// What the caller asked for, and what it costs to probe.
+#[derive(Clone, Copy)]
+struct NodeChoice<'a> {
+    node: Option<&'a str>,
+    allow_unadvertised: bool,
+    tls_policy: TlsPolicy,
+    connect_timeout: Duration,
+    trace_file: Option<&'a Path>,
+}
+
+/// Probes every advertised endpoint and returns the one to dial.
+///
+/// Selection never silently substitutes: an explicit `--node` that is absent
+/// from the advertised list, or present but unreachable, is an error. A quiet
+/// fallback would make every later measurement unattributable — the operator
+/// would believe they tested one node while having tested another.
+async fn select_data_node(
+    resources: &atrust_auth::ClientResources,
+    endpoint: &GatewayEndpoint,
+    request: NodeChoice<'_>,
+) -> Result<(String, u16), Box<dyn std::error::Error>> {
+    let candidates = resources.all_nodes(endpoint);
+    let unadvertised = if request.allow_unadvertised {
+        UnadvertisedNode::Allow
+    } else {
+        UnadvertisedNode::Reject
+    };
+    let selection = select_node(
+        &candidates,
+        request.node,
+        unadvertised,
+        request.tls_policy,
+        request.connect_timeout,
+    )
+    .await?;
+    report_node_selection(&selection, request.trace_file)?;
+    Ok(selection.host_port())
+}
+
+/// Logs the full latency ranking, not just the winner: the alternatives are the
+/// evidence for why this endpoint was picked.
+fn report_node_selection(
+    selection: &atrust_auth::NodeSelection,
+    trace_file: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (rank, measurement) in selection.ranked.iter().enumerate() {
+        info!(
+            event = "probe.node_select.candidate",
+            rank,
+            group_id = %measurement.group_id,
+            address = %measurement.address(),
+            from_sdpc_placeholder = measurement.endpoint.from_sdpc_placeholder,
+            outcome = %measurement.outcome,
+            reachable = measurement.reachable(),
+            elapsed_ms = u64::try_from(measurement.elapsed.as_millis()).unwrap_or(u64::MAX)
+        );
     }
+    info!(
+        event = "probe.node_select.chosen",
+        address = %selection.chosen.address(),
+        group_id = %selection.chosen.group_id,
+        source = selection.source.as_str(),
+        elapsed_ms = u64::try_from(selection.chosen.elapsed.as_millis()).unwrap_or(u64::MAX),
+        candidates = selection.ranked.len()
+    );
+    append_probe_trace(
+        trace_file,
+        "node_selected",
+        json!({
+            "chosen": selection.chosen.address(),
+            "source": selection.source.as_str(),
+            "candidates": selection
+                .ranked
+                .iter()
+                .map(|measurement| json!({
+                    "group_id": measurement.group_id,
+                    "address": measurement.address(),
+                    "outcome": measurement.outcome.to_string(),
+                    "reachable": measurement.reachable(),
+                    "elapsed_ms": u64::try_from(measurement.elapsed.as_millis()).unwrap_or(u64::MAX),
+                }))
+                .collect::<Vec<_>>(),
+        }),
+    )?;
+    Ok(())
 }
 
 /// Logs and traces a Get-IP outcome.

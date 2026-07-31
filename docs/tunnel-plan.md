@@ -49,8 +49,11 @@
 3. 记录：成功/超时/证书错误；**不**发送 `05 01 81...`（`probe_nodes_tls` 共享实现）
 4. 后续再加 3 次短 TCP 时延选优（对齐 Go `pingNum=3`）
 
-**状态（2026-07-28）：** 已接线，外网跑出 `:441` TCP 超时（网络层不可达）。代码正确，
-待校内网络位置复跑取 `Ok`。
+**状态（2026-07-31 更正）：** 已接线并 live。此前记的「外网 `:441` 网络层不可达」是误判——
+探测打在了 DNS 解析出的 `61.150.43.99`（该 IP 的 `:441` 确实是死端口），且带了 SNI。
+真实节点 `61.150.43.94:441` 外网可达，`node-probe --address 61.150.43.94:441 --insecure-tls`
+取 `outcome=ok`，**81 ms**。**任何 SNI 都会让该节点静默不响应**（rustls 对 IP 字面量不发 SNI，
+所以按 IP 指定才通）。详见 [`open-questions.md`](open-questions.md) D1/D2。
 
 ### Phase C — 最小 TCP 隧道（单一受控目标）
 
@@ -104,18 +107,17 @@ EasyConnect 不在本规划内。
 
 **必须先在西电真机确认**（否则 L3 代码形状会猜错）：
 
-1. **SignKey 是否真被校验 —— 1 号闸门。** 目前 `sign_key_provisional=true`，唯一通过的
-   握手来自参考服务端 `sign_key_hex=None → UnboundAccepted`。§3.3 的 `0x13` 逐流鉴权
-   同样以 HMAC-SHA256 覆盖整段 JSON 字节串，若西电真校验，第一个五元组即失败。
-   最便宜的判定：西电 `tcp-dial` 各跑一次正常 key 与改 1 bit 的 key——都通过=不校验；
-   都拒=key 另有来源；一通一拒=必须先解决绑定。
-2. **西电原生 `tcp-dial` live**（Phase C 只对公网参考服务端通过）。带两个未知进 L3
-   无法二分定位。会话持久化落地后此条已无阻塞。
-3. **Get-IP 西电 live 复跑**。~~并保留 `53 00` 响应 JSON~~ **已落地（2026-07-31）：**
-   `GetIpv4Response { address, status_bodies }` 保留全部 `53 00` body 并写 trace
-   （`get_ip_succeeded.status_bodies`），VIP / 掩码 / second VIP 线索不再被丢弃。
-   复跑不再需要重走浏览器登录：`atrust-probe get-ip --session-file <file> --node <host:port>`。
-4. **`0x94` 下行双格式**：已落地为 body 首 `u16-be n`，`0 < n ≤ 4096` 为长度前缀、否则 token 帧（见 `atrust-protocol::l3_frame`）。
+1. ~~**SignKey 是否真被校验 —— 1 号闸门**~~ **L0 已决（2026-07-31 E3）：**
+   西电 TCP init **不硬校验** HMAC（good/bad key 均握手成功）；L3 `0x13` 用同一
+   provisional key 的 flow auth 也成功。B1 降级为非阻塞（绑定语义仍可研究）。
+2. ~~**西电原生 `tcp-dial` live**~~ **已通（2026-07-31）：**
+   例如 `202.117.115.138:80`（新OA）、`140.210.72.240:80`；部分目标在节点侧
+   `ConnectRejected 0x03`（目的不可达/策略），与 SignKey 无关。
+3. ~~**Get-IP 西电 live**~~ **已通（2026-07-31 E4）：**
+   `addrType=1`，`vip=10.210.29.200`，`vip_data=0ad21dc80000`（尾 `00 00`），
+   status OK+deviceID。`get-ip --session-file` 可复跑。
+4. ~~**`0x94` 双格式 + 回环**~~ **codec 已落地；西电 E5 已通（2026-07-31）：**
+   `connect_token_len=32`，下行 `layout=length_prefixed`，TCP SYN 回包 44B。
 5. **`tcp:` vs `tcp://`**：TCP init 用 `tcp://`（`tcp_init.rs`），§3.3 的 L3 鉴权写
    `tcp:10.0.0.1:443`。~~L3 独立 wire DTO~~（`build_signed_l3_auth_json`）；真机 `url` 形态仍待抓包。
 
@@ -230,9 +232,9 @@ atrust-probe         人工诊断子命令：auth / cas-login / client-resource 
 4. ~~TCP init / target / app 帧 codec（`atrust-protocol`）。~~
 5. ~~TCP 握手状态机 + 应用帧 I/O（`atrust-tcp`，mock duplex 单测）。~~
 6. ~~西电 `node-probe --primary` live（TLS only，不发 init）。~~
-   **已接线并 live（2026-07-28，外网）：** `cas-login --probe-nodes` 同进程收割后
-   探测 primary 节点；`:441` **TCP connect 超时**（外网网络层不可达，非 TLS/证书）。
-   `node-probe --address` 独立路径同样因外网超时。**待校内复跑**取 `outcome=Ok` 与时延基线。
+   **已接线并 live（2026-07-28）；2026-07-31 更正结论：** 当时记的「`:441` TCP connect 超时、
+   外网不可达」是打错了 IP 并带了 SNI。`node-probe --address 61.150.43.94:441 --insecure-tls`
+   取 `outcome=ok`，**81 ms**，外网可达。见 [`open-questions.md`](open-questions.md) D1/D2。
 7. Cookie SID ↔ init JSON SID 抓包对照；SignKey 服务端策略确认。
    **参考服务端已确认（2026-07-29）：** SID 即 psw 响应 `Set-Cookie: sid=`，`session_cookie_value`
    从 jar 导出后原样进 init JSON；服务端 `sign_key_hex=None` → UnboundAccepted 放行。西电真机仍待抓包。

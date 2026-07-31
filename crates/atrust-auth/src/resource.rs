@@ -204,7 +204,7 @@ fn resolve_node_address(
     })
 }
 
-fn split_host_port(value: &str, default_port: u16) -> Option<(String, u16)> {
+pub(crate) fn split_host_port(value: &str, default_port: u16) -> Option<(String, u16)> {
     let value = value.trim();
     if value.is_empty() {
         return None;

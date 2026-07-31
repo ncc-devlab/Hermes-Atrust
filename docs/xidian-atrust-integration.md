@@ -203,16 +203,18 @@ cargo run -p atrust-probe -- \
 | Cookie → LoggedIn + onlineInfo | 完成 | 2026-07-27 |
 | SessionMaterial 导出 | 完成（SignKey provisional） | 2026-07-27 `probe.session_material` |
 | clientResource + 节点解析 | 完成 | 2026-07-27：1361/523/1 组 2 节点，~1.3MB/12.5s |
-| node-probe TLS 冒烟 | **已接线并 live 跑过（外网）** | 2026-07-28：`cas-login --probe-nodes` 同进程触发；primary 节点 `:441` **TCP connect 超时**（外网网络层不可达，非 TLS/证书失败）；待校内复跑 |
-| TCP Dial / init | codec、拨号状态机和参考对端 live 已完成；Xidian 待校内验证 | Phase C |
-| L3 / TUN / DNS 路由 | 未做 | Phase D |
+| node-probe TLS 冒烟 | **外网已通** | 2026-07-31：`61.150.43.94:441` OK；`10.255.57.11:441` 外网超时（预期） |
+| TCP Dial / init | **西电 live 已通** | 2026-07-31 E3：SignKey 不硬校验；多目标 handshake_ok |
+| Get-IP | **西电 live 已通** | 2026-07-31 E4：VIP `10.210.29.200`，addrType=1，6 字节 body |
+| L3 session（无 TUN） | **西电 live 已通** | 2026-07-31 E5：flow auth + TCP SYN 回环；token_len=32 |
+| L3 / TUN / DNS 路由 | 未做 | Phase D 余下 |
 
 ## 尚未闭环
 
 1. ~~`clientResource` 客户端请求与严格解析 + 西电实测计数~~
-2. SID / DeviceID / ConnectionID / SignKey 的**服务端绑定确认**
-   （Cookie SID 与隧道 init JSON 是否同一值仍待抓包；SignKey 仍 provisional）；
-3. 节点 TLS 可达性 live、TCP/L3 隧道、代理与 TUN；
+2. SID / DeviceID / ConnectionID / SignKey 的**服务端绑定语义**
+   （E3：西电 TCP/L3 不硬校验 provisional SignKey；Cookie SID 与 init JSON 是否同一值仍待抓包）；
+3. ~~节点 TLS / TCP / L3 无 TUN 回环~~ **已 live**；余下代理与 TUN/DNS/路由；
 4. 将 SMS/MFA 建模为可恢复的 `SessionProgress::InteractionRequired` 产品状态机
    （当前 Xidian 路径把 MFA 全部留在浏览器内完成）；
 5. golden fixture 与更多 ignored live tests；

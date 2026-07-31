@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 base64.workspace = true
+futures-util.workspace = true
 hermes-model = { path = "../hermes-model" }
 hermes-transport = { path = "../hermes-transport" }
 hex.workspace = true
@@ -21,7 +22,7 @@ url.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

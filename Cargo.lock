@@ -85,6 +85,7 @@ dependencies = [
  "async-trait",
  "atrust-protocol",
  "base64",
+ "futures-util",
  "hermes-model",
  "hermes-transport",
  "hex",

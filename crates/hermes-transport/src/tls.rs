@@ -153,7 +153,7 @@ async fn resolve_first(host: &str, port: u16) -> Result<SocketAddr, std::io::Err
 }
 
 fn client_config(policy: TlsPolicy) -> ClientConfig {
-    match policy {
+    let mut config = match policy {
         TlsPolicy::Verify => {
             let mut roots = rustls::RootCertStore::empty();
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -165,7 +165,17 @@ fn client_config(policy: TlsPolicy) -> ClientConfig {
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
             .with_no_client_auth(),
-    }
+    };
+    // Data-plane nodes are SDP gateways, not name-based virtual hosts: the real
+    // Xidian node (`61.150.43.94:441`) silently discards any ClientHello that
+    // carries an SNI extension, regardless of the name inside it. Relying on
+    // "the address happens to be an IP literal" for that — rustls omits SNI only
+    // for `ServerName::IpAddress` — leaves a hostname endpoint (including every
+    // `{{sdpcHost}}` substitution) hanging with no error and no diagnosis.
+    // Certificate name verification is unaffected; it uses the `ServerName`
+    // passed to `connect`, not this flag.
+    config.enable_sni = false;
+    config
 }
 
 #[derive(Debug)]
@@ -229,6 +239,16 @@ impl fmt::Display for NodeTlsProbeOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression guard for a silent-hang class of failure: the Xidian data-plane
+    /// node discards any ClientHello carrying SNI, and the symptom is no response
+    /// at all rather than an error. Both policies must suppress it — the probe
+    /// path runs under `Verify`, the dial path usually under the dangerous one.
+    #[test]
+    fn data_plane_tls_never_sends_sni() {
+        assert!(!client_config(TlsPolicy::Verify).enable_sni);
+        assert!(!client_config(TlsPolicy::DangerousAcceptInvalidCertificates).enable_sni);
+    }
 
     #[tokio::test]
     async fn localhost_closed_port_is_tcp_failure_or_timeout() {
