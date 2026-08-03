@@ -29,7 +29,7 @@ pub use resource::{
     ClientResources, DEFAULT_NODE_PORT, DnsServers, DomainResource, IpResource, NodeAddress,
     NodeGroup, ResolvedNodeEndpoint, ResolvedNodeGroup, ResourceError, ResourceProtocol,
 };
-pub use routing::{Destination, DomainFlow, FlowKey, FlowProtocol, ResourceIndex};
+pub use routing::{Destination, DomainFlow, FlowKey, FlowProtocol, MatchedResource, ResourceIndex};
 pub use session::{AuthStep, SessionProgress};
 pub use store::{
     LoginMethod, SESSION_STORE_VERSION, SessionStoreError, StoredCookie, StoredSession,

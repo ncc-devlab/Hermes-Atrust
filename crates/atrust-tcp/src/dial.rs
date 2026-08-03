@@ -11,13 +11,21 @@ use hermes_transport::{TlsConnectError, TlsPolicy, connect_tls};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::time::timeout;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::stream::TcpTunnel;
 use crate::target::TunnelTarget;
 
 /// Session + node parameters for one TCP tunnel dial.
-#[derive(Debug)]
+/// Default budget for TCP/TLS establishment and for the aTrust handshake.
+pub const TCP_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// zju-connect may repeat one failed underlay dial after refreshing the network
+/// interface. Hermes has no interface owner, but makes the same single retry for
+/// transient failures before any application bytes can have been sent.
+pub const TCP_DIAL_RETRIES: usize = 1;
+
+#[derive(Clone, Debug)]
 pub struct DialTcpRequest<'a> {
     pub node_host: &'a str,
     pub node_port: u16,
@@ -75,6 +83,33 @@ pub async fn dial_tcp(request: DialTcpRequest<'_>) -> Result<TcpTunnel, DialTcpE
     );
 
     Ok(TcpTunnel::from_stream(stream))
+}
+
+/// Dials a TCP tunnel and retries transient establishment failures.
+///
+/// This never retries a server rejection or malformed protocol response, and it
+/// stops once a [`TcpTunnel`] is returned. Replaying application bytes after a
+/// later disconnect would be unsafe for non-idempotent protocols.
+pub async fn dial_tcp_with_retry(
+    request: DialTcpRequest<'_>,
+    max_retries: usize,
+) -> Result<TcpTunnel, DialTcpError> {
+    let mut retries = 0_usize;
+    loop {
+        match dial_tcp(request.clone()).await {
+            Ok(tunnel) => return Ok(tunnel),
+            Err(error) if retries < max_retries && error.is_retryable() => {
+                retries += 1;
+                warn!(
+                    event = "atrust_tcp.dial.retry",
+                    attempt = retries + 1,
+                    max_attempts = max_retries + 1,
+                    error = %error
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Runs the aTrust TCP handshake on an already-connected stream (tests / injection).
@@ -250,6 +285,35 @@ pub enum DialTcpError {
     ConnectRejected { status: u8 },
 }
 
+impl DialTcpError {
+    /// Whether a fresh connection can safely retry this failure before the
+    /// caller has received a tunnel and sent application data.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::ConnectTimeout | Self::HandshakeTimeout => true,
+            Self::Tls(error) => !matches!(error, TlsConnectError::InvalidServerName),
+            Self::Io(error) => matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::UnexpectedEof
+            ),
+            Self::EmptyNodeHost
+            | Self::InvalidNodePort
+            | Self::EmptyAppId
+            | Self::InvalidTargetPort
+            | Self::InitJson(_)
+            | Self::Frame(_)
+            | Self::UnexpectedStatusHeader { .. }
+            | Self::AddressRejected { .. }
+            | Self::ConnectRejected { .. } => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,6 +333,19 @@ mod tests {
             frame,
             encode_tcp_target_ipv4(Ipv4Addr::new(10, 0, 0, 1), 443)
         );
+    }
+
+    #[test]
+    fn retry_policy_only_accepts_transient_establishment_failures() {
+        assert!(DialTcpError::ConnectTimeout.is_retryable());
+        assert!(DialTcpError::HandshakeTimeout.is_retryable());
+        assert!(
+            DialTcpError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+                .is_retryable()
+        );
+        assert!(!DialTcpError::InvalidTargetPort.is_retryable());
+        assert!(!DialTcpError::ConnectRejected { status: 2 }.is_retryable());
+        assert!(!DialTcpError::UnexpectedStatusHeader { bytes: vec![5, 9] }.is_retryable());
     }
 
     #[test]

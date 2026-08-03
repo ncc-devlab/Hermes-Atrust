@@ -225,16 +225,11 @@ flow key 里是 `4`。两者都是经验值。
 **依据：L1**。两个常量都来自 zju-connect 源码，**服务端从未声明**。西电的实际容忍窗口未知。
 心跳过慢会被服务端静默断开，过快在大规模部署下可能触发限流。
 
-### B5 — 鉴权失败后的重试语义分歧 <a id="b5"></a>
+### B5 — 鉴权失败后的重试语义（已对齐） <a id="b5"></a>
 
-**已知分歧，已记录未修。**
-
-zju-connect 的「重试一次」是**整条连接作废**：新建 TLS + 全新 conntrack。
-Hermes 只驱逐 conntrack 表项，**复用同一条连接**。
-
-Hermes 的做法是弱化版本：如果失败的真实原因在连接层（服务端侧状态已脏、token 已失效），
-只重建表项不重建连接会一直失败。选择保留是因为重建连接的代价高且暂无证据表明必要。
-**live 出现「重试也一直失败」时，这一条排在 [A1](#a1) 之后第二位。**
+`L3SessionManager` 现在拥有节点组的一条可重建会话：连接关闭时最多重连 5 次；8 秒 flow-auth
+超时会作废整条连接、重新 Get-IP 和鉴权一次。显式策略拒绝、坏帧和配置错误不重试。
+这与 zju-connect 的边界一致，同时保持 TUN、DNS 和系统路由在管理器之外。
 
 ---
 
@@ -253,8 +248,10 @@ first-match；TCP tunnel 的 IP 匹配循环不 `break`，后命中的 `appId` /
 **决定（2026-07-31，用户）：维持 Hermes 的 specificity 排序**，理由是「zju-connect 能用」
 不等于「zju-connect 正确」——也可能只是 ZJU 的表恰好不重叠。
 
-**代价已接受且症状具有欺骗性**：选错 `appId` 的表现是服务端拒绝或静默丢包，
-**长得和协议 bug 一模一样**。因此**任何 L3 live 失败都必须先排除这一条**。
+**E9 已确认西电网关接受任一覆盖目标的合法候选，而不是只接受唯一的首条或最具体项。**
+因此 specificity 与 zju-connect L3 first-match 在当前西电资源表上都能通过授权；但完全无关的
+`appId` 会被拒绝，所以 matcher 仍必须筛掉不覆盖目标、端口或协议的资源。该结论不能自动外推
+到其他网关，`nodeGroupId` 不同的重叠项也仍需作为一个整体选择。
 
 #### L0 量化结果（2026-07-31，E2，西电 1361 条 IP 资源）
 
@@ -276,13 +273,10 @@ first-match；TCP tunnel 的 IP 匹配循环不 `break`，后命中的 `appId` /
 202.117.112.9:53    zju→27bf5f60 (202.117.112.1-.254)       hermes→2b306a40 (202.117.112.9-.14)
 ```
 
-**关键的负面结论：迄今为止的 live 测试对这一条没有提供任何证据。**
-E3 / E5 用过的三个目的地——`202.117.112.1:80`（6 个候选）、`202.117.115.138:80`（3 个）、
-`140.210.72.240:80`（1 个）——**两种排序恰好都选同一个 `appId`**。
-所以「E5 通了」不能读作「Hermes 的排序对」。
-
-**判定实验：** [E2](#e2) 已跑（上表）；**[E9](#e9) 是决定性的下一步**——
-对一个已知分歧的目的地，用两个候选 `appId` 各拨一次，让服务端自己表态。
+**判定实验：** [E9](#e9) 已完成。对 `202.117.112.71:8081`，Hermes specificity 候选
+`316772f0...` 与原始首条 `27bf5f60...` 在 TCP 和 L3 两条路径都通过了 app 授权；无关候选
+`66238e10...` 分别收到 TCP `0x02` 和 L3 `0x82`。这排除了“服务端只承认一种排序”的模型，
+支持“任一匹配资源都可授权”的模型。
 
 ### C2 — ICMP 如何命中资源 <a id="c2"></a>
 
@@ -470,7 +464,7 @@ grep -E "node_select.candidate|node_select.chosen" /tmp/e1-nodes.log
 ```
 
 `--show-all` 输出多于一条候选的目的地，就是 Hermes 的 specificity 排序与
-zju-connect L3 的 first-match **可能分歧**的点。要统计的量：
+zju-connect 的 first-match **可能分歧**的点。要统计的量：
 
 - 有多少个目的地命中 **> 1** 条资源（重叠总数）；
 - 其中**第一名与「原始顺序第一条」不同**的有多少个（真正分歧数）。
@@ -579,52 +573,48 @@ grep "ignored_command" /tmp/e5.log                                 # A3/A4：出
 
 ### E9 — 服务端对 `appId` 的裁决（[C1](#c1) 的决定性实验） <a id="e9"></a>
 
-E2 证明 specificity 与原始首条的分歧覆盖 60% 的 TCP 采样点，但**没有任何 live 证据
-说明服务端如何裁决**。同一个已知重叠的目的地至少要测四类 `appId`：specificity、
-原始首条、原始末条和完全无关的负对照。TCP 与 L3 必须分别测，不能把一条数据路径的
-结果外推给另一条。
+E2 证明 specificity 与原始首条的分歧覆盖 60% 的 TCP 采样点。2026-08-03 分别在
+TCP tunnel 和 L3 flow auth 上测试同一已知分歧目标的 specificity、原始首条与无关负对照。
 
-`tcp-dial --app-id` 本来就是显式传参、不受匹配器影响（匹配器只在不一致时打 WARN），
-所以这个实验不需要改代码。
+以下命令是自动匹配改造前的历史实验记录。当时 `--app-id` 可覆盖 matcher；当前参数仅作为
+自动匹配结果的断言，不一致会 fail-closed，因此不能再用它注入负对照。
 
 ```bash
-# 从 E2 的分歧清单里挑一个有真实监听的目的地
+# 从 E2 的分歧清单选择一个目标；实测时该端口已不再可连接
 TARGET=202.117.112.71:8081
 
-# A：Hermes specificity；这个样本也恰好是原始末条
+# A：Hermes 的选择（最窄条目）
 ./target/debug/atrust-probe --host atrust.xidian.edu.cn --insecure-tls \
-  --log-file /tmp/e9-specific.log \
+  --log-file /tmp/e9-specific-debug.log \
   tcp-dial --session-file ~/.hermes/xidian-session.json \
   --node 61.150.43.94:441 --target "$TARGET" \
-  --app-id 316772f0-c9a7-11f0-8b22-4f20181761d8 --send-http
+  --app-id 316772f0-c9a7-11f0-8b22-4f20181761d8 \
+  --handshake-timeout-seconds 20
 
-# B：原始顺序首条（zju-connect L3 的选择）
+# B：原始顺序第一条（zju-connect L3 的选择）
 ./target/debug/atrust-probe --host atrust.xidian.edu.cn --insecure-tls \
-  --log-file /tmp/e9-first.log \
+  --log-file /tmp/e9-first-debug.log \
   tcp-dial --session-file ~/.hermes/xidian-session.json \
   --node 61.150.43.94:441 --target "$TARGET" \
-  --app-id 27bf5f60-c9a7-11f0-8b22-4f20181761d8 --send-http
-
-# C：原始顺序末条（zju-connect TCP 的选择）。本样本与 A 相同，无需重复；
-# 若换目标后 C != A，必须单独拨一次。
-
-# D：从资源表取一个完全不覆盖 TARGET 的 appId，作为负对照。
-# 实验前离线确认它不在 --show-all 候选中，再使用同一条 tcp-dial 命令拨号。
+  --app-id 27bf5f60-c9a7-11f0-8b22-4f20181761d8 \
+  --handshake-timeout-seconds 20
 ```
 
-**判读：**
+**实测结果（L0，2026-08-03）：**
 
-| 结果 | 结论 |
-|---|---|
-| 只有 A 成功 | 当前路径支持 specificity |
-| 只有 B 成功 | 当前路径支持原始首条 |
-| 只有 C 成功 | 当前路径支持原始末条 |
-| A/B/C 成功、D 失败 | 服务端可能接受任一匹配资源，而不强制唯一优先级 |
-| D 也成功 | 当前路径没有硬性校验 `appId`；它仍可能影响审计/记账，不能称为纯观测差异 |
-| A/B/C/D 都失败 | 不可判读：目标、会话、节点或更早握手阶段有问题，换目标或修复前置条件 |
+| 路径 | specificity `316772f0...` | 原始首条 `27bf5f60...` | 无关 `66238e10...` |
+|---|---|---|---|
+| TCP tunnel | 地址阶段通过，约 15 秒后目标连接 `0x03` | 地址阶段通过，约 15 秒后目标连接 `0x03` | 约 0.1 秒立即 `0x02` |
+| L3 `tcp-syn --auth-only` | 返回 connect token | 返回 connect token | `auth status 0x82` |
 
-每组必须分开记录 init/auth 是否成功与目标服务连接是否成功；后者失败不能反推
-`appId` 被拒绝。至少交错重复一轮，并在另一个重叠且真实监听的目标上复验。
+TCP 的 `0x03` 出现在合法候选通过地址响应后、节点尝试连接目标约 15 秒之后；无关 appId 的
+`0x02` 则立即返回，因此不能把两个合法候选的 `0x03` 读成 app 授权失败。默认 8 秒 handshake
+timeout 会在 `0x03` 到达前先报超时，E9 必须使用至少 20 秒。两条路径共同证明：
+
+1. 网关确实按目标、协议、端口与 `appId` 的关系做授权，无关 appId 会被拒绝；
+2. 重叠时不强制唯一的 first-match 或 specificity，两个覆盖目标的候选都有效；
+3. Hermes 可继续使用确定性的 specificity，不必为了西电兼容性改成 first-match；
+4. 该样本所有候选同属一个 node group，尚未验证跨 node-group 重叠时的行为。
 
 ### 实验索引
 
@@ -635,7 +625,7 @@ TARGET=202.117.112.71:8081
 | [E3](#e3) | SignKey 是否真被校验（[B1](#b1)） | E1、E2 | **否** |
 | [E4](#e4) | VIP 帧真实布局（[A2](#a2)、[A5](#a5)） | E1 | **否** |
 | [E5](#e5) | `0x94` 分支与 token 长度（[A1](#a1)、[A3](#a3)、[A4](#a4)） | E3 判定通过 | **否** |
-| **[E9](#e9)** | **服务端是否按 `appId` 裁决（[C1](#c1)）** | E2 的分歧清单 | **否** |
+| **[E9](#e9)** | **服务端是否按 `appId` 裁决（[C1](#c1)，已完成）** | E2 的分歧清单 | **否** |
 
 **接 TUN 前还欠的三关**（尚未展开成实验条目）：
 
@@ -679,3 +669,8 @@ TARGET=202.117.112.71:8081
   - **[C2](#c2)：** `0x82` 确认服务端在 flow auth 阶段比较协议；
   - **代码：** 读循环改为满队列丢包（`try_send` + `dropped_packets` 计数），
     不再让慢消费者拖住 `0x93` 分发。
+- **2026-08-03（E9 live）：** `202.117.112.71:8081` 的 specificity 与原始首条 appId 在
+  TCP 地址阶段均通过、随后都因目标不可连接返回 `0x03`，L3 flow auth 均返回 connect token；
+  无关 appId 在 TCP/L3 分别被 `0x02`/`0x82` 拒绝。西电网关验证 appId 是否属于匹配资源，
+  但不强制重叠候选的唯一排序；Hermes 保持 specificity。TCP 默认 8 秒握手超时不足以等到
+  本次约 15 秒后的 `0x03`，实验使用 20 秒。

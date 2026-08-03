@@ -128,18 +128,18 @@ EasyConnect 不在本规划内。
    `nodeGroupId`，未命中返回 `None`（即不得进 VPN）；域名目标走域名表且**不**本地先解析，
    避免丢失域名资源语义（§6.4）。重叠表按「地址范围最窄 → 端口最窄 → 精确协议先于 `all`
    → 服务端原始顺序」定序，`match_ip_all` / `match_domain_all` 暴露全部候选供抓包对照
-   （服务端真实优先级仍未确认，见架构文档未决项 7）。17 个单测含一条从真实 JSON body
+    （E9 已确认西电接受任一合法重叠候选）。单测含一条从真实 JSON body
    解析到匹配的端到端用例。诊断入口：
    `atrust-probe resource-match --resource-file <body.json> --target <host:port> [--protocol udp|icmp] [--show-all]`，
-   配合 `client-resource --save-body` 可完全离线迭代。`tcp-dial` 会在拨号前记录匹配结果，
-   并在与 `--app-id` 不一致时打 WARN（仅观测，不改变拨号行为）。
+    配合 `client-resource --save-body` 可完全离线迭代。TCP/L3 强制使用同一匹配项的
+    `appId + nodeGroupId`，只选择该组节点；未匹配或 `--app-id` 断言不一致时 fail-closed。
 2. ~~会话持久化~~（已完成，见执行清单第 8 项）。
 3. ~~L3 帧 codec~~：`encode_l3_data_req` / `encode_l3_auth_req` / `encode_l3_heartbeat_req` /
    `0x94` 双格式解码 / `05 95` 头判定（`atrust-protocol::l3_frame`）。property/fuzz 仍待。
 4. ~~conntrack + connectToken 状态机骨架~~ **已接线（2026-07-31）：** `FlowKey` / `auth_id` /
    `try_start_auth` / `mark_auth` / `L3_AUTH_TIMEOUT=8s`（`atrust-l3::conntrack`），并新增
-   `evict` / `evict_by_auth_id`。读循环、驱逐、重试一次已由 `atrust-l3::session` 驱动：
-   鉴权超时 → 驱逐条目 → 下次调用重新发 `0x13`（对齐 Go「驱逐并重试一次」）。
+    `evict` / `evict_by_auth_id`。`L3SessionManager` 在鉴权超时后作废连接并自动重试一次，
+    连接关闭最多重建 5 次；策略拒绝不重试。
    被驱逐条目的 `auth_id` 不复用，迟到的 `0x93` 落在未知 id 上丢弃，不会复活已放弃的流。
 5. ~~IPv4 包解析（atype / protocol / 五元组）~~ **已完成（2026-07-31）：**
    `atrust-l3::parse_ipv4_flow`，按 IHL 定位传输层（含 options），TCP/UDP 取端口、ICMP 端口为 0，

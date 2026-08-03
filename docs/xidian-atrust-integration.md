@@ -258,8 +258,8 @@ cargo run -p atrust-probe -- --host atrust.xidian.edu.cn \
 `atrust_auth::ResourceIndex` 回答「这条流该不该进隧道、进哪个 `appId` / 节点组」。
 西电资源表约 1361 条 IP + 523 条域名，重叠不可避免（`/16` 套 `/32`、端口区间套精确端口），
 匹配器按「地址范围最窄 → 端口最窄 → 精确协议先于 `all` → 服务端原始顺序」取第一名，
-并保留全部候选供抓包对照。**服务端真实优先级规则尚未确认**，若证实是 first-match-wins，
-只需改 `ResourceIndex::build` 的排序。
+并保留全部候选供抓包对照。E9 已确认西电 TCP 与 L3 都接受任一覆盖目标的合法候选，
+但拒绝完全无关的 appId；因此保持确定性的 specificity，不需要改成 first-match。
 
 先存一份 body，之后完全离线迭代：
 
@@ -282,9 +282,13 @@ ICMP 不比较端口，可命中显式 `icmp` 或 `all`；zju-connect 的 matche
 其当前 aTrust parser 却会提前丢弃显式 `icmp`，Hermes 不复制这个内部不一致。
 仍待真机确认的规则是 `*.example.edu` 是否覆盖 apex。
 
-`tcp-dial` 现在会在拨号前记录该目标的匹配结果；若与 `--app-id` 不一致会打一条
-`probe.tcp_dial.app_id_mismatch` WARN，但**仍按 `--app-id` 拨号**——排序规则未经真机确认前
-不改变数据面行为，这条日志正是用来收集确认证据的。
+`tcp-dial` 现在强制使用 matcher 返回的 `appId + nodeGroupId`，只在该组的端点中选节点；
+未匹配目标直接拒绝。`--app-id` 仅用于断言自动结果，不再能覆盖策略。连接与握手窗口均为
+15 秒，应用数据发送前的瞬时建连错误自动重试一次。
+
+L3 同样使用复合匹配和组内节点。`L3SessionManager` 在连接关闭时最多重连 5 次，在 8 秒
+flow-auth 超时后重建连接并重试一次；策略拒绝不重试。该层只处理原始 IPv4 包，不包含 TUN、
+DNS 或系统路由。
 
 ## 下一阶段任务（建议顺序）
 

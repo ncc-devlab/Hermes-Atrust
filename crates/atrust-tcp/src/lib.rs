@@ -7,6 +7,9 @@ mod dial;
 mod stream;
 mod target;
 
-pub use dial::{DialTcpError, DialTcpRequest, complete_handshake, dial_tcp, ipv4_target};
+pub use dial::{
+    DialTcpError, DialTcpRequest, TCP_DIAL_RETRIES, TCP_DIAL_TIMEOUT, complete_handshake, dial_tcp,
+    dial_tcp_with_retry, ipv4_target,
+};
 pub use stream::{TcpTunnel, TunnelError};
 pub use target::TunnelTarget;

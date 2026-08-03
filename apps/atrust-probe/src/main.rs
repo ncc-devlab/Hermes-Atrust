@@ -13,7 +13,7 @@ use atrust_auth::{
     extract_sid_from_cookies, select_node,
 };
 use atrust_browser::{BrowserKind, WebDriverBrowser, append_trace_event};
-use atrust_tcp::{DialTcpRequest, TunnelTarget, dial_tcp};
+use atrust_tcp::{DialTcpRequest, TCP_DIAL_RETRIES, TunnelTarget, dial_tcp_with_retry};
 use clap::{Parser, Subcommand};
 use hermes_logging::{LogFormat, LoggerConfig};
 use hermes_model::{DeviceId, GatewayEndpoint, SecretString};
@@ -189,8 +189,9 @@ enum Command {
     /// session already established by `cas-login` (the only workable path on a gateway that
     /// requires CAS + MFA), or omit it to run one local password login from
     /// `HERMES_ATRUST_USERNAME` / `HERMES_ATRUST_PASSWORD`.
-    /// This is a live data-plane action; it dials only the node you point it at and
-    /// completes exactly one handshake to `--target`. Never auto-retries credentials.
+    /// This is a live data-plane action. It automatically matches the target to
+    /// one appId/node group and may retry one transient establishment failure.
+    /// Credentials and application data are never replayed.
     TcpDial {
         /// Login domain for the password path. Ignored with `--session-file`.
         #[arg(long, default_value = "local")]
@@ -213,15 +214,16 @@ enum Command {
         /// Server-side destination the tunnel connects to, as `host:port`.
         #[arg(long)]
         target: String,
-        /// appId carried in the init JSON (matches a clientResource app on strict gateways).
-        #[arg(long, default_value = "app-lab")]
-        app_id: String,
+        /// Optional assertion for the automatically matched appId. A mismatch is
+        /// rejected; this never overrides server policy.
+        #[arg(long)]
+        app_id: Option<String>,
         /// After the handshake, send a minimal `GET / HTTP/1.0` and read one app frame.
         #[arg(long)]
         send_http: bool,
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = atrust_tcp::TCP_DIAL_TIMEOUT.as_secs())]
         connect_timeout_seconds: u64,
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = atrust_tcp::TCP_DIAL_TIMEOUT.as_secs())]
         handshake_timeout_seconds: u64,
     },
     /// Phase D: one SID-only Get-IP exchange against a node, then disconnect.
@@ -279,7 +281,8 @@ enum Command {
         /// destination the resource table never authorized.
         #[arg(long)]
         target: String,
-        /// appId for the flow. Defaults to whatever the resource matcher picks.
+        /// Optional assertion for the automatically matched appId. A mismatch is
+        /// rejected; this never overrides the matched node group.
         #[arg(long)]
         app_id: Option<String>,
         /// Source port for the synthetic flow.
@@ -944,56 +947,44 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 session_material_trace(&material),
             )?;
 
-            // 2. clientResource confirms authorization and can supply the node address.
-            let resources = match client.client_resource(&configuration).await {
-                Ok(resources) => {
-                    log_client_resources(&endpoint, &resources);
-                    Some(resources)
-                }
-                Err(error) => {
-                    warn!(event = "probe.tcp_dial.client_resource_failed", error = %error);
-                    None
-                }
-            };
-
-            // 3. Report what the resource matcher decides for this target. This is
-            // observability only: the dial still uses --app-id / --node verbatim, so
-            // the matcher's ranking can be confirmed against a live gateway before
-            // anything depends on it.
+            // 2. Resource policy is mandatory: appId and nodeGroupId come from
+            // one match and are never assembled independently.
+            let resources = client.client_resource(&configuration).await?;
+            log_client_resources(&endpoint, &resources);
             let (target_host, target_port) = parse_host_port(&target)?;
-            if let Some(resources) = resources.as_ref() {
-                report_resource_match(
-                    resources,
-                    &endpoint,
-                    &target_host,
-                    target_port,
-                    FlowProtocol::Tcp,
-                    false,
-                    cli.browser_trace_file.as_deref(),
-                )?;
-                let matched_app_id = resources
-                    .routing_index()
-                    .match_destination(&target_host, target_port, FlowProtocol::Tcp)
-                    .map(|destination| destination.app_id().to_owned());
-                if matched_app_id.as_deref() != Some(app_id.as_str()) {
-                    warn!(
-                        event = "probe.tcp_dial.app_id_mismatch",
-                        supplied_app_id = %app_id,
-                        matched_app_id = matched_app_id.as_deref().unwrap_or("<none>"),
-                        note = "dialing with the supplied --app-id; a strict gateway may reject it"
-                    );
-                }
+            report_resource_match(
+                &resources,
+                &endpoint,
+                &target_host,
+                target_port,
+                FlowProtocol::Tcp,
+                false,
+                cli.browser_trace_file.as_deref(),
+            )?;
+            let route = resources
+                .routing_index()
+                .match_destination(&target_host, target_port, FlowProtocol::Tcp)
+                .map(|destination| destination.to_matched_resource())
+                .ok_or_else(|| {
+                    format!(
+                        "resource table does not authorize TCP target {target_host}:{target_port}"
+                    )
+                })?;
+            if let Some(asserted) = app_id.as_deref()
+                && asserted != route.app_id
+            {
+                return Err(format!(
+                    "--app-id {asserted} does not match resource appId {}",
+                    route.app_id
+                )
+                .into());
             }
 
-            // 5. Resolve the node to dial. Every advertised endpoint is probed so
-            // the choice is measured rather than assumed; an explicit --node wins
-            // but must be advertised and must answer.
-            let Some(resources) = resources.as_ref() else {
-                return Err("clientResource failed, so no node could be selected".into());
-            };
+            // 3. Probe only endpoints belonging to the matched node group.
             let (node_host, node_port) = select_data_node(
-                resources,
+                &resources,
                 &endpoint,
+                Some(&route.node_group_id),
                 NodeChoice {
                     node: node.as_deref(),
                     allow_unadvertised: allow_unadvertised_node,
@@ -1004,15 +995,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?;
 
-            // 6. Build the server-side destination frame target.
-            let tunnel_target = build_tunnel_target(&target_host, target_port, &app_id);
+            // 4. Build the destination with the appId from that same resource.
+            let tunnel_target = build_tunnel_target(&target_host, target_port, &route.app_id);
 
             // 7. Dial + complete the aTrust TCP handshake.
             info!(
                 event = "probe.tcp_dial.begin",
                 node_port,
                 target_port,
-                app_id_present = !app_id.is_empty(),
+                app_id_present = !route.app_id.is_empty(),
+                node_group_id = %route.node_group_id,
                 send_http
             );
             let request = DialTcpRequest {
@@ -1030,7 +1022,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 connect_timeout: Duration::from_secs(connect_timeout_seconds.max(1)),
                 handshake_timeout: Duration::from_secs(handshake_timeout_seconds.max(1)),
             };
-            let mut tunnel = dial_tcp(request).await?;
+            let mut tunnel = dial_tcp_with_retry(request, TCP_DIAL_RETRIES).await?;
             info!(
                 event = "probe.tcp_dial.handshake_ok",
                 node_port, target_port
@@ -1073,6 +1065,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 &client,
                 &session.configuration,
                 &endpoint,
+                None,
                 NodeChoice {
                     node: node.as_deref(),
                     allow_unadvertised: allow_unadvertised_node,
@@ -1145,45 +1138,46 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 format!("--target must be an IPv4 literal for L3, got {target_host}")
             })?;
 
-            // 3. Resource match decides appId and node group unless overridden.
-            let resources = client.client_resource(&configuration).await.ok();
+            // 3. Resource match atomically decides appId and node group.
+            let resources = client.client_resource(&configuration).await?;
             let flow_protocol = match probe {
                 L3Probe::IcmpEcho => FlowProtocol::Icmp,
                 L3Probe::TcpSyn => FlowProtocol::Tcp,
             };
-            let mut node_group_id = String::new();
-            let mut matched_app_id = None;
-            if let Some(resources) = resources.as_ref() {
-                log_client_resources(&endpoint, resources);
-                report_resource_match(
-                    resources,
-                    &endpoint,
-                    &target_host,
-                    target_port,
-                    flow_protocol,
-                    false,
-                    cli.browser_trace_file.as_deref(),
-                )?;
-                if let Some(destination) = resources.routing_index().match_destination(
-                    &target_host,
-                    target_port,
-                    flow_protocol,
-                ) {
-                    node_group_id = destination.node_group_id().to_owned();
-                    matched_app_id = Some(destination.app_id().to_owned());
-                }
-            }
-            let Some(app_id) = app_id.or(matched_app_id) else {
-                return Err(
-                    "no --app-id given and the resource table does not authorize this target"
-                        .into(),
-                );
-            };
-
-            let (node_host, node_port) = resolve_data_node(
-                &client,
-                &configuration,
+            log_client_resources(&endpoint, &resources);
+            report_resource_match(
+                &resources,
                 &endpoint,
+                &target_host,
+                target_port,
+                flow_protocol,
+                false,
+                cli.browser_trace_file.as_deref(),
+            )?;
+            let route = resources
+                .routing_index()
+                .match_destination(&target_host, target_port, flow_protocol)
+                .map(|destination| destination.to_matched_resource())
+                .ok_or_else(|| {
+                    format!(
+                        "resource table does not authorize {} target {target_host}:{target_port}",
+                        flow_protocol.as_str()
+                    )
+                })?;
+            if let Some(asserted) = app_id.as_deref()
+                && asserted != route.app_id
+            {
+                return Err(format!(
+                    "--app-id {asserted} does not match resource appId {}",
+                    route.app_id
+                )
+                .into());
+            }
+
+            let (node_host, node_port) = select_data_node(
+                &resources,
+                &endpoint,
+                Some(&route.node_group_id),
                 NodeChoice {
                     node: node.as_deref(),
                     allow_unadvertised: allow_unadvertised_node,
@@ -1194,32 +1188,17 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?;
 
-            // 4. Establish the session: Get-IP on a connection that stays open.
+            // 4. Establish, authorize and optionally send. Closed connections
+            // are rebuilt up to the zju-connect limit; auth timeout gets one
+            // retry on a fresh connection. Policy failures are never retried.
             info!(
                 event = "probe.l3_session.begin",
                 node_port,
                 target_port,
                 protocol = flow_protocol.as_str(),
-                app_id_present = !app_id.is_empty()
+                app_id_present = !route.app_id.is_empty(),
+                node_group_id = %route.node_group_id
             );
-            let l3 = atrust_l3::L3Session::establish(atrust_l3::L3SessionConfig {
-                node_host: &node_host,
-                node_port,
-                tls_policy,
-                sid: &material.sid,
-                connect_timeout: Duration::from_secs(connect_timeout_seconds.max(1)),
-                heartbeat_interval: atrust_l3::L3_HEARTBEAT_INTERVAL,
-            })
-            .await?;
-            report_get_ip(l3.get_ip(), node_port, cli.browser_trace_file.as_deref())?;
-
-            // 5. Authorize exactly one five-tuple.
-            let vip = l3.vip();
-            let packet = match probe {
-                L3Probe::IcmpEcho => build_icmp_echo(vip, target_ip),
-                L3Probe::TcpSyn => build_tcp_syn(vip, src_port, target_ip, target_port),
-            };
-            let flow = atrust_l3::parse_ipv4_flow(&packet)?;
             let process = atrust_l3::ProcessIdentity::default_for_port(target_port);
             let ctx = atrust_l3::L3AuthContext {
                 sid: &material.sid,
@@ -1229,25 +1208,51 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 process: &process,
                 lang: "en-US",
             };
-            let token = match l3
-                .authorize_flow(&ctx, &app_id, &node_group_id, &flow)
-                .await
-            {
-                Ok(token) => token,
+            let manager = atrust_l3::L3SessionManager::new(
+                atrust_l3::L3SessionManagerConfig::with_default_heartbeat(
+                    node_host,
+                    node_port,
+                    route.node_group_id.clone(),
+                    tls_policy,
+                    material.sid.clone(),
+                    Duration::from_secs(connect_timeout_seconds.max(1)),
+                ),
+            );
+            let initial = manager.session().await?;
+            report_get_ip(
+                initial.get_ip(),
+                node_port,
+                cli.browser_trace_file.as_deref(),
+            )?;
+            let packet = match probe {
+                L3Probe::IcmpEcho => build_icmp_echo(initial.vip(), target_ip),
+                L3Probe::TcpSyn => build_tcp_syn(initial.vip(), src_port, target_ip, target_port),
+            };
+            let flow = atrust_l3::parse_ipv4_flow(&packet)?;
+            let authorized = if auth_only {
+                manager.authorize_flow(&ctx, &route.app_id, &flow).await
+            } else {
+                manager
+                    .authorize_and_send(&ctx, &route.app_id, &flow, &packet)
+                    .await
+            };
+            let authorized = match authorized {
+                Ok(authorized) => authorized,
                 Err(error) => {
                     append_probe_trace(
                         cli.browser_trace_file.as_deref(),
                         "l3_flow_auth_failed",
                         json!({
                             "flow": flow.flow_key().as_str(),
-                            "app_id": app_id,
+                            "app_id": route.app_id.as_str(),
                             "error": error.to_string(),
                         }),
                     )?;
-                    l3.close().await;
+                    manager.close().await;
                     return Err(error.into());
                 }
             };
+            let token = authorized.connect_token();
             info!(
                 event = "probe.l3_session.flow_authorized",
                 flow = %flow.flow_key(),
@@ -1258,15 +1263,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 "l3_flow_authorized",
                 json!({
                     "flow": flow.flow_key().as_str(),
-                    "app_id": app_id,
-                    "node_group_id": node_group_id,
+                    "app_id": route.app_id.as_str(),
+                    "node_group_id": route.node_group_id.as_str(),
                     "connect_token": token,
                 }),
             )?;
 
-            // 6. One packet out, one packet in.
             if !auth_only {
-                l3.send_packet(&token, &packet).await?;
                 info!(
                     event = "probe.l3_session.packet_sent",
                     bytes = packet.len(),
@@ -1274,7 +1277,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
                 match tokio::time::timeout(
                     Duration::from_secs(reply_timeout_seconds.max(1)),
-                    l3.recv_packet(),
+                    authorized.session().recv_packet(),
                 )
                 .await
                 {
@@ -1297,8 +1300,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     ),
                 }
             }
-
-            l3.close().await;
+            manager.close().await;
             info!(event = "probe.l3_session.closed");
         }
     }
@@ -1312,10 +1314,11 @@ async fn resolve_data_node(
     client: &AuthClient,
     configuration: &AuthConfiguration,
     endpoint: &GatewayEndpoint,
+    node_group_id: Option<&str>,
     request: NodeChoice<'_>,
 ) -> Result<(String, u16), Box<dyn std::error::Error>> {
     let resources = client.client_resource(configuration).await?;
-    select_data_node(&resources, endpoint, request).await
+    select_data_node(&resources, endpoint, node_group_id, request).await
 }
 
 /// What the caller asked for, and what it costs to probe.
@@ -1337,10 +1340,18 @@ struct NodeChoice<'a> {
 async fn select_data_node(
     resources: &atrust_auth::ClientResources,
     endpoint: &GatewayEndpoint,
+    node_group_id: Option<&str>,
     request: NodeChoice<'_>,
 ) -> Result<(String, u16), Box<dyn std::error::Error>> {
-    let candidates = resources.all_nodes(endpoint);
-    let unadvertised = if request.allow_unadvertised {
+    let candidates = match node_group_id {
+        Some(group_id) => resources
+            .node_group_endpoints(group_id, endpoint)
+            .into_iter()
+            .map(|node| (group_id.to_owned(), node))
+            .collect(),
+        None => resources.all_nodes(endpoint),
+    };
+    let unadvertised = if request.allow_unadvertised && node_group_id.is_none() {
         UnadvertisedNode::Allow
     } else {
         UnadvertisedNode::Reject

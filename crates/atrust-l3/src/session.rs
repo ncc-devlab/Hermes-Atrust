@@ -17,8 +17,8 @@
 //! This is the protocol driver only. It does **not** own a TUN device, a DNS
 //! resolver, routes, or a node-group connection cache; packets go in and out as
 //! raw IPv4 bytes so a failure stays inside the protocol, not the kernel routing
-//! table. Reconnect-on-drop also belongs to the (absent) node-group cache: when
-//! this connection dies, the session reports closed and every waiter is woken.
+//! table. Reconnect-on-drop belongs to [`crate::L3SessionManager`]: when this
+//! connection dies, the session reports closed and every waiter is woken.
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -65,6 +65,11 @@ const MIN_UNAMBIGUOUS_CONNECT_TOKEN: usize = 17;
 const READ_CHUNK: usize = 16 * 1024;
 const WRITE_QUEUE_DEPTH: usize = 64;
 const PACKET_QUEUE_DEPTH: usize = 256;
+
+struct OutboundFrame {
+    bytes: Vec<u8>,
+    written: Option<oneshot::Sender<Result<(), ()>>>,
+}
 
 /// Inputs for establishing one L3 session against a data-plane node.
 #[derive(Clone, Debug)]
@@ -174,7 +179,7 @@ impl SessionShared {
 pub struct L3Session {
     get_ip: GetIpv4Response,
     shared: Arc<SessionShared>,
-    write_tx: mpsc::Sender<Vec<u8>>,
+    write_tx: mpsc::Sender<OutboundFrame>,
     packets: AsyncMutex<mpsc::Receiver<Vec<u8>>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -222,7 +227,7 @@ impl L3Session {
 
         let shared = Arc::new(SessionShared::new());
         let (read_half, mut write_half) = tokio::io::split(stream);
-        let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(WRITE_QUEUE_DEPTH);
+        let (write_tx, mut write_rx) = mpsc::channel::<OutboundFrame>(WRITE_QUEUE_DEPTH);
         let (packets_tx, packets_rx) = mpsc::channel::<Vec<u8>>(PACKET_QUEUE_DEPTH);
 
         let writer_shared = Arc::clone(&shared);
@@ -236,15 +241,24 @@ impl L3Session {
                     _ = writer_stop.changed() => break,
                     frame = write_rx.recv() => {
                         let Some(frame) = frame else { break };
-                        if let Err(error) = write_half.write_all(&frame).await {
+                        if let Err(error) = write_half.write_all(&frame.bytes).await {
+                            if let Some(written) = frame.written {
+                                let _ = written.send(Err(()));
+                            }
                             warn!(event = "atrust_l3.session.write_failed", %error);
                             writer_shared.shutdown("L3 connection write failed");
                             break;
                         }
                         if let Err(error) = write_half.flush().await {
+                            if let Some(written) = frame.written {
+                                let _ = written.send(Err(()));
+                            }
                             warn!(event = "atrust_l3.session.flush_failed", %error);
                             writer_shared.shutdown("L3 connection flush failed");
                             break;
+                        }
+                        if let Some(written) = frame.written {
+                            let _ = written.send(Ok(()));
                         }
                     }
                 }
@@ -276,7 +290,10 @@ impl L3Session {
                     biased;
                     _ = heartbeat_stop.changed() => break,
                     _ = ticker.tick() => {
-                        if heartbeat_tx.send(encode_l3_heartbeat_req().to_vec()).await.is_err() {
+                        if heartbeat_tx.send(OutboundFrame {
+                            bytes: encode_l3_heartbeat_req().to_vec(),
+                            written: None,
+                        }).await.is_err() {
                             break;
                         }
                     }
@@ -384,7 +401,7 @@ impl L3Session {
                 flow = %key,
                 app_id
             );
-            if self.write_tx.send(frame).await.is_err() {
+            if self.write_frame(frame).await.is_err() {
                 self.abandon_flow(&key, auth_id);
                 return Err(L3SessionError::Closed);
             }
@@ -445,10 +462,25 @@ impl L3Session {
             return Err(L3SessionError::Closed);
         }
         let frame = encode_l3_data_req(connect_token.as_bytes(), packets)?;
+        self.write_frame(frame).await
+    }
+
+    /// Queues a frame and waits until the writer has flushed it. Without this
+    /// acknowledgement a dead socket looks successful to callers, preventing
+    /// the connection owner from performing a safe L3 retry.
+    async fn write_frame(&self, bytes: Vec<u8>) -> Result<(), L3SessionError> {
+        let (written, receiver) = oneshot::channel();
         self.write_tx
-            .send(frame)
+            .send(OutboundFrame {
+                bytes,
+                written: Some(written),
+            })
             .await
-            .map_err(|_| L3SessionError::Closed)
+            .map_err(|_| L3SessionError::Closed)?;
+        match receiver.await {
+            Ok(Ok(())) => Ok(()),
+            _ => Err(L3SessionError::Closed),
+        }
     }
 
     /// Receives the next inbound IPv4 packet, or `None` once the session ends.

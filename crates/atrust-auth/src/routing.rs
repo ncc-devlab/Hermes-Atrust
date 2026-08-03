@@ -132,6 +132,14 @@ pub enum Destination<'a> {
     Domain(&'a DomainResource),
 }
 
+/// Owned routing decision. The application and node group always come from the
+/// same server-published resource and must not be overridden independently.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MatchedResource {
+    pub app_id: String,
+    pub node_group_id: String,
+}
+
 impl Destination<'_> {
     pub fn app_id(&self) -> &str {
         match self {
@@ -166,6 +174,13 @@ impl Destination<'_> {
         match self {
             Self::Ip(_) => "ip",
             Self::Domain(_) => "domain",
+        }
+    }
+
+    pub fn to_matched_resource(&self) -> MatchedResource {
+        MatchedResource {
+            app_id: self.app_id().to_owned(),
+            node_group_id: self.node_group_id().to_owned(),
         }
     }
 }
@@ -926,6 +941,13 @@ mod tests {
         assert_eq!(literal.kind(), "ip");
         assert_eq!(literal.app_id(), "byip");
         assert_eq!(literal.node_group_id(), "ng-byip");
+        assert_eq!(
+            literal.to_matched_resource(),
+            MatchedResource {
+                app_id: "byip".to_owned(),
+                node_group_id: "ng-byip".to_owned(),
+            }
+        );
 
         let name = index
             .match_destination("lib.example.edu", 443, FlowProtocol::Tcp)

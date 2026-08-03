@@ -97,18 +97,15 @@ cargo test --workspace
    `{atype}:{src}:{sport}-{dst}:{dport}`，与 Hermes `FlowKey` 逐字符一致；
 6. ~~L3 授权 URL 应使用 `tcp:` 还是 `tcp://`~~ **已决：`tcp:`（无 `//`）。**
    zju-connect `buildAuthRequest` 用 `protoName(proto):dstIP:dstPort`，Hermes 一致；
-7. **资源表重叠时服务端的优先级规则 —— 与 zju-connect 存在已知分歧。**
+7. ~~资源表重叠时服务端的优先级规则~~ **西电已决（2026-08-03，E9）：任一匹配候选均可授权。**
    zju-connect 没有统一策略：L3 `processIPV4` 按服务端原始顺序 first-match；TCP tunnel
    的 IP 循环不 `break`，实际由 last-match 覆盖；域名资源使用 Go `map`，重复与重叠选择
    也不稳定。Hermes 的 `ResourceIndex` 按「地址范围最窄 → 端口范围最窄 →
    精确协议先于 `all` → 原始顺序」排序取第一名。表存在重叠时两者会选出不同的
-   `appId`/`nodeGroupId`。注意 zju-connect 可用**不等于**它与官方客户端一致——也可能只是
-   ZJU 的表恰好不重叠。
-   **决定（2026-07-31）：维持 Hermes 现有的 specificity 排序，不照搬 zju-connect
-   任一路径的偶然行为**，理由正是「能用」不等于「正确」。代价已知：若西电的表存在重叠，
-   Hermes 可能选出与 zju-connect L3 不同的 `appId`，且症状会长得像协议 bug。判定方法：登录后
-   `client-resource --save-body`，再用 `resource-match --show-all` 统计重叠条数与两种
-   排序分歧的目的地数量。在拿到这个数据前，任何 L3 live 失败都要先排除这一条；
+   `appId`/`nodeGroupId`。E9 对同一目标测试 specificity、原始首条和无关 appId：前两者在
+   TCP/L3 均通过 app 授权，无关项分别被 TCP `0x02`、L3 `0x82` 拒绝。故西电验证 appId
+   是否属于匹配资源，但不强制唯一排序；Hermes 保持确定性的 specificity。该结论尚不能外推
+   到其他网关或跨 node-group 的重叠项；
 8. **ICMP 如何命中资源**。zju-connect 的判据是 `resource.Protocol == "icmp" || == "all"`
    且不比较端口，但其 aTrust parser 当前会提前过滤显式 `icmp` 条目。Hermes 同时解析并匹配
    显式 `icmp` 与 `all`，不复制这个 parser/matcher 不一致；
@@ -235,7 +232,8 @@ cargo run -p atrust-probe -- \
 - Linux、macOS、Windows 的指定网卡绑定；
 - 自动探测底层网卡及网络切换后的重新探测；
 - VPN 服务端和虚拟 IP 的路由排除；
-- TCP/TLS 分阶段超时、取消、重试和退避；
+- ~~TCP/TLS 分阶段超时与瞬时建连重试~~（连接与握手各 15s；应用数据发送前最多重试 1 次）；
+  多节点退避仍待上层连接池；
 - 自定义 CA、证书固定及更细粒度 TLS 诊断。
 
 ### TCP 隧道
@@ -250,12 +248,12 @@ cargo run -p atrust-probe -- \
 
 - ~~Get-IP codec（动态 SID JSON 长度；`05 d0` / `53 00` / 地址循环）~~；`53 00` body 已保留进
   `GetIpv4Response::status_bodies` 并落 trace；Xidian live 待复跑（`atrust-probe get-ip --session-file`）；
-- ~~SID 总连接（Get-IP 之后）长连接保持~~（`atrust-l3::L3Session`，读/写/心跳三任务 +
-  watch 停止信号 + `Drop` 兜底 abort）；**多节点组缓存与重连仍未做**——一条连接死掉时会话只报告
-  closed 并唤醒全部等待者，重建属于尚不存在的 node-group 缓存层；
+- ~~SID 总连接（Get-IP 之后）长连接保持与重连~~（`atrust-l3::L3Session` 驱动读/写/心跳，
+  `L3SessionManager` 按节点组拥有会话；closed 最多重连 5 次，auth timeout 作废连接后重试 1 次）；
+  多节点组的全局 manager cache 仍待上层按需组合；
 - ~~按五元组鉴权 JSON（`tcp:` 无 `//`）、conntrack 表、connectToken 状态机~~
-  （`atrust-protocol::l3_auth` + `atrust-l3::{conntrack,auth,session}`；8s 超时已由会话驱动，
-  超时驱逐条目以允许重试一次；并发同流合并为一次 `0x13`）；
+  （`atrust-protocol::l3_auth` + `atrust-l3::{conntrack,auth,session,manager}`；8s 超时后由 manager
+  重建连接并自动重试一次；并发同流合并为一次 `0x13`）；
 - ~~`0x14` 编码 / 下行 `0x94` 双格式 / 心跳请求常量~~；~~读循环与心跳任务~~（已接，25s）；
 - ~~IPv4 包五元组解析~~（`atrust-l3::parse_ipv4_flow`，按 IHL 定位传输层）；
 - ICMP、UDP、TCP 的逐阶段真实联调（`atrust-probe l3-session --probe icmp-echo|tcp-syn`）；

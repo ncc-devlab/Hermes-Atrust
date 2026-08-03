@@ -4,14 +4,16 @@
 //! - Per-flow conntrack + connectToken (`conntrack`, `auth`)
 //! - IPv4 packet classification (`packet`)
 //! - Full-duplex session driver: read loop + heartbeat + flow auth (`session`)
+//! - Node-group session ownership, reconnect and bounded retries (`manager`)
 //! - Packet `0x14`/`0x94` framing lives in `atrust-protocol::l3_frame`
 //!
-//! TUN, DNS, routing and the node-group connection cache are deliberately out of
-//! scope: this crate stops at raw IPv4 packets in and out of one node.
+//! TUN, DNS and routing are deliberately out of scope: this crate stops at raw
+//! IPv4 packets in and out of one selected node group.
 
 mod auth;
 mod conntrack;
 mod get_ip;
+mod manager;
 mod packet;
 mod session;
 
@@ -23,8 +25,16 @@ pub use conntrack::{
     AuthOutcome, ConntrackEntry, ConntrackError, ConntrackTable, FlowKey, L3_AUTH_TIMEOUT,
 };
 pub use get_ip::{GetIpv4Error, GetIpv4Request, GetIpv4Response, get_ipv4, request_ipv4};
+pub use manager::{
+    AuthorizedL3Flow, L3SessionManager, L3SessionManagerConfig, L3SessionManagerError,
+};
 pub use packet::{FLOW_KEY_ATYPE_IPV4, Ipv4Flow, PacketError, parse_ipv4_flow};
 pub use session::{L3_HEARTBEAT_INTERVAL, L3Session, L3SessionConfig, L3SessionError};
+
+/// Match zju-connect's retry boundary: five reconnects after a closed L3
+/// connection, and one fresh-connection retry after flow-auth timeout.
+pub const L3_CLOSED_RETRIES: usize = 5;
+pub const L3_AUTH_TIMEOUT_RETRIES: usize = 1;
 
 // Re-export wire helpers used by L3 callers.
 pub use atrust_protocol::{
