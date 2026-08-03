@@ -94,6 +94,35 @@ VIP 帧为 `05 <status> <reserved> <addrType>` + `vipPayloadLength(addrType)` �
 
 **判定实验：** [E4](#e4)（`vip_data_hex` trace）——长度已决；尾字节语义仍开。
 
+**掩码假说已证伪，且这个问题本身是伪问题（2026-07-31）。** 见 [A8](#a8)：
+zju-connect 根本不从 VIP 推导掩码，尾 2 字节它一次都没读过。
+
+### A8 — 隧道 MTU 与路由模型（掩码问题的真正答案） <a id="a8"></a>
+
+**依据：L1**（zju-connect `stack/tun/stack.go`、`stack_linux.go`、`stack_windows.go`、
+`stack/gvisor/stack.go`、`client/atrust/parse.go`）
+
+E4 的尾 2 字节是 `00 00` 之后，我曾把「VIP 的前缀长度无处可取」列为接 TUN 的阻塞项。
+**查完 zju-connect 后这个担心不成立——它压根不需要那个掩码：**
+
+| 问题 | zju-connect 的做法 | 出处 |
+|---|---|---|
+| VIP 掩码 | **恒 `/32`**，不从任何帧推导 | `stack_linux.go:71` `ip + "/32"`；`gvisor/stack.go:160` `PrefixLen: 32`；Windows 走 `route add ... mask` |
+| 隧道 MTU | **硬编码 1400**，不协商 | `stack/tun/stack.go:26` `const MTU uint32 = 1400` |
+| 走哪些网段 | **完全来自资源表**，逐条 `ip route add <target> dev <tun>` | `stack_linux.go:48` `AddRoute` |
+| 资源表里的网段怎么来 | `parse.go` 把 host 串按 IP／CIDR／`a-b` 三种形态解析成 `IPMin..IPMax` | `parse.go:118-150` |
+
+也就是说 **VIP 只是一个 /32 的源地址，不承载任何子网信息**；「哪些流量进隧道」由资源表
+独立决定。VIP body 尾部那 2 字节 zju-connect 从头到尾没有读过——`vipPayloadLength` 读 6 是
+为了**保持流同步**，只有前 4 字节进 IP。
+
+**对 Hermes 的直接结论：** TUN 层按 `<vip>/32` 配地址，路由按资源表逐条下，MTU 取 1400。
+尾 2 字节保留在 `vip_data` 里供将来对照，但**不进任何决策路径**。
+
+**仍未决：** 1400 这个 MTU 同样是 zju-connect 的常量而非服务端声明。它与 [A1](#a1)
+第三条二义区间（下行 > 4096 失同步）的关系是：**上行**受 TUN MTU 约束不会越界，
+**下行**没有任何东西保证服务端不发更大的包。这正是 [E6](#e6) 要测的。
+
 ### A3 — 每命令的帧头不对称 <a id="a3"></a>
 
 **依据：L1 + L2**
@@ -213,8 +242,11 @@ Hermes 的做法是弱化版本：如果失败的真实原因在连接层（服�
 
 ### C1 — 资源表重叠时的优先级（**已知故意分歧**） <a id="c1"></a>
 
-zju-connect `processIPV4` 是**纯 first-match，按服务端原始顺序**，不排序。
-Hermes `ResourceIndex` 按「地址范围最窄 → 端口范围最窄 → 精确协议先于 `all` → 原始顺序」排序。
+zju-connect **没有统一的资源优先级**：L3 `processIPV4` 是按服务端原始顺序的
+first-match；TCP tunnel 的 IP 匹配循环不 `break`，后命中的 `appId` / `nodeGroupId`
+会覆盖前者，实际是 last-match；域名资源放进 Go `map`，重复 key 后写覆盖，重叠后又受
+无序迭代影响。Hermes `ResourceIndex` 则统一按「地址范围最窄 → 端口范围最窄 →
+精确协议先于 `all` → 原始顺序」确定性排序。
 
 **表存在重叠时两者选出不同的 `appId` / `nodeGroupId`。**
 
@@ -224,13 +256,50 @@ Hermes `ResourceIndex` 按「地址范围最窄 → 端口范围最窄 → 精�
 **代价已接受且症状具有欺骗性**：选错 `appId` 的表现是服务端拒绝或静默丢包，
 **长得和协议 bug 一模一样**。因此**任何 L3 live 失败都必须先排除这一条**。
 
-**判定实验：** [E2](#e2)（离线，不需要数据面，登录后立刻可做）。
+#### L0 量化结果（2026-07-31，E2，西电 1361 条 IP 资源）
+
+对 2035 个采样点（每条资源取 `IPMin` / `IPMax` / 中点 × 端口下界 / 上界 / 80）：
+
+| 协议 | 命中 | 重叠（候选 > 1） | **两种排序选出不同 appId** |
+|---|---|---|---|
+| TCP | 2035 | 1510（**74%**） | **1235（60%）** |
+| UDP | 444 | 80（18%） | 14（3%） |
+
+**分歧不是边缘情况，是 TCP 的多数情况。** 主因是表里存在**排在很前面的宽泛兜底条目**，
+例如 `10.0.0.1-10.255.255.254`（`all`，全端口）。zju-connect 的 **L3 first-match**
+会把几乎所有 10.x 流量都归给那一个 `appId`；Hermes 则按最窄条目归给具体应用。
+典型分歧（`zju` 列特指 L3）：
+
+```
+10.168.76.172:8355  zju→290b1940 (10.0.0.1-10.255.255.254)  hermes→34a33d00 (10.168.76.172)
+202.117.112.71:8081 zju→27bf5f60 (202.117.112.1-.254)       hermes→316772f0 (202.117.112.71)
+202.117.112.9:53    zju→27bf5f60 (202.117.112.1-.254)       hermes→2b306a40 (202.117.112.9-.14)
+```
+
+**关键的负面结论：迄今为止的 live 测试对这一条没有提供任何证据。**
+E3 / E5 用过的三个目的地——`202.117.112.1:80`（6 个候选）、`202.117.115.138:80`（3 个）、
+`140.210.72.240:80`（1 个）——**两种排序恰好都选同一个 `appId`**。
+所以「E5 通了」不能读作「Hermes 的排序对」。
+
+**判定实验：** [E2](#e2) 已跑（上表）；**[E9](#e9) 是决定性的下一步**——
+对一个已知分歧的目的地，用两个候选 `appId` 各拨一次，让服务端自己表态。
 
 ### C2 — ICMP 如何命中资源 <a id="c2"></a>
 
-**依据：L1**。zju-connect 判据是 `Protocol == "icmp" || == "all"` 且不比较端口。
-Hermes 已跟随（2026-07-31 之前只允许命中 `all`，会漏匹配）。西电的表是否真的出现
-`icmp` 协议值，未验证。
+**依据：L1**。zju-connect 的 L3 matcher 判据是
+`Protocol == "icmp" || == "all"` 且不比较端口；但当前 aTrust `parse.go` 只把
+`tcp` / `udp` / `all` 放入 `ipResources`，所以服务端显式 `icmp` 条目实际上会在进入
+matcher 前被丢弃。这是 zju-connect 自身 parser/matcher 的不一致，不应照搬。
+Hermes 解析并匹配显式 `icmp`，同时允许 ICMP 命中 `all`。
+
+**L0（2026-07-31 E5 附带）：** 对只有 `tcp:80` 资源的目的地发 ICMP echo，
+`0x13` 返回 **`auth status 0x82`**。这是第一条服务端侧证据：
+**网关在 flow auth 阶段真的比较协议，并对协议不匹配显式拒绝。**
+连带结论：西电资源表里没有 ICMP 授权的目的地时，隧道内 ping 不通**不是 bug**，
+`--probe icmp-echo` 也因此不能作为通用回环探针（[E6](#e6) 需要换 UDP）。
+
+**仍未决：** 西电的表是否存在 `icmp` 协议值的条目（E2 的采样里未专门统计）；
+`0x82` 是否专指协议不匹配，还是「资源不授权」的通用码。
 
 ### C3 — 域名通配符语义 <a id="c3"></a>
 
@@ -401,7 +470,7 @@ grep -E "node_select.candidate|node_select.chosen" /tmp/e1-nodes.log
 ```
 
 `--show-all` 输出多于一条候选的目的地，就是 Hermes 的 specificity 排序与
-zju-connect 的 first-match **可能分歧**的点。要统计的量：
+zju-connect L3 的 first-match **可能分歧**的点。要统计的量：
 
 - 有多少个目的地命中 **> 1** 条资源（重叠总数）；
 - 其中**第一名与「原始顺序第一条」不同**的有多少个（真正分歧数）。
@@ -508,6 +577,55 @@ grep "ignored_command" /tmp/e5.log                                 # A3/A4：出
 - `layout=length_prefixed` 且 `bytes` 逼近 4096 → 第三条二义区间迫近，需要确认隧道 MTU；
 - 出现 `ignored_command` → 记录 `cmd` 值，这是 [A3](#a3)/[A4](#a4) 的第一手证据。
 
+### E9 — 服务端对 `appId` 的裁决（[C1](#c1) 的决定性实验） <a id="e9"></a>
+
+E2 证明 specificity 与原始首条的分歧覆盖 60% 的 TCP 采样点，但**没有任何 live 证据
+说明服务端如何裁决**。同一个已知重叠的目的地至少要测四类 `appId`：specificity、
+原始首条、原始末条和完全无关的负对照。TCP 与 L3 必须分别测，不能把一条数据路径的
+结果外推给另一条。
+
+`tcp-dial --app-id` 本来就是显式传参、不受匹配器影响（匹配器只在不一致时打 WARN），
+所以这个实验不需要改代码。
+
+```bash
+# 从 E2 的分歧清单里挑一个有真实监听的目的地
+TARGET=202.117.112.71:8081
+
+# A：Hermes specificity；这个样本也恰好是原始末条
+./target/debug/atrust-probe --host atrust.xidian.edu.cn --insecure-tls \
+  --log-file /tmp/e9-specific.log \
+  tcp-dial --session-file ~/.hermes/xidian-session.json \
+  --node 61.150.43.94:441 --target "$TARGET" \
+  --app-id 316772f0-c9a7-11f0-8b22-4f20181761d8 --send-http
+
+# B：原始顺序首条（zju-connect L3 的选择）
+./target/debug/atrust-probe --host atrust.xidian.edu.cn --insecure-tls \
+  --log-file /tmp/e9-first.log \
+  tcp-dial --session-file ~/.hermes/xidian-session.json \
+  --node 61.150.43.94:441 --target "$TARGET" \
+  --app-id 27bf5f60-c9a7-11f0-8b22-4f20181761d8 --send-http
+
+# C：原始顺序末条（zju-connect TCP 的选择）。本样本与 A 相同，无需重复；
+# 若换目标后 C != A，必须单独拨一次。
+
+# D：从资源表取一个完全不覆盖 TARGET 的 appId，作为负对照。
+# 实验前离线确认它不在 --show-all 候选中，再使用同一条 tcp-dial 命令拨号。
+```
+
+**判读：**
+
+| 结果 | 结论 |
+|---|---|
+| 只有 A 成功 | 当前路径支持 specificity |
+| 只有 B 成功 | 当前路径支持原始首条 |
+| 只有 C 成功 | 当前路径支持原始末条 |
+| A/B/C 成功、D 失败 | 服务端可能接受任一匹配资源，而不强制唯一优先级 |
+| D 也成功 | 当前路径没有硬性校验 `appId`；它仍可能影响审计/记账，不能称为纯观测差异 |
+| A/B/C/D 都失败 | 不可判读：目标、会话、节点或更早握手阶段有问题，换目标或修复前置条件 |
+
+每组必须分开记录 init/auth 是否成功与目标服务连接是否成功；后者失败不能反推
+`appId` 被拒绝。至少交错重复一轮，并在另一个重叠且真实监听的目标上复验。
+
 ### 实验索引
 
 | ID | 目标 | 依赖 | 需在校内 |
@@ -517,6 +635,15 @@ grep "ignored_command" /tmp/e5.log                                 # A3/A4：出
 | [E3](#e3) | SignKey 是否真被校验（[B1](#b1)） | E1、E2 | **否** |
 | [E4](#e4) | VIP 帧真实布局（[A2](#a2)、[A5](#a5)） | E1 | **否** |
 | [E5](#e5) | `0x94` 分支与 token 长度（[A1](#a1)、[A3](#a3)、[A4](#a4)） | E3 判定通过 | **否** |
+| **[E9](#e9)** | **服务端是否按 `appId` 裁决（[C1](#c1)）** | E2 的分歧清单 | **否** |
+
+**接 TUN 前还欠的三关**（尚未展开成实验条目）：
+
+- **E6 — 大包 / MTU / token 分支。** E5 只证明了 44 字节；[A1](#a1) 的 `n > 4096` 区间和
+  整个 token 分支**一次都没被触发过**。需要 `--payload-bytes` 与一个 UDP 探针
+  （ICMP 走不通，见下方 C2 的 `0x82`）。上行受 MTU 1400 约束不会越界，**下行没有保证**；
+- **E7 — 长会话存活。** 25 秒心跳是 zju-connect 的常量（[B4](#b4)），西电容忍窗口未知；
+- **E8 — 并发多流。** conntrack 驱逐、并发授权去重、waiter map 目前**只有 mock 覆盖**。
 
 **关于 `10.255.57.11`：它外网不可达是预期的，不构成阻塞。** 它是内网侧地址，
 真正的问题不是「能不能直连它」，而是「Hermes 会不会默认选中它」——由 [E1](#e1) 回答。
@@ -540,5 +667,15 @@ grep "ignored_command" /tmp/e5.log                                 # A3/A4：出
     status `{"code":0,"data":{"deviceID":"644B123B"},"message":"OK"}` → [A2](#a2)/[A5](#a5) 首样本；
   - **E5：** L3 `tcp-syn` 鉴权 `ready=true`，`connect_token_len=32`（≥17，[A1](#a1) 安全），
     下行 `data_resp layout=length_prefixed` bytes=44，回环成功。
-  注意：`icmp-echo` 对仅 `tcp:80` 资源会 `auth status 0x82`；E2 的 C1 目标
+  注意：`icmp-echo` 对仅 `tcp:80` 资源会 `auth status 0x82`（见 [C2](#c2)）；E2 的 C1 目标
   `202.117.112.1:80` 在节点侧 TCP connect `0x03`（可达性/策略），换「新OA」后通。
+- **2026-07-31（同日，E2 量化 + 掩码问题结案）**
+  - **[C1](#c1)：** 2035 个采样点中 TCP 重叠 74%、**两种排序分歧 60%**；
+    且 E3/E5 用过的三个目的地恰好都不分歧 → **live 至今对 C1 零证据**。新增 [E9](#e9) 作为
+    决定性实验（同目的地、两个候选 `appId` 各拨一次，让服务端表态）；
+  - **[A2](#a2)/[A8](#a8)：** VIP 尾 2 字节的掩码假说证伪后，查 zju-connect 确认
+    **它根本不从 VIP 推导掩码**——VIP 恒 `/32`，MTU 硬编码 1400，路由完全由资源表逐条下发。
+    掩码问题就此结案，不再是接 TUN 的阻塞项；
+  - **[C2](#c2)：** `0x82` 确认服务端在 flow auth 阶段比较协议；
+  - **代码：** 读循环改为满队列丢包（`try_send` + `dropped_packets` 计数），
+    不再让慢消费者拖住 `0x93` 分发。

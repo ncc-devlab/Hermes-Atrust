@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -90,6 +90,8 @@ struct SessionShared {
     /// one waiter when several packets race into the same unauthorized flow.
     waiters: Mutex<HashMap<u64, Vec<oneshot::Sender<AuthOutcome>>>>,
     closed: AtomicBool,
+    /// Inbound packets discarded because the consumer was not keeping up.
+    dropped_packets: AtomicU64,
     /// Broadcast stop signal. Every task selects on it, so closing a session
     /// does not have to wait for a task's own timer to fire.
     stop_tx: watch::Sender<bool>,
@@ -101,8 +103,27 @@ impl SessionShared {
             conntrack: Mutex::new(ConntrackTable::new()),
             waiters: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
+            dropped_packets: AtomicU64::new(0),
             stop_tx: watch::channel(false).0,
         }
+    }
+
+    /// Records one discarded inbound packet and returns the running total.
+    ///
+    /// Logged at WARN for the first drop and then on a widening scale: a
+    /// congested tunnel must not turn into a log flood, but the first drop is
+    /// the moment the operator can still act on it.
+    fn record_drop(&self) -> u64 {
+        let total = self.dropped_packets.fetch_add(1, Ordering::Relaxed) + 1;
+        if total == 1 || total.is_power_of_two() {
+            warn!(
+                event = "atrust_l3.session.packet_dropped",
+                dropped_total = total,
+                queue_depth = PACKET_QUEUE_DEPTH,
+                note = "inbound packet discarded: consumer is slower than the tunnel"
+            );
+        }
+        total
     }
 
     fn stop_signal(&self) -> watch::Receiver<bool> {
@@ -289,6 +310,16 @@ impl L3Session {
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.shared.closed.load(Ordering::SeqCst)
+    }
+
+    /// Inbound packets discarded because the consumer fell behind.
+    ///
+    /// Non-zero means the tunnel outran whatever is draining [`Self::recv_packet`].
+    /// The packets are gone — this is the counter a TUN layer should surface as
+    /// interface drops rather than treating as a protocol error.
+    #[must_use]
+    pub fn dropped_packets(&self) -> u64 {
+        self.shared.dropped_packets.load(Ordering::Relaxed)
     }
 
     /// Authorizes one flow and returns its connect token.
@@ -564,14 +595,14 @@ where
             match action {
                 Dispatch::Continue => {}
                 Dispatch::Send(packet) => {
-                    if packets_tx.send(packet).await.is_err() {
-                        return "L3 packet consumer dropped".to_owned();
+                    if let Some(reason) = deliver(packets_tx, shared, packet) {
+                        return reason;
                     }
                 }
                 Dispatch::SendMany(packets) => {
                     for packet in packets {
-                        if packets_tx.send(packet).await.is_err() {
-                            return "L3 packet consumer dropped".to_owned();
+                        if let Some(reason) = deliver(packets_tx, shared, packet) {
+                            return reason;
                         }
                     }
                 }
@@ -590,10 +621,36 @@ where
     }
 }
 
+/// Hands one inbound packet to the consumer, dropping it if the queue is full.
+///
+/// Returns a shutdown reason only when the consumer is gone for good.
+///
+/// **Dropping, not awaiting, is the point.** This runs on the read loop, which
+/// is also the only task that dispatches `0x93` auth responses and `0x95`
+/// heartbeat acks. Blocking here on a full queue would stall the control path
+/// behind a slow data consumer: every in-flight `authorize_flow` would run out
+/// its 8s timeout while the tunnel still looked healthy, and the reader would
+/// stop draining the socket. A tunnel that carries IP is lossy by contract, so
+/// discarding a packet is a legal outcome; wedging flow authorization is not.
+fn deliver(
+    packets_tx: &mpsc::Sender<Vec<u8>>,
+    shared: &Arc<SessionShared>,
+    packet: Vec<u8>,
+) -> Option<String> {
+    match packets_tx.try_send(packet) {
+        Ok(()) => None,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            shared.record_drop();
+            None
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => Some("L3 packet consumer dropped".to_owned()),
+    }
+}
+
 /// What the read loop must do after a frame is decoded.
 ///
 /// Packets are handed back rather than sent inline so the borrow on the read
-/// buffer ends before the loop awaits on the packet channel.
+/// buffer ends before the loop hands them to the packet channel.
 enum Dispatch {
     Continue,
     Send(Vec<u8>),
@@ -724,6 +781,36 @@ pub enum L3SessionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A full packet queue must cost packets, never the read loop. If `deliver`
+    /// ever goes back to awaiting, this test deadlocks instead of failing — which
+    /// is exactly the production symptom it guards against.
+    #[tokio::test]
+    async fn a_full_packet_queue_drops_instead_of_stalling_the_reader() {
+        let shared = Arc::new(SessionShared::new());
+        let (packets_tx, _packets_rx) = mpsc::channel::<Vec<u8>>(2);
+
+        assert_eq!(deliver(&packets_tx, &shared, vec![1]), None);
+        assert_eq!(deliver(&packets_tx, &shared, vec![2]), None);
+        assert_eq!(shared.dropped_packets.load(Ordering::Relaxed), 0);
+
+        // Third packet has nowhere to go.
+        assert_eq!(deliver(&packets_tx, &shared, vec![3]), None);
+        assert_eq!(deliver(&packets_tx, &shared, vec![4]), None);
+        assert_eq!(shared.dropped_packets.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn a_gone_consumer_still_ends_the_session() {
+        let shared = Arc::new(SessionShared::new());
+        let (packets_tx, packets_rx) = mpsc::channel::<Vec<u8>>(2);
+        drop(packets_rx);
+
+        let reason = deliver(&packets_tx, &shared, vec![1]).expect("closed consumer ends the loop");
+        assert!(reason.contains("consumer"));
+        // A closed channel is not congestion, so it must not inflate the counter.
+        assert_eq!(shared.dropped_packets.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn next_frame_needs_a_complete_auth_response() {

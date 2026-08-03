@@ -98,19 +98,20 @@ cargo test --workspace
 6. ~~L3 授权 URL 应使用 `tcp:` 还是 `tcp://`~~ **已决：`tcp:`（无 `//`）。**
    zju-connect `buildAuthRequest` 用 `protoName(proto):dstIP:dstPort`，Hermes 一致；
 7. **资源表重叠时服务端的优先级规则 —— 与 zju-connect 存在已知分歧。**
-   zju-connect `processIPV4` 是**纯 first-match，按服务端原始顺序**遍历 `ipResources`，
-   不做任何排序。Hermes 的 `ResourceIndex` 按「地址范围最窄 → 端口范围最窄 →
+   zju-connect 没有统一策略：L3 `processIPV4` 按服务端原始顺序 first-match；TCP tunnel
+   的 IP 循环不 `break`，实际由 last-match 覆盖；域名资源使用 Go `map`，重复与重叠选择
+   也不稳定。Hermes 的 `ResourceIndex` 按「地址范围最窄 → 端口范围最窄 →
    精确协议先于 `all` → 原始顺序」排序取第一名。表存在重叠时两者会选出不同的
    `appId`/`nodeGroupId`。注意 zju-connect 可用**不等于**它与官方客户端一致——也可能只是
    ZJU 的表恰好不重叠。
-   **决定（2026-07-31）：维持 Hermes 现有的 specificity 排序，不跟随 zju-connect 改成
-   first-match**，理由正是「能用」不等于「正确」。代价已知：若西电的表存在重叠，Hermes 会选出
-   与 zju-connect 不同的 `appId`，且症状会长得像协议 bug。判定方法：登录后
+   **决定（2026-07-31）：维持 Hermes 现有的 specificity 排序，不照搬 zju-connect
+   任一路径的偶然行为**，理由正是「能用」不等于「正确」。代价已知：若西电的表存在重叠，
+   Hermes 可能选出与 zju-connect L3 不同的 `appId`，且症状会长得像协议 bug。判定方法：登录后
    `client-resource --save-body`，再用 `resource-match --show-all` 统计重叠条数与两种
    排序分歧的目的地数量。在拿到这个数据前，任何 L3 live 失败都要先排除这一条；
 8. **ICMP 如何命中资源**。zju-connect 的判据是 `resource.Protocol == "icmp" || == "all"`
-   且不比较端口；Hermes 现规定 ICMP 只能命中 `all`。若服务端资源表真的出现 `icmp`
-   协议值，Hermes 会漏匹配。尚未经真机验证；
+   且不比较端口，但其 aTrust parser 当前会提前过滤显式 `icmp` 条目。Hermes 同时解析并匹配
+   显式 `icmp` 与 `all`，不复制这个 parser/matcher 不一致；
 9. **域名通配符语义**。现按 `*.example.edu` 覆盖任意子域但不含 apex 实现，
    服务端是否同此仍待确认。
 

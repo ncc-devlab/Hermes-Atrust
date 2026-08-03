@@ -370,9 +370,9 @@ fn domain_entry_matches(entry: &IndexedDomain, host: &str, flow: DomainFlow<'_>)
 
 /// A `tcp`/`udp` resource only carries its own protocol; `all` carries any.
 ///
-/// ICMP therefore requires an `all` resource. This mirrors the resource table
-/// having no ICMP protocol value of its own, and is **unconfirmed against a live
-/// gateway** — verify before relying on ping through the tunnel.
+/// ICMP can be carried by either an explicit `icmp` resource or `all`. The
+/// zju-connect matcher has the same predicate, although its current aTrust
+/// parser inconsistently filters explicit `icmp` resources before matching.
 fn protocol_matches(resource: ResourceProtocol, flow: FlowProtocol) -> bool {
     matches!(
         (resource, flow),

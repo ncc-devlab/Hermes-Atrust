@@ -278,8 +278,9 @@ cargo run -p atrust-probe -- --host atrust.xidian.edu.cn resource-match \
 `matched=false` 是有效结果：数据面对未命中资源的目标**必须不发**。域名目标走域名表，
 不在本地先解析——域名资源与 IP 资源可能是不同的 `appId` 和节点组（§6.4）。
 
-两条待真机确认的规则已写入架构文档未决项：ICMP 只能命中 `all` 且不比较端口（未决项 8）、
-`*.example.edu` 覆盖任意子域但不含 apex（未决项 9）。
+ICMP 不比较端口，可命中显式 `icmp` 或 `all`；zju-connect 的 matcher 虽支持前者，
+其当前 aTrust parser 却会提前丢弃显式 `icmp`，Hermes 不复制这个内部不一致。
+仍待真机确认的规则是 `*.example.edu` 是否覆盖 apex。
 
 `tcp-dial` 现在会在拨号前记录该目标的匹配结果；若与 `--app-id` 不一致会打一条
 `probe.tcp_dial.app_id_mismatch` WARN，但**仍按 `--app-id` 拨号**——排序规则未经真机确认前
