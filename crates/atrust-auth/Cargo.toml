@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 base64.workspace = true
 futures-util.workspace = true
+hermes-events = { path = "../hermes-events" }
 hermes-model = { path = "../hermes-model" }
 hermes-transport = { path = "../hermes-transport" }
 hex.workspace = true
@@ -18,6 +19,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 url.workspace = true
 
 [dev-dependencies]

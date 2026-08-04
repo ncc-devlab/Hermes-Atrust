@@ -30,6 +30,7 @@ use atrust_protocol::{
     DataRespPackets, L3_VERSION, L3FrameError, decode_l3_data_resp_body, encode_l3_data_req,
     encode_l3_heartbeat_req, l3_cmd,
 };
+use hermes_events::{EventBus, HermesEvent, L3DataLayout, OptionalEventBus as _};
 use hermes_model::SessionId;
 use hermes_transport::{TlsConnectError, TlsPolicy, connect_tls};
 use thiserror::Error;
@@ -40,7 +41,9 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::auth::{FlowAuthError, L3AuthContext, apply_auth_wire_status, build_flow_auth_frame};
-use crate::conntrack::{AuthOutcome, ConntrackTable, FlowKey, L3_AUTH_TIMEOUT};
+use crate::conntrack::{
+    AuthOutcome, ConntrackTable, FlowKey, L3_AUTH_TIMEOUT, L3_CONNTRACK_CAPACITY,
+};
 use crate::get_ip::{GetIpv4Error, GetIpv4Response, request_ipv4};
 use crate::packet::Ipv4Flow;
 
@@ -85,6 +88,8 @@ pub struct L3SessionConfig<'a> {
     /// failure. Default to something comfortably above the measured connect.
     pub connect_timeout: Duration,
     pub heartbeat_interval: Duration,
+    /// Observation channel for protocol findings seen on this connection.
+    pub events: Option<Arc<EventBus>>,
 }
 
 /// State shared between the caller and the session tasks.
@@ -100,16 +105,39 @@ struct SessionShared {
     /// Broadcast stop signal. Every task selects on it, so closing a session
     /// does not have to wait for a task's own timer to fire.
     stop_tx: watch::Sender<bool>,
+    /// Optional observation channel. Publishing is non-blocking and lossy by
+    /// contract, which is what makes it safe to call from the read loop.
+    events: Option<Arc<EventBus>>,
+    /// Which `0x94` branches have already been reported. The layout is a
+    /// protocol finding (A1), so it is worth one event per branch — and only
+    /// one, because a saturated tunnel would otherwise flood the stream.
+    seen_length_prefixed: AtomicBool,
+    seen_token_framed: AtomicBool,
 }
 
 impl SessionShared {
-    fn new() -> Self {
+    fn new(events: Option<Arc<EventBus>>) -> Self {
         Self {
             conntrack: Mutex::new(ConntrackTable::new()),
             waiters: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
             dropped_packets: AtomicU64::new(0),
             stop_tx: watch::channel(false).0,
+            events,
+            seen_length_prefixed: AtomicBool::new(false),
+            seen_token_framed: AtomicBool::new(false),
+        }
+    }
+
+    /// Reports a `0x94` branch the first time it is seen on this connection.
+    fn record_data_layout(&self, layout: L3DataLayout, bytes: usize) {
+        let first = match layout {
+            L3DataLayout::LengthPrefixed => &self.seen_length_prefixed,
+            L3DataLayout::TokenFramed => &self.seen_token_framed,
+        };
+        if !first.swap(true, Ordering::Relaxed) {
+            self.events
+                .emit(|| HermesEvent::L3DataLayoutObserved { layout, bytes });
         }
     }
 
@@ -127,6 +155,9 @@ impl SessionShared {
                 queue_depth = PACKET_QUEUE_DEPTH,
                 note = "inbound packet discarded: consumer is slower than the tunnel"
             );
+            self.events.emit(|| HermesEvent::L3PacketsDropped {
+                dropped_total: total,
+            });
         }
         total
     }
@@ -199,6 +230,7 @@ impl L3Session {
             config.sid,
             config.heartbeat_interval,
             config.connect_timeout,
+            config.events,
         )
         .await
     }
@@ -212,6 +244,7 @@ impl L3Session {
         sid: &SessionId,
         heartbeat_interval: Duration,
         get_ip_timeout: Duration,
+        events: Option<Arc<EventBus>>,
     ) -> Result<Self, L3SessionError>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -225,7 +258,7 @@ impl L3Session {
             status_bodies = get_ip.status_bodies.len()
         );
 
-        let shared = Arc::new(SessionShared::new());
+        let shared = Arc::new(SessionShared::new(events));
         let (read_half, mut write_half) = tokio::io::split(stream);
         let (write_tx, mut write_rx) = mpsc::channel::<OutboundFrame>(WRITE_QUEUE_DEPTH);
         let (packets_tx, packets_rx) = mpsc::channel::<Vec<u8>>(PACKET_QUEUE_DEPTH);
@@ -329,6 +362,15 @@ impl L3Session {
         self.shared.closed.load(Ordering::SeqCst)
     }
 
+    /// Flows currently tracked on this connection.
+    ///
+    /// Bounded by `L3_CONNTRACK_CAPACITY`; a value pinned at the cap means the
+    /// table is thrashing rather than merely busy.
+    #[must_use]
+    pub fn conntrack_len(&self) -> usize {
+        self.shared.conntrack.lock().expect("conntrack mutex").len()
+    }
+
     /// Inbound packets discarded because the consumer fell behind.
     ///
     /// Non-zero means the tunnel outran whatever is draining [`Self::recv_packet`].
@@ -361,8 +403,11 @@ impl L3Session {
 
         // Phase 1: claim the flow and register a waiter, holding the lock only
         // for bookkeeping — never across an await.
-        let (auth_id, must_send, receiver) = {
+        let (auth_id, must_send, receiver, prune) = {
             let mut table = self.shared.conntrack.lock().expect("conntrack mutex");
+            // Retire idle flows on the same lock acquisition that adds one, so
+            // the table stays bounded without a second task contending here.
+            let prune = table.prune();
             let entry = table.get_or_create(key.clone(), app_id, node_group_id);
             if let Some(outcome) = entry.outcome() {
                 return match outcome {
@@ -382,8 +427,33 @@ impl L3Session {
                 .entry(auth_id)
                 .or_default()
                 .push(sender);
-            (auth_id, must_send, receiver)
+            (auth_id, must_send, receiver, prune)
         };
+
+        // Reported outside the lock. Idle expiry is routine and stays at debug;
+        // a capacity eviction is not, because it means an authorized flow was
+        // retired early and will pay another round trip.
+        if prune.evicted_for_capacity > 0 {
+            warn!(
+                event = "atrust_l3.session.conntrack_pressure",
+                entries = prune.entries,
+                capacity = L3_CONNTRACK_CAPACITY,
+                evicted = prune.evicted_for_capacity
+            );
+            self.shared
+                .events
+                .emit(|| HermesEvent::L3ConntrackPressure {
+                    entries: prune.entries,
+                    capacity: L3_CONNTRACK_CAPACITY,
+                    evicted: prune.evicted_for_capacity,
+                });
+        } else if prune.expired > 0 {
+            debug!(
+                event = "atrust_l3.session.conntrack_expired",
+                expired = prune.expired,
+                entries = prune.entries
+            );
+        }
 
         // Phase 2: build and send outside the lock. A build failure must not
         // strand the flow in "auth started" with nothing in flight.
@@ -725,6 +795,10 @@ fn dispatch(
                                 connect_token_len = token.len(),
                                 minimum = MIN_UNAMBIGUOUS_CONNECT_TOKEN
                             );
+                            shared.events.emit(|| HermesEvent::L3ConnectTokenAmbiguous {
+                                connect_token_len: token.len(),
+                                minimum: MIN_UNAMBIGUOUS_CONNECT_TOKEN,
+                            });
                         }
                         shared.notify(auth_id, &outcome);
                     }
@@ -749,15 +823,18 @@ fn dispatch(
                     packets = 1,
                     bytes = packet.len()
                 );
+                shared.record_data_layout(L3DataLayout::LengthPrefixed, packet.len());
                 Dispatch::Send(packet.to_vec())
             }
             DataRespPackets::TokenFramed(packets) => {
+                let bytes = packets.iter().map(|packet| packet.len()).sum::<usize>();
                 debug!(
                     event = "atrust_l3.session.data_resp",
                     layout = "token_framed",
                     packets = packets.len(),
-                    bytes = packets.iter().map(|packet| packet.len()).sum::<usize>()
+                    bytes
                 );
+                shared.record_data_layout(L3DataLayout::TokenFramed, bytes);
                 Dispatch::SendMany(packets.into_iter().map(<[u8]>::to_vec).collect())
             }
         },
@@ -783,6 +860,7 @@ fn dispatch(
             // Warn, not debug: an unrecognised frame from the real gateway is a
             // finding, even though skipping it keeps the session alive.
             warn!(event = "atrust_l3.session.ignored_command", cmd);
+            shared.events.emit(|| HermesEvent::L3UnknownCommand { cmd });
             Dispatch::Continue
         }
     }
@@ -819,7 +897,7 @@ mod tests {
     /// is exactly the production symptom it guards against.
     #[tokio::test]
     async fn a_full_packet_queue_drops_instead_of_stalling_the_reader() {
-        let shared = Arc::new(SessionShared::new());
+        let shared = Arc::new(SessionShared::new(None));
         let (packets_tx, _packets_rx) = mpsc::channel::<Vec<u8>>(2);
 
         assert_eq!(deliver(&packets_tx, &shared, vec![1]), None);
@@ -834,7 +912,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_gone_consumer_still_ends_the_session() {
-        let shared = Arc::new(SessionShared::new());
+        let shared = Arc::new(SessionShared::new(None));
         let (packets_tx, packets_rx) = mpsc::channel::<Vec<u8>>(2);
         drop(packets_rx);
 

@@ -613,6 +613,33 @@ pub enum AuthError {
     Resource(#[from] ResourceError),
 }
 
+/// aTrust business code for a session the gateway no longer recognises.
+///
+/// Observed live on 2026-08-03: a stored CAS session replayed roughly 3.7 hours
+/// after it was saved returned `75500002 / "The session is invalid"`.
+pub const SESSION_INVALID_CODE: i64 = 75_500_002;
+
+impl AuthError {
+    /// True when the gateway rejected the session itself.
+    ///
+    /// This is worth distinguishing from every other failure because it is the
+    /// one that **retrying cannot fix**: a periodic refresh loop that treats it
+    /// as a transient error will warn forever while the rest of the runtime
+    /// keeps serving an increasingly stale resource table.
+    /// The same business code reaches callers through two different error
+    /// types depending on which endpoint noticed first: `authConfig` reports it
+    /// as a rejected authentication, `clientResource` as a rejected resource
+    /// response. Both mean the session is gone.
+    #[must_use]
+    pub fn is_session_invalid(&self) -> bool {
+        match self {
+            Self::AuthenticationRejected { code, .. }
+            | Self::Resource(ResourceError::Rejected { code, .. }) => *code == SESSION_INVALID_CODE,
+            _ => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;

@@ -1,23 +1,25 @@
 [package]
-name = "atrust-l3"
+name = "atrust-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+atrust-auth = { path = "../atrust-auth" }
+atrust-l3 = { path = "../atrust-l3" }
 atrust-protocol = { path = "../atrust-protocol" }
+atrust-tcp = { path = "../atrust-tcp" }
 hermes-events = { path = "../hermes-events" }
 hermes-model = { path = "../hermes-model" }
 hermes-transport = { path = "../hermes-transport" }
-serde.workspace = true
-serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["io-util", "macros", "rt", "rt-multi-thread", "sync", "test-util", "time"] }
+async-trait.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 
 [lints]
 workspace = true

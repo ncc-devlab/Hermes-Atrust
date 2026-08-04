@@ -23,10 +23,12 @@ pub use auth::{
 };
 pub use conntrack::{
     AuthOutcome, ConntrackEntry, ConntrackError, ConntrackTable, FlowKey, L3_AUTH_TIMEOUT,
+    L3_CONNTRACK_CAPACITY, L3_CONNTRACK_IDLE_TTL, PruneOutcome,
 };
 pub use get_ip::{GetIpv4Error, GetIpv4Request, GetIpv4Response, get_ipv4, request_ipv4};
 pub use manager::{
-    AuthorizedL3Flow, L3SessionManager, L3SessionManagerConfig, L3SessionManagerError,
+    AuthorizedL3Flow, L3NodeEndpoint, L3SessionManager, L3SessionManagerCache,
+    L3SessionManagerConfig, L3SessionManagerError,
 };
 pub use packet::{FLOW_KEY_ATYPE_IPV4, Ipv4Flow, PacketError, parse_ipv4_flow};
 pub use session::{L3_HEARTBEAT_INTERVAL, L3Session, L3SessionConfig, L3SessionError};

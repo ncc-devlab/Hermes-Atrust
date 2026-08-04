@@ -4,12 +4,35 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
 /// Default wait for a per-flow `0x93` response (Go `ensureAuth`).
 pub const L3_AUTH_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// How long an authorized flow survives without carrying a packet.
+///
+/// **This is a deliberate divergence from zju-connect, which never expires a
+/// conntrack entry.** That is survivable for a short-lived process and a memory
+/// leak for a long-lived tunnel: every short connection burns a fresh source
+/// port, so an hour of ordinary browsing produces tens of thousands of distinct
+/// five-tuples that would otherwise be retained until the connection dies.
+///
+/// 5 minutes is chosen against two measured quantities rather than as a round
+/// number: re-authorization costs one round trip (~30 ms on the Xidian link,
+/// 2026-08-04), and common HTTP keep-alive idles are 60–120 s. The TTL sits
+/// above the latter so interactive flows are not churned, and the penalty when
+/// it does fire is one extra round trip on the next packet.
+pub const L3_CONNTRACK_IDLE_TTL: Duration = Duration::from_secs(300);
+
+/// Hard cap on tracked flows per connection.
+///
+/// Roughly 250 bytes per entry (flow key, two UUIDs, a 32-byte token, and two
+/// hash map slots), so the cap bounds the table near 2 MB. Reaching it means
+/// the client is opening flows faster than [`L3_CONNTRACK_IDLE_TTL`] retires
+/// them, which is a condition worth surfacing rather than absorbing silently.
+pub const L3_CONNTRACK_CAPACITY: usize = 8192;
 
 /// Stable key for one L3 flow (Go `connTrackKey`).
 ///
@@ -66,12 +89,29 @@ pub struct ConntrackEntry {
     pub node_group_id: String,
     auth_started: bool,
     outcome: Option<AuthOutcome>,
+    /// Last time a packet touched this flow. Drives idle expiry.
+    last_used: Instant,
 }
 
 impl ConntrackEntry {
     #[must_use]
     pub fn auth_started(&self) -> bool {
         self.auth_started
+    }
+
+    #[must_use]
+    pub fn last_used(&self) -> Instant {
+        self.last_used
+    }
+
+    /// True while a `0x13` is outstanding and no verdict has arrived.
+    ///
+    /// Such an entry must never be pruned: a caller is blocked on its waiter,
+    /// and removing it would strand that caller for the full auth timeout even
+    /// though the answer was still coming.
+    #[must_use]
+    pub fn auth_in_flight(&self) -> bool {
+        self.auth_started && self.outcome.is_none()
     }
 
     #[must_use]
@@ -99,11 +139,38 @@ impl ConntrackEntry {
 }
 
 /// Conntrack table keyed by flow and by auth id (Go `conntrackMgr`).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ConntrackTable {
     next_auth_id: AtomicU64,
     by_key: HashMap<FlowKey, ConntrackEntry>,
     by_id: HashMap<u64, FlowKey>,
+    idle_ttl: Duration,
+    capacity: usize,
+}
+
+impl Default for ConntrackTable {
+    fn default() -> Self {
+        Self::with_limits(L3_CONNTRACK_IDLE_TTL, L3_CONNTRACK_CAPACITY)
+    }
+}
+
+/// What one prune pass removed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PruneOutcome {
+    /// Entries retired for exceeding the idle TTL. Routine.
+    pub expired: usize,
+    /// Entries retired early because the table was full. Not routine: it means
+    /// flows are being created faster than the TTL retires them.
+    pub evicted_for_capacity: usize,
+    /// Entries remaining afterwards.
+    pub entries: usize,
+}
+
+impl PruneOutcome {
+    #[must_use]
+    pub fn removed_any(&self) -> bool {
+        self.expired > 0 || self.evicted_for_capacity > 0
+    }
 }
 
 impl ConntrackTable {
@@ -112,14 +179,99 @@ impl ConntrackTable {
         Self::default()
     }
 
+    #[must_use]
+    pub fn with_limits(idle_ttl: Duration, capacity: usize) -> Self {
+        Self {
+            next_auth_id: AtomicU64::new(0),
+            by_key: HashMap::new(),
+            by_id: HashMap::new(),
+            idle_ttl,
+            capacity: capacity.max(1),
+        }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.by_key.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.by_key.is_empty()
+    }
+
+    /// Retires idle flows, then trims to capacity by least-recently-used.
+    ///
+    /// Call this before creating an entry rather than on a timer: it keeps the
+    /// table bounded without a second task contending for the same lock, and
+    /// the only moment the bound can be exceeded is the moment a flow is added.
+    pub fn prune(&mut self) -> PruneOutcome {
+        self.prune_at(Instant::now())
+    }
+
+    /// [`Self::prune`] against a caller-supplied clock.
+    pub fn prune_at(&mut self, now: Instant) -> PruneOutcome {
+        let mut outcome = PruneOutcome::default();
+
+        let expired: Vec<FlowKey> = self
+            .by_key
+            .values()
+            .filter(|entry| {
+                !entry.auth_in_flight()
+                    && now.saturating_duration_since(entry.last_used) >= self.idle_ttl
+            })
+            .map(|entry| entry.key.clone())
+            .collect();
+        for key in expired {
+            self.evict(&key);
+            outcome.expired += 1;
+        }
+
+        // Capacity is enforced only against settled entries. An in-flight auth
+        // clears itself within the 8s timeout, so a table that is briefly all
+        // in-flight is self-limiting; refusing to track a new flow there would
+        // turn a transient burst into dropped traffic.
+        while self.by_key.len() >= self.capacity {
+            let Some(victim) = self
+                .by_key
+                .values()
+                .filter(|entry| !entry.auth_in_flight())
+                .min_by_key(|entry| entry.last_used)
+                .map(|entry| entry.key.clone())
+            else {
+                break;
+            };
+            self.evict(&victim);
+            outcome.evicted_for_capacity += 1;
+        }
+
+        outcome.entries = self.by_key.len();
+        outcome
+    }
+
     /// Returns existing entry or creates one with a fresh `auth_id`.
+    ///
+    /// Touching an existing flow refreshes its idle clock, so an active flow is
+    /// never retired underneath a caller that is still sending on it.
     pub fn get_or_create(
         &mut self,
         key: FlowKey,
         app_id: impl Into<String>,
         node_group_id: impl Into<String>,
     ) -> &mut ConntrackEntry {
-        if self.by_key.contains_key(&key) {
+        self.get_or_create_at(key, app_id, node_group_id, Instant::now())
+    }
+
+    /// [`Self::get_or_create`] against a caller-supplied clock.
+    pub fn get_or_create_at(
+        &mut self,
+        key: FlowKey,
+        app_id: impl Into<String>,
+        node_group_id: impl Into<String>,
+        now: Instant,
+    ) -> &mut ConntrackEntry {
+        if let Some(entry) = self.by_key.get_mut(&key) {
+            entry.last_used = now;
             return self.by_key.get_mut(&key).expect("key present");
         }
         let auth_id = self.next_auth_id.fetch_add(1, Ordering::Relaxed) + 1;
@@ -130,6 +282,7 @@ impl ConntrackTable {
             node_group_id: node_group_id.into(),
             auth_started: false,
             outcome: None,
+            last_used: now,
         };
         self.by_id.insert(auth_id, key.clone());
         self.by_key.insert(key.clone(), entry);
@@ -277,6 +430,119 @@ mod tests {
             table.get_by_key(&key2).unwrap().outcome(),
             Some(AuthOutcome::Failed { .. })
         ));
+    }
+
+    fn table(capacity: usize) -> ConntrackTable {
+        ConntrackTable::with_limits(Duration::from_secs(300), capacity)
+    }
+
+    fn flow(port: u16) -> FlowKey {
+        FlowKey::new(4, "10.0.0.1", port, "10.9.0.1", 80)
+    }
+
+    /// The leak this replaces: before idle expiry, every successful flow stayed
+    /// until the connection died, and a browsing session burns a fresh source
+    /// port per connection.
+    #[test]
+    fn an_idle_settled_flow_is_retired_but_an_active_one_is_not() {
+        let mut table = table(64);
+        let start = Instant::now();
+
+        for port in [1000, 1001] {
+            let entry = table.get_or_create_at(flow(port), "app", "group", start);
+            entry.try_start_auth();
+        }
+        table
+            .mark_auth(1, 0, "OK", "token-1")
+            .expect("settle first flow");
+        table
+            .mark_auth(2, 0, "OK", "token-2")
+            .expect("settle second flow");
+
+        // One flow keeps carrying packets; the other goes quiet.
+        let later = start + Duration::from_secs(299);
+        table.get_or_create_at(flow(1000), "app", "group", later);
+
+        let outcome = table.prune_at(start + Duration::from_secs(301));
+        assert_eq!(outcome.expired, 1);
+        assert_eq!(outcome.evicted_for_capacity, 0);
+        assert_eq!(outcome.entries, 1);
+        assert!(table.get_by_key(&flow(1000)).is_some(), "active flow kept");
+        assert!(table.get_by_key(&flow(1001)).is_none(), "idle flow retired");
+        // The retired flow's auth id must go with it, or a late 0x93 could
+        // revive an entry the caller has forgotten.
+        assert!(table.get_by_auth_id(2).is_none());
+    }
+
+    /// Pruning must never take an entry whose caller is still blocked on it:
+    /// that would strand the waiter for the full auth timeout with the verdict
+    /// already on its way.
+    #[test]
+    fn an_in_flight_auth_survives_both_expiry_and_capacity_pressure() {
+        let mut table = table(1);
+        let start = Instant::now();
+        table
+            .get_or_create_at(flow(1000), "app", "group", start)
+            .try_start_auth();
+
+        let outcome = table.prune_at(start + Duration::from_secs(3600));
+        assert_eq!(outcome.expired, 0);
+        assert_eq!(outcome.evicted_for_capacity, 0);
+        assert_eq!(outcome.entries, 1, "the entry is still there");
+        assert!(!outcome.removed_any());
+        assert!(table.get_by_key(&flow(1000)).is_some());
+        assert!(
+            table
+                .get_by_key(&flow(1000))
+                .expect("entry")
+                .auth_in_flight(),
+            "the entry is exactly the one prune must refuse to take"
+        );
+    }
+
+    #[test]
+    fn capacity_pressure_evicts_the_least_recently_used_settled_flow() {
+        let mut table = table(3);
+        let start = Instant::now();
+
+        for (index, port) in [1000u16, 1001, 1002].into_iter().enumerate() {
+            let at = start + Duration::from_secs(index as u64);
+            table
+                .get_or_create_at(flow(port), "app", "group", at)
+                .try_start_auth();
+            table
+                .mark_auth(index as u64 + 1, 0, "OK", "token")
+                .expect("settle");
+        }
+        // 1000 is the oldest; touching it makes 1001 the least recent.
+        table.get_or_create_at(flow(1000), "app", "group", start + Duration::from_secs(10));
+
+        let outcome = table.prune_at(start + Duration::from_secs(11));
+        assert_eq!(outcome.expired, 0);
+        assert_eq!(outcome.evicted_for_capacity, 1);
+        assert!(table.get_by_key(&flow(1001)).is_none(), "LRU evicted");
+        assert!(table.get_by_key(&flow(1000)).is_some());
+        assert!(table.get_by_key(&flow(1002)).is_some());
+    }
+
+    /// The bound is the point: a client that never stops opening flows must not
+    /// be able to grow the table without limit.
+    #[test]
+    fn a_flood_of_settled_flows_stays_under_the_cap() {
+        let mut table = table(16);
+        let start = Instant::now();
+
+        for index in 0..500u64 {
+            let at = start + Duration::from_millis(index);
+            let port = 10_000 + u16::try_from(index % 5000).expect("port fits");
+            table.prune_at(at);
+            let entry = table.get_or_create_at(flow(port), "app", "group", at);
+            let auth_id = entry.auth_id;
+            if entry.try_start_auth() {
+                table.mark_auth(auth_id, 0, "OK", "token").expect("settle");
+            }
+            assert!(table.len() <= 16, "table exceeded the cap at {index}");
+        }
     }
 
     #[test]

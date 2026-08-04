@@ -273,7 +273,7 @@ async fn session_with(
     let (client, server) = tokio::io::duplex(64 * 1024);
     let stats = PeerStats::default();
     let peer = spawn_peer(server, behaviour, stats.clone());
-    let session = L3Session::start(client, &sid(), heartbeat, GET_IP_TIMEOUT)
+    let session = L3Session::start(client, &sid(), heartbeat, GET_IP_TIMEOUT, None)
         .await
         .expect("session establishes");
     (session, stats, peer)
@@ -561,7 +561,7 @@ async fn token_framed_data_response_is_delivered() {
         tokio::time::sleep(Duration::from_secs(5)).await;
     });
 
-    let session = L3Session::start(client, &sid(), IDLE_HEARTBEAT, GET_IP_TIMEOUT)
+    let session = L3Session::start(client, &sid(), IDLE_HEARTBEAT, GET_IP_TIMEOUT, None)
         .await
         .expect("session establishes");
 
