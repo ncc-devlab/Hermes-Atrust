@@ -266,6 +266,11 @@ flow key 里是 `4`。两者都是经验值。
 任何请求，两种模型都能解释这次观测。区分实验：保存后每 30 分钟打一次 `onlineInfo`，
 看它能否延到 3.7 小时以上。
 
+**第二样本（2026-08-04）：** 会话 02:40 UTC 保存，03:40 仍成功完成 `authConfig`、
+`onlineInfo`、两次 `clientResource` 和一次 L3 flow auth；06:34 再跑时 `authConfig` 仍返回结构，
+但 `onlineInfo` 报同一 `75500002`。它再次确认失效业务码和小时级寿命，但由于 03:40 到 06:34
+之间没有 30 分钟心跳请求，仍不能区分绝对 TTL 与空闲超时，也不比第一样本的上界更紧。
+
 **实现后果（已处理）：** 同一个业务码会经由两个不同的错误类型到达调用方——`authConfig`
 报 `AuthError::AuthenticationRejected`，`clientResource` 报 `AuthError::Resource(Rejected)`，
 `AuthError::is_session_invalid()` 同时识别两者。`ResourceCache` 据此把它**升级**为
@@ -756,8 +761,8 @@ timeout 会在 `0x03` 到达前先报超时，E9 必须使用至少 20 秒。两
 - **E6 — 大包 / MTU / token 分支。** E5 只证明了 44 字节；[A1](#a1) 的 `n > 4096` 区间和
   整个 token 分支**一次都没被触发过**。UDP 探针与 `--payload-bytes` 已实现，live 尚待一个
   资源表授权且会原样回显 datagram 的 UDP echo 目标；
-- **E7 — 长会话存活。** 25 秒心跳是 zju-connect 的常量（[B4](#b4)），西电容忍窗口未知；
-- **E8 — 并发多流。** conntrack 驱逐、并发授权去重、waiter map 目前**只有 mock 覆盖**。
+- **E7 — 长会话存活。** 30 秒 heartbeat 预检通过；隔离控制面刷新的长跑在 57–58 分钟被服务端断开；
+- **E8 — 并发多流。** 2 flow × 2 caller 的离线反序回包与西电 live 均已通过；
 
 ### E6 — UDP 大包、MTU 与 `0x94` 分支 <a id="e6"></a>
 
@@ -786,6 +791,80 @@ UDP 服务替代。
 `--payload-bytes 1372 --auth-only`，VIP `10.210.29.114`，flow auth 成功并返回 32 字节
 connect token。这只证明 UDP 路由、五元组和 `0x13` 授权路径可用；`auth-only` 没有发送 datagram，
 因此不能据此声称 1400 MTU、echo 校验或 `0x94` 分支已通过。完整 E6 仍等受控 echo 目标。
+
+### E7 — 长会话与 heartbeat 存活 <a id="e7"></a>
+
+探针的判据不是「进程睡够了」，而是同一条 L3 session 在保持前后分别授权两个不同源端口的新流：
+末次授权必须成功、`Arc<L3Session>` 与 VIP 必须不变、wire 上必须恰好新增两个 `0x13` verdict，且期间
+不能 closed 或 timeout。`--status-interval-seconds` 周期记录 conntrack、drop 与授权计数。
+
+先用 30 秒跨过一个默认 25 秒 heartbeat 做接线预检，再用 4 小时覆盖此前控制面 `<3h40` 的寿命观测：
+
+```bash
+# 接线预检
+./target/debug/atrust-probe --host atrust.xidian.edu.cn --insecure-tls \
+  --log-file /tmp/e7-30s.log \
+  l3-session --session-file ~/.hermes/xidian-session.json \
+  --node 61.150.43.94:441 --target 202.117.112.71:8081 \
+  --probe tcp-syn --auth-only --src-port 41000 \
+  --hold-seconds 30 --heartbeat-seconds 25 --status-interval-seconds 10 \
+  --resource-refresh-seconds 3600 --connect-timeout-seconds 20
+
+# 正式运行：保留 60 秒资源刷新，观察控制面和 L3 是否一起存活
+# 将 --hold-seconds 改为 14400，--status-interval-seconds 改为 60，
+# 并把 --resource-refresh-seconds 改为 60。
+```
+
+正式运行还应再做一次 `resource-refresh-seconds > hold-seconds` 的隔离对照，以区分资源刷新是否延长
+控制面 SID。一次自动重连不能伪装成 PASS，因为最终 session pointer 必须与开始时相同。
+
+**30 秒预检（L0，2026-08-04 06:53–06:54 UTC）：通过。** VIP `10.210.29.188`，保持前后
+源端口 `41000/41001` 的两个新流都返回 verdict；same session=true、wire request=2、verdict=2、
+timeout=0、drop=0。保持跨过一个 25 秒 heartbeat 后第二次授权仍成功。日志 `/tmp/e7-30s.log`。
+
+**长跑结果（L0，2026-08-04 06:55–07:53 UTC）：57–58 分钟时被服务端断开。** 参数为
+`hold=14400`、heartbeat=25 秒、resource refresh=20000 秒（长于 hold），源端口从 `43000`
+开始。3420 秒采样仍是 `session_closed=false`，3480 秒采样首次变为 true，期间 auth in-flight=0、
+drop=0；探针随即以 `E7 session closed during the hold` 非零退出，没有执行末次新流授权。
+因此这不是「4 小时失败后的模糊结果」，而是**西电已建立 L3 连接寿命落在 57–58 分钟**的直接样本。
+日志 `/tmp/e7-4h.log`。
+
+本组隔离了控制面刷新，尚不能判断断开是服务端 L3 绝对寿命、heartbeat ACK 容忍策略，还是控制面
+SID 在连接内的联动失效。下一组应保持其它变量不变，只把 resource refresh 改为 60 秒；若仍在约
+58 分钟断开，控制面续期解释基本可排除。另应给 heartbeat ACK 增加计数，以确认断开前是否先停止 ACK。
+
+### E8 — 并发多流与同流去重 <a id="e8"></a>
+
+最小矩阵为两个不同源端口（两个 flow），每个 flow 同时两个 caller。四个任务由同一个 barrier 释放；
+PASS 要求四个 caller 全成功，但 wire `0x13` 恰好只有两个、两个 verdict、零 timeout、峰值在途授权至少
+为二、conntrack 恰好增加两项，且所有结果仍属于开始时的 session。这同时验证「不同流可并发」和
+「同流 caller 只发一次鉴权」，不会用上千请求在 live 环境测试容量上限。
+
+```bash
+./target/debug/atrust-probe --host atrust.xidian.edu.cn --insecure-tls \
+  --log-file /tmp/e8.log \
+  l3-session --session-file ~/.hermes/xidian-session.json \
+  --node 61.150.43.94:441 --target 202.117.112.71:8081 \
+  --probe tcp-syn --auth-only --src-port 42000 \
+  --concurrent-flows 2 --callers-per-flow 2 \
+  --experiment-timeout-seconds 15 --resource-refresh-seconds 3600 \
+  --connect-timeout-seconds 20
+```
+
+**离线结果（2026-08-04）：** mock peer 等两个不同 `0x13` 都到达后才按反序返回 verdict；四个 caller
+全部拿到正确结果，wire request=2、peak in-flight=2、conntrack=2。它证明客户端并发和 auth-id/waiter
+关联正确，但服务端 live 仍需上述命令证实。
+
+**live 尝试（2026-08-04 06:34 UTC）：不可判读。** 保存会话在 L3 建连前即返回
+`75500002 / The session is invalid`，所以没有发出任何 `0x13`。需要新鲜 CAS 会话后连续跑 E8 和
+E7 30 秒预检；日志保存在 `/tmp/e8.log`。这次失败只增加了一条控制面寿命观测，不能算 E8 失败。
+
+**live 结果（L0，2026-08-04 06:51–06:52 UTC，新鲜会话）：通过。** VIP `10.210.29.188`，
+flow 为源端口 `42000/42001` 到 `202.117.112.71:8081`；4/4 caller 成功，wire request=2、
+verdict=2、timeout=0、peak in-flight=2、conntrack=2、same session=true，两条 connect token
+长度均为 32。服务端返回顺序是 `42001` 后 `42000`，未造成 auth-id/waiter 串线。日志
+`/tmp/e8-fresh.log`。**E8 的最小 live 判据已完成。** 容量上限和驱逐继续只做离线测试，不对
+真实网关制造 8192-flow 压力。
 
 **关于 `10.255.57.11`：它外网不可达是预期的，不构成阻塞。** 它是内网侧地址，
 真正的问题不是「能不能直连它」，而是「Hermes 会不会默认选中它」——由 [E1](#e1) 回答。

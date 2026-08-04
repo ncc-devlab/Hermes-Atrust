@@ -173,7 +173,10 @@ TCP SYN → 44 字节应答回环成功，未出现未知命令。**因此 `mock
 它此前只能证明实现自洽，现在帧格式的理解已被真机证伪过一轮。
 
 E1–E5、E9、E3b 均已完成，1 号闸门（SignKey）已解除。接 TUN 之前剩下的是 E6（大包／
-token 分支／MTU）、E7（长会话存活）、E8（并发多流），三者都需要先补探针能力。
+token 分支／MTU）、E7（长会话存活）、E8（并发多流）；三者的探针能力均已补齐，E8 离线与
+西电 live 的 2 flow × 2 caller 均已通过；E7 30 秒 heartbeat 预检通过，但隔离控制面刷新的
+长跑在 57–58 分钟被服务端断开，仍需 60 秒资源刷新对照与 heartbeat ACK 计数。
+E6 仍需受控 UDP echo 目标。
 实验命令见 [`open-questions.md`](open-questions.md)，隧道分阶段规划见 [`tunnel-plan.md`](tunnel-plan.md)。
 
 学校差异（IDS 表单、滑块、SMS UI）只存在于浏览器/UI 适配层。协议层只接受：
