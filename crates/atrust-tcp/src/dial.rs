@@ -178,7 +178,7 @@ fn encode_dest_frame(target: &TunnelTarget) -> Result<Vec<u8>, DialTcpError> {
     }
 }
 
-/// After init+dest: skip `05 81` noise, require `53 00 <len> <payload containing OK>`.
+/// After init+dest: skip `05 81` noise, require `53 00 <len> <payload equal to OK>`.
 async fn wait_for_address_ok<S>(stream: &mut S) -> Result<(), DialTcpError>
 where
     S: AsyncRead + Unpin,
@@ -214,7 +214,7 @@ where
             event = "atrust_tcp.dial.address_response",
             payload_len = body.len()
         );
-        if body.windows(2).any(|w| w == b"OK") || is_status_ok(&body) {
+        if is_status_ok(&body) {
             return Ok(());
         }
         return Err(DialTcpError::AddressRejected {
@@ -373,6 +373,22 @@ mod tests {
             u16::from_be_bytes([frame[5], frame[6]]) as usize,
             json.len()
         );
+    }
+
+    #[tokio::test]
+    async fn address_status_requires_exact_ok_body() {
+        for body in [b"NOT OK".as_slice(), b"OKAY".as_slice()] {
+            let (mut client, mut server) = duplex(64);
+            let mut response = vec![0x53, 0x00];
+            response.extend_from_slice(&(body.len() as u16).to_be_bytes());
+            response.extend_from_slice(body);
+            server.write_all(&response).await.unwrap();
+
+            assert!(matches!(
+                wait_for_address_ok(&mut client).await,
+                Err(DialTcpError::AddressRejected { .. })
+            ));
+        }
     }
 
     #[tokio::test]

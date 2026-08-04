@@ -143,7 +143,7 @@ fn try_decode_app(read_buf: &mut Vec<u8>) -> Result<Decode, TunnelError> {
             }
             let body = read_buf[4..4 + len].to_vec();
             read_buf.drain(..4 + len);
-            if !body.windows(2).any(|w| w == b"OK") && body.as_slice() != b"OK" {
+            if body.as_slice() != b"OK" {
                 return Err(TunnelError::ProtocolError {
                     body: String::from_utf8_lossy(&body).into_owned(),
                 });
@@ -349,5 +349,19 @@ mod tests {
             try_decode_app(&mut frame).unwrap(),
             Decode::Closed
         ));
+    }
+
+    #[test]
+    fn data_phase_status_requires_exact_ok_body() {
+        for body in [b"NOT OK".as_slice(), b"OKAY".as_slice()] {
+            let mut frame = vec![0x53, 0x00];
+            frame.extend_from_slice(&(body.len() as u16).to_be_bytes());
+            frame.extend_from_slice(body);
+
+            assert!(matches!(
+                try_decode_app(&mut frame),
+                Err(TunnelError::ProtocolError { .. })
+            ));
+        }
     }
 }
