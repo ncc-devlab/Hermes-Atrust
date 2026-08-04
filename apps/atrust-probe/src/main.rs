@@ -307,6 +307,24 @@ enum Command {
         /// Refresh clientResource in the background while this L3 owner is alive.
         #[arg(long, default_value_t = 60)]
         resource_refresh_seconds: u64,
+        /// E7: keep the established session alive, then authorize a fresh flow.
+        #[arg(long, default_value_t = 0)]
+        hold_seconds: u64,
+        /// Heartbeat cadence while the session is alive.
+        #[arg(long, default_value_t = 25)]
+        heartbeat_seconds: u64,
+        /// E7 status sampling cadence during the hold.
+        #[arg(long, default_value_t = 60)]
+        status_interval_seconds: u64,
+        /// E8: number of distinct source-port flows authorized together.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..=64))]
+        concurrent_flows: u16,
+        /// E8: racing callers sharing each distinct flow.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..=64))]
+        callers_per_flow: u16,
+        /// Overall deadline for an E8 concurrency batch.
+        #[arg(long, default_value_t = 15)]
+        experiment_timeout_seconds: u64,
     },
 }
 
@@ -1009,7 +1027,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .with_tcp_handshake_timeout(Duration::from_secs(
                         handshake_timeout_seconds.max(1),
                     ))
-                    .with_endpoint_override(Some(endpoint_override)),
+                    .with_node_group_endpoint_override(
+                        node_group_id.clone(),
+                        Some(endpoint_override),
+                    ),
             )
             .await?;
             let events = report_events(runtime.events());
@@ -1141,6 +1162,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             connect_timeout_seconds,
             reply_timeout_seconds,
             resource_refresh_seconds,
+            hold_seconds,
+            heartbeat_seconds,
+            status_interval_seconds,
+            concurrent_flows,
+            callers_per_flow,
+            experiment_timeout_seconds,
         } => {
             // Everything below is assembly the runtime owns: this arm only
             // supplies diagnostics-specific choices (which node, which probe
@@ -1153,6 +1180,24 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 (_, None) => 0,
             };
+            let e8 = concurrent_flows > 1 || callers_per_flow > 1;
+            if (hold_seconds > 0 || e8) && !auth_only {
+                return Err("E7/E8 modes require --auth-only".into());
+            }
+            if (hold_seconds > 0 || e8) && matches!(probe, L3Probe::IcmpEcho) {
+                return Err(
+                    "E7/E8 require --probe tcp-syn or --probe udp for distinct flows".into(),
+                );
+            }
+            if hold_seconds > 0 && e8 {
+                return Err("run E7 hold and E8 concurrency as separate experiments".into());
+            }
+            let last_port_offset = concurrent_flows.saturating_sub(1);
+            if src_port.checked_add(last_port_offset).is_none()
+                || (hold_seconds > 0 && src_port.checked_add(1).is_none())
+            {
+                return Err("source-port range exceeds 65535".into());
+            }
             let session = match session_file.as_deref() {
                 Some(path) => restore_session(&client, transport.as_ref(), &endpoint, path).await?,
                 None => {
@@ -1228,10 +1273,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 material,
                 atrust_client::AtrustClientConfig::new(endpoint.clone(), tls_policy)
                     .with_connect_timeout(Duration::from_secs(connect_timeout_seconds.max(1)))
+                    .with_heartbeat_interval(Duration::from_secs(heartbeat_seconds.max(1)))
                     .with_resource_refresh_interval(Duration::from_secs(
                         resource_refresh_seconds.max(1),
                     ))
-                    .with_endpoint_override(Some(endpoint_override)),
+                    .with_node_group_endpoint_override(
+                        node_group_id.clone(),
+                        Some(endpoint_override),
+                    ),
             )
             .await?;
             // Subscribed before the first packet, so the establish and any VIP
@@ -1271,18 +1320,28 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // run leaves the node connection open and the gateway holding a
             // session it can only time out on its own.
             let outcome = tokio::select! {
-                result = run_l3_probe(
-                    &runtime,
-                    probe,
-                    target_ip,
-                    target_port,
-                    src_port,
-                    payload_bytes,
-                    auth_only,
-                    reply_timeout_seconds,
-                    node_port,
-                    cli.browser_trace_file.as_deref(),
-                ) => result,
+                result = async {
+                    if hold_seconds > 0 {
+                        run_l3_longevity(
+                            &runtime, probe, target_ip, target_port, src_port, payload_bytes,
+                            hold_seconds, status_interval_seconds, node_port,
+                            cli.browser_trace_file.as_deref(),
+                        ).await
+                    } else if e8 {
+                        run_l3_concurrency(
+                            Arc::clone(&runtime), probe, target_ip, target_port, src_port,
+                            payload_bytes, concurrent_flows, callers_per_flow,
+                            experiment_timeout_seconds, node_port,
+                            cli.browser_trace_file.as_deref(),
+                        ).await
+                    } else {
+                        run_l3_probe(
+                            &runtime, probe, target_ip, target_port, src_port, payload_bytes,
+                            auth_only, reply_timeout_seconds, node_port,
+                            cli.browser_trace_file.as_deref(),
+                        ).await
+                    }
+                } => result,
                 signal = tokio::signal::ctrl_c() => {
                     warn!(event = "probe.l3_session.interrupted");
                     signal.map_err(Into::into)
@@ -1346,6 +1405,275 @@ fn report_events(mut stream: atrust_client::EventStream) -> EventReporter {
         }
     });
     EventReporter { stop, task }
+}
+
+fn l3_probe_protocol(probe: L3Probe) -> FlowProtocol {
+    match probe {
+        L3Probe::IcmpEcho => FlowProtocol::Icmp,
+        L3Probe::TcpSyn => FlowProtocol::Tcp,
+        L3Probe::Udp => FlowProtocol::Udp,
+    }
+}
+
+fn build_l3_probe_packet(
+    probe: L3Probe,
+    vip: std::net::Ipv4Addr,
+    src_port: u16,
+    target_ip: std::net::Ipv4Addr,
+    target_port: u16,
+    payload_bytes: usize,
+) -> Vec<u8> {
+    match probe {
+        L3Probe::IcmpEcho => build_icmp_echo(vip, target_ip),
+        L3Probe::TcpSyn => build_tcp_syn(vip, src_port, target_ip, target_port),
+        L3Probe::Udp => build_udp_probe(vip, src_port, target_ip, target_port, payload_bytes),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_l3_longevity(
+    runtime: &atrust_client::AtrustClient,
+    probe: L3Probe,
+    target_ip: std::net::Ipv4Addr,
+    target_port: u16,
+    src_port: u16,
+    payload_bytes: usize,
+    hold_seconds: u64,
+    status_interval_seconds: u64,
+    node_port: u16,
+    trace_file: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let route = runtime
+        .route(
+            &target_ip.to_string(),
+            target_port,
+            l3_probe_protocol(probe),
+        )
+        .await
+        .ok_or("resource table does not authorize the E7 target")?;
+    let session = runtime.connect_node_group(&route.node_group_id).await?;
+    report_get_ip(session.get_ip(), node_port, trace_file)?;
+    let vip = session.vip();
+    let baseline = session.flow_auth_stats();
+    let first_packet =
+        build_l3_probe_packet(probe, vip, src_port, target_ip, target_port, payload_bytes);
+    let first = runtime.authorize_ipv4(&first_packet).await?;
+    if !Arc::ptr_eq(&session, &first.session) {
+        return Err("E7 initial authorization moved to another L3 session".into());
+    }
+
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_secs(hold_seconds);
+    let sample_every = Duration::from_secs(status_interval_seconds.max(1));
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        tokio::time::sleep((deadline - now).min(sample_every)).await;
+        let stats = session.flow_auth_stats();
+        info!(
+            event = "probe.e7.sample",
+            elapsed_seconds = started.elapsed().as_secs(),
+            session_closed = session.is_closed(),
+            tracked_flows = session.conntrack_len(),
+            auth_requests_sent = stats.requests_sent,
+            auth_in_flight = stats.in_flight,
+            dropped_packets = session.dropped_packets()
+        );
+        if session.is_closed() {
+            return Err("E7 session closed during the hold".into());
+        }
+    }
+
+    let final_port = src_port.checked_add(1).expect("validated E7 port range");
+    let final_packet = build_l3_probe_packet(
+        probe,
+        vip,
+        final_port,
+        target_ip,
+        target_port,
+        payload_bytes,
+    );
+    let final_flow = runtime.authorize_ipv4(&final_packet).await?;
+    let final_stats = session.flow_auth_stats();
+    let same_session = Arc::ptr_eq(&session, &final_flow.session);
+    let requests = final_stats.requests_sent - baseline.requests_sent;
+    let outcomes = final_stats.outcomes_received - baseline.outcomes_received;
+    let passed = same_session
+        && !session.is_closed()
+        && session.vip() == vip
+        && requests == 2
+        && outcomes == 2
+        && final_stats.timeouts == baseline.timeouts;
+    info!(
+        event = "probe.e7.result",
+        passed,
+        hold_seconds,
+        same_session,
+        vip = %vip,
+        wire_auth_requests = requests,
+        auth_outcomes = outcomes,
+        auth_timeouts = final_stats.timeouts - baseline.timeouts,
+        tracked_flows = session.conntrack_len()
+    );
+    append_probe_trace(
+        trace_file,
+        "e7_result",
+        json!({
+            "passed": passed,
+            "hold_seconds": hold_seconds,
+            "same_session": same_session,
+            "vip": vip.to_string(),
+            "wire_auth_requests": requests,
+            "auth_outcomes": outcomes,
+            "auth_timeouts": final_stats.timeouts - baseline.timeouts,
+        }),
+    )?;
+    if !passed {
+        return Err("E7 longevity criteria were not met".into());
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_l3_concurrency(
+    runtime: Arc<atrust_client::AtrustClient>,
+    probe: L3Probe,
+    target_ip: std::net::Ipv4Addr,
+    target_port: u16,
+    src_port: u16,
+    payload_bytes: usize,
+    concurrent_flows: u16,
+    callers_per_flow: u16,
+    timeout_seconds: u64,
+    node_port: u16,
+    trace_file: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let route = runtime
+        .route(
+            &target_ip.to_string(),
+            target_port,
+            l3_probe_protocol(probe),
+        )
+        .await
+        .ok_or("resource table does not authorize the E8 target")?;
+    let session = runtime.connect_node_group(&route.node_group_id).await?;
+    report_get_ip(session.get_ip(), node_port, trace_file)?;
+    let baseline = session.flow_auth_stats();
+    let baseline_flows = session.conntrack_len();
+    let total_callers = usize::from(concurrent_flows) * usize::from(callers_per_flow);
+    let barrier = Arc::new(tokio::sync::Barrier::new(total_callers + 1));
+    let mut tasks = tokio::task::JoinSet::new();
+
+    for flow_index in 0..concurrent_flows {
+        let flow_port = src_port
+            .checked_add(flow_index)
+            .expect("validated E8 port range");
+        let packet = build_l3_probe_packet(
+            probe,
+            session.vip(),
+            flow_port,
+            target_ip,
+            target_port,
+            payload_bytes,
+        );
+        for caller_index in 0..callers_per_flow {
+            let runtime = Arc::clone(&runtime);
+            let barrier = Arc::clone(&barrier);
+            let packet = packet.clone();
+            tasks.spawn(async move {
+                barrier.wait().await;
+                (
+                    flow_index,
+                    caller_index,
+                    runtime.authorize_ipv4(&packet).await,
+                )
+            });
+        }
+    }
+    barrier.wait().await;
+
+    let results = tokio::time::timeout(Duration::from_secs(timeout_seconds.max(1)), async {
+        let mut results = Vec::with_capacity(total_callers);
+        while let Some(result) = tasks.join_next().await {
+            results.push(result?);
+        }
+        Ok::<_, tokio::task::JoinError>(results)
+    })
+    .await
+    .map_err(|_| format!("E8 batch timed out after {timeout_seconds}s"))??;
+
+    let mut successful = 0usize;
+    let mut same_session = true;
+    let mut token_lengths = std::collections::HashMap::<u16, usize>::new();
+    for (flow_index, _caller_index, result) in results {
+        let sent = result?;
+        successful += 1;
+        same_session &= Arc::ptr_eq(&session, &sent.session);
+        match token_lengths.entry(flow_index) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(sent.connect_token_len);
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                if *entry.get() != sent.connect_token_len {
+                    return Err("E8 callers for one flow observed different token lengths".into());
+                }
+            }
+        }
+    }
+
+    let final_stats = session.flow_auth_stats();
+    let requests = final_stats.requests_sent - baseline.requests_sent;
+    let outcomes = final_stats.outcomes_received - baseline.outcomes_received;
+    let timeouts = final_stats.timeouts - baseline.timeouts;
+    let expected_requests = u64::from(concurrent_flows);
+    let expected_peak = u64::from(concurrent_flows.min(2));
+    let tracked_flows = session.conntrack_len() - baseline_flows;
+    let passed = successful == total_callers
+        && same_session
+        && requests == expected_requests
+        && outcomes == expected_requests
+        && timeouts == 0
+        && baseline.peak_in_flight == 0
+        && final_stats.peak_in_flight >= expected_peak
+        && tracked_flows == usize::from(concurrent_flows)
+        && token_lengths.values().all(|length| *length > 0);
+    info!(
+        event = "probe.e8.result",
+        passed,
+        concurrent_flows,
+        callers_per_flow,
+        submitted_callers = total_callers,
+        successful_callers = successful,
+        wire_auth_requests = requests,
+        auth_outcomes = outcomes,
+        auth_timeouts = timeouts,
+        peak_auth_in_flight = final_stats.peak_in_flight,
+        tracked_flows,
+        same_session
+    );
+    append_probe_trace(
+        trace_file,
+        "e8_result",
+        json!({
+            "passed": passed,
+            "concurrent_flows": concurrent_flows,
+            "callers_per_flow": callers_per_flow,
+            "submitted_callers": total_callers,
+            "successful_callers": successful,
+            "wire_auth_requests": requests,
+            "auth_outcomes": outcomes,
+            "auth_timeouts": timeouts,
+            "peak_auth_in_flight": final_stats.peak_in_flight,
+            "tracked_flows": tracked_flows,
+            "same_session": same_session,
+        }),
+    )?;
+    if !passed {
+        return Err("E8 concurrency criteria were not met".into());
+    }
+    Ok(())
 }
 
 /// Brings the node group up, sends one hand-built packet, and reports the reply.
