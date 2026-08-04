@@ -273,7 +273,7 @@ impl AtrustClient {
         snapshot: &ResourceSnapshot,
         node_group_id: &str,
     ) -> Result<Arc<L3SessionManager>, ClientError> {
-        let endpoints = self.endpoints_for(&snapshot, node_group_id);
+        let endpoints = self.endpoints_for(snapshot, node_group_id);
         if endpoints.is_empty() {
             return Err(ClientError::NoEndpoints {
                 node_group_id: node_group_id.to_owned(),
