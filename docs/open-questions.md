@@ -751,13 +751,41 @@ timeout 会在 `0x03` 到达前先报超时，E9 必须使用至少 20 秒。两
 | [E5](#e5) | `0x94` 分支与 token 长度（[A1](#a1)、[A3](#a3)、[A4](#a4)） | E3 判定通过 | **否** |
 | **[E9](#e9)** | **服务端是否按 `appId` 裁决（[C1](#c1)，已完成）** | E2 的分歧清单 | **否** |
 
-**接 TUN 前还欠的三关**（尚未展开成实验条目）：
+**接 TUN 前还欠的三关：**
 
 - **E6 — 大包 / MTU / token 分支。** E5 只证明了 44 字节；[A1](#a1) 的 `n > 4096` 区间和
-  整个 token 分支**一次都没被触发过**。需要 `--payload-bytes` 与一个 UDP 探针
-  （ICMP 走不通，见下方 C2 的 `0x82`）。上行受 MTU 1400 约束不会越界，**下行没有保证**；
+  整个 token 分支**一次都没被触发过**。UDP 探针与 `--payload-bytes` 已实现，live 尚待一个
+  资源表授权且会原样回显 datagram 的 UDP echo 目标；
 - **E7 — 长会话存活。** 25 秒心跳是 zju-connect 的常量（[B4](#b4)），西电容忍窗口未知；
 - **E8 — 并发多流。** conntrack 驱逐、并发授权去重、waiter map 目前**只有 mock 覆盖**。
+
+### E6 — UDP 大包、MTU 与 `0x94` 分支 <a id="e6"></a>
+
+`--payload-bytes N` 中的 `N` 只计算 UDP application payload，不含 8 字节 UDP 头和 20 字节
+IPv4 头；缺省为 32，合法范围 `0..=65507`，用于非 UDP 探针会直接报错。payload 是确定性字节序列，
+回包必须满足反向地址/端口、IP/UDP 长度、checksum 和 payload 全部一致；UDP 超时、连接提前关闭、
+畸形或内容不符都会让命令非零退出。因此该实验必须使用**受控 UDP echo**，不能拿 DNS 之类的普通
+UDP 服务替代。
+
+```bash
+./target/debug/atrust-probe --host atrust.xidian.edu.cn --insecure-tls \
+  --log-file /tmp/e6-1372.log \
+  l3-session --session-file ~/.hermes/xidian-session.json \
+  --node 61.150.43.94:441 --target <AUTHORIZED_ECHO_IP>:<PORT> \
+  --probe udp --payload-bytes 1372 --src-port 40000 \
+  --connect-timeout-seconds 20 --reply-timeout-seconds 10
+```
+
+第一档 `1372 + 8 + 20 = 1400`，正好覆盖计划中的 TUN MTU；随后从较小值逐步二分到路径上限。
+`4068` payload 产生 4096 字节 IP 包，是 length-prefixed 判别的最后边界；`4069` 产生 4097 字节，
+但远超 MTU 1400，且当前探针设置 DF，所以**不能把它当普通上行 echo 用例**。要触发大于 4096 的下行，
+应让受控服务用一个小请求生成大响应；在实现 IP 分片重组前，分片回包同样不能判读为 framing 结论。
+每档检查 `l3.data_layout_observed`、`packet_sent/received` 与退出状态，不得仅以「授权成功」判定 E6 成功。
+
+**2026-08-04 live 预检：** 对资源表明确覆盖的 `202.117.112.9:53/udp` 使用
+`--payload-bytes 1372 --auth-only`，VIP `10.210.29.114`，flow auth 成功并返回 32 字节
+connect token。这只证明 UDP 路由、五元组和 `0x13` 授权路径可用；`auth-only` 没有发送 datagram，
+因此不能据此声称 1400 MTU、echo 校验或 `0x94` 分支已通过。完整 E6 仍等受控 echo 目标。
 
 **关于 `10.255.57.11`：它外网不可达是预期的，不构成阻塞。** 它是内网侧地址，
 真正的问题不是「能不能直连它」，而是「Hermes 会不会默认选中它」——由 [E1](#e1) 回答。

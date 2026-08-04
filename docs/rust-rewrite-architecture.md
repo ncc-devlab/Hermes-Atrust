@@ -286,7 +286,8 @@ cargo run -p atrust-probe -- \
   重建连接并自动重试一次；并发同流合并为一次 `0x13`）；
 - ~~`0x14` 编码 / 下行 `0x94` 双格式 / 心跳请求常量~~；~~读循环与心跳任务~~（已接，25s）；
 - ~~IPv4 包五元组解析~~（`atrust-l3::parse_ipv4_flow`，按 IHL 定位传输层）；
-- ICMP、UDP、TCP 的逐阶段真实联调（`atrust-probe l3-session --probe icmp-echo|tcp-syn`）；
+- ICMP、UDP、TCP 的逐阶段真实联调（`atrust-probe l3-session --probe icmp-echo|udp|tcp-syn`；
+  UDP 支持 `--payload-bytes` 并校验 echo 回包）；
 - second VIP（`0x96` 已能解出并记录，未主动请求）和 IPv6 能力确认。
 
 ### 上层接入
