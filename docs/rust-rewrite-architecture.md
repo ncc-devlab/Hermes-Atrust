@@ -12,12 +12,19 @@ application
           -> atrust-protocol
           -> hermes-transport
           -> hermes-model
+          -> hermes-events
 ```
+
+`hermes-events` 横跨 auth 与 l3，因此不能放进任何一侧；它也不放进 `hermes-model`，
+后者的职责是「无异步依赖的强类型」，而事件总线需要 `tokio::sync`。
 
 当前已经落地：
 
 - `hermes-model`：经过校验的公共强类型和敏感值封装；
 - `atrust-protocol`：纯线协议 JSON 和签名基础，不包含网络、配置、日志或异步运行时。
+- `hermes-events`：统一运行时事件流（`EventBus` / `HermesEvent`）。发布**非阻塞、不可失败、
+  可丢弃**，因此可以从 L3 读循环里调用；订阅者落后时收到 `Lagged { skipped }` 而不是静默缺口。
+  事件不含任何凭据，只报 `connectToken` 的**长度**（[A1](open-questions.md#a1) 依赖它）；
 - `hermes-logging`：应用入口使用的统一 `tracing` 订阅器，支持 compact 与 JSON 输出；
 - `hermes-transport`：可替换的异步 HTTP 接口、受限响应读取和显式 TLS 策略；
 - `atrust-auth`：`authConfig`、RSA 密码主认证、CAS challenge 和严格回调校验；
@@ -27,7 +34,14 @@ application
   收割和全保真 trace（`0600`，见强制边界 12）；
 - `atrust-tcp`：单连接 TCP 隧道握手和帧化 I/O；
 - `atrust-l3`：Get-IP、conntrack/`connectToken`、每流 `0x13` 帧组装；全双工读循环 / TUN 未做；
-- `atrust-probe`：组合上述库进行真实对端诊断，不再拥有浏览器协议实现。
+- `atrust-client`：**装配层**。`atrust-auth` 与 `atrust-l3` 互不依赖，两者之间的接线
+  （路由一个包 → 选节点组 → 拥有重连 → 保持资源表新鲜 → 让 manager 跟上每个代际）此前
+  不属于任何 crate，只存在于 `atrust-probe` 的一个 match arm 里，没有第二个消费者能复用，
+  也没有测试覆盖。现在它是 `AtrustClient`，并额外提供 CLI arm 给不了的三样东西：
+  **观察**（一条 `hermes-events` 流）、**控制**（`refresh_resources` / `reconnect` /
+  `shutdown`）、**包入口**（`send_ipv4` / `authorize_ipv4` / `connect_node_group`）。
+  仍然不含 TUN、DNS、路由和登录——认证由调用方完成，本类型从已认证的 `SessionMaterial` 起步；
+- `atrust-probe`：组合上述库进行真实对端诊断，不再拥有浏览器协议实现，也不再自己装配数据面。
 
 只有存在实际实现时才新增 crate，禁止先创建无职责的空壳模块。
 
@@ -84,13 +98,22 @@ cargo test --workspace
 **完整登记（含二义区间、误判症状、判定实验和命令）见
 [`open-questions.md`](open-questions.md)。** 本节只保留结论条目。
 
+同一批实测结果**面向服务端实现者的转写**见
+[`server-behaviour-inferences.md`](server-behaviour-inferences.md)：它把「客户端观察到什么」
+翻译成「服务端需要表现出什么行为」，供 `Hermes-aTrust-Server` 逐条对照。
+该文档是本仓库的产物，对那个项目只读。
+
 以下事实未经真实对端和抓包确认前，不得当作稳定协议继续向上封装：
 
 1. ~~Go Get-IP 请求中的 `0x0053` 是否为固定值，还是应由 SID JSON 长度动态计算~~
    **已决（2026-07-31，zju-connect 对照）：动态。** `authTunnel::wrapAuthReqData` 动态计算，
    `getIP` 写死的 `0x0053`=83 只是 73 字符 SID 的巧合。Hermes 的动态实现正确；
 2. ~~L3 `0x94` 下行双格式判别~~（已决：body 首 `u16-be n`，`0 < n ≤ 4096` → 长度前缀，否则 token 帧；见 `atrust-protocol::l3_frame`）；
-3. SignKey 是客户端生成、服务端下发还是经其它接口注册，以及它与 SID 的绑定关系；
+3. ~~SignKey 是否被服务端硬校验~~ **已决（2026-08-04，E3 + E3b）：西电两条路径都不校验。**
+   TCP init（E3，2026-07-31）与 L3 `0x13`（E3b）分别做过坏 key 负对照，均仍然通过；
+   E3b 另用新 flow key 复跑以排除服务端缓存授权。L3 auth JSON 不含 `signKey` 字段，
+   因此「first-write 学习」模型在该路径上不可能成立。**临时随机 SignKey 不再是阻塞项。**
+   仍未决的是是否存在独立注册接口，以及该结论能否外推到其他网关（见 open-questions B1）；
 4. second VIP 的请求条件和用途。addrType=5 的 VIP 帧同时带 IPv4 与 IPv6，
    `0x16`/`0x96` 是独立的 second-VIP 请求/响应对——两者关系仍未确认；
 5. ~~L3 flow key 是否必须包含协议号~~ **已决：不含。** zju-connect `connTrackKey` =
@@ -128,7 +151,7 @@ authConfig                              [已完成]
 → TCP 帧 codec                          [已实现]
 → TCP DialTCP 握手 + 应用帧             [已实现；对公网参考服务端 live 打通]
 → L3 帧 codec + IPv4 包解析             [已实现]
-→ L3 全双工会话（Get-IP→鉴权→数据）    [已实现；仅 mock 对端验证，无任何 live]
+→ L3 全双工会话（Get-IP→鉴权→数据）    [已实现；西电真机 live 打通 2026-08-03/04]
 ```
 
 **控制面里程碑已闭环（2026-07-27）。数据面探测已接上（2026-07-28）。数据面 TCP 隧道已 live
@@ -139,15 +162,18 @@ authConfig                              [已完成]
 且**任何 SNI 都会让节点静默不响应**。这两条见 [`open-questions.md`](open-questions.md) D1/D2。
 后果是**西电 live 验证不再需要进校**，实验序列 E1–E5 见同一文档。Phase C 已用 `atrust-probe tcp-dial` 对
 `Hermes-aTrust-Server` 完成 psw 登录 → SID 导出 → 握手 → 应用数据回环 → 关闭的端到端验证；
-证实帧与该服务端逐字节互通。注意「临时随机 SignKey 模型成立」只在那个**重建**服务端上成立，
-属于循环论证，西电是否硬校验由实验 E3 判定。**西电真机数据面仍待实测对照**（SID/SignKey
-绑定、`0x0053` 长度语义；`0x94` 双格式见 `atrust-protocol::l3_frame` 与 open-questions A1）。
+证实帧与该服务端逐字节互通。此前「临时随机 SignKey 模型成立」只在那个**重建**服务端上成立，
+属于循环论证；**该循环已于 2026-08-04 由 E3/E3b 在西电真机上打破**（两条路径均不校验）。
+残留待测项：`0x0053` 长度语义需要一个长度 ≠ 73 的 SID 才有区分力（open-questions B2）。
 
-**L3 离线件已到里程碑边界（2026-07-31）：** `atrust-l3::L3Session` 打通「Get-IP → 五元组鉴权 →
-IPv4 包往返 → 关闭」，诊断入口 `atrust-probe l3-session`。**但它一次真实对端都没跑过**——
-覆盖它的 `mock_session.rs` 是照着参考服务端源码写的，因此只能证明实现自洽，不能证伪
-对帧格式的理解。下一步的 live 顺序不变，但**已不再被地理位置阻塞**：资源表重叠量化（E2，离线）
-→ SignKey 是否真被校验（E3，1 号闸门）→ Get-IP 复跑（E4）→ 才谈 L3 live（E5）。
+**L3 已对西电真机 live（2026-08-03 E9 / 2026-08-04 E3b、E5 复核）。** `atrust-l3::L3Session`
+的「Get-IP → 五元组鉴权 → IPv4 包往返 → 关闭」全程在真实网关上跑通：VIP `10.210.29.x`
+（`addrType=1`，6 字节），`connect_token_len=32`，下行 `0x94` 走长度前缀分支，
+TCP SYN → 44 字节应答回环成功，未出现未知命令。**因此 `mock_session.rs` 不再是唯一依据**——
+它此前只能证明实现自洽，现在帧格式的理解已被真机证伪过一轮。
+
+E1–E5、E9、E3b 均已完成，1 号闸门（SignKey）已解除。接 TUN 之前剩下的是 E6（大包／
+token 分支／MTU）、E7（长会话存活）、E8（并发多流），三者都需要先补探针能力。
 实验命令见 [`open-questions.md`](open-questions.md)，隧道分阶段规划见 [`tunnel-plan.md`](tunnel-plan.md)。
 
 学校差异（IDS 表单、滑块、SMS UI）只存在于浏览器/UI 适配层。协议层只接受：
@@ -249,8 +275,12 @@ cargo run -p atrust-probe -- \
 - ~~Get-IP codec（动态 SID JSON 长度；`05 d0` / `53 00` / 地址循环）~~；`53 00` body 已保留进
   `GetIpv4Response::status_bodies` 并落 trace；Xidian live 待复跑（`atrust-probe get-ip --session-file`）；
 - ~~SID 总连接（Get-IP 之后）长连接保持与重连~~（`atrust-l3::L3Session` 驱动读/写/心跳，
-  `L3SessionManager` 按节点组拥有会话；closed 最多重连 5 次，auth timeout 作废连接后重试 1 次）；
-  多节点组的全局 manager cache 仍待上层按需组合；
+  `L3SessionManager` 按节点组拥有会话；closed 最多重连 5 次，auth timeout 作废连接后重试 1 次；
+  建连失败或连接失效时在同组可达端点间轮转）；
+- ~~按 `nodeGroupId` 缓存 manager~~（`L3SessionManagerCache` 作用域绑定一套 SID/TLS 配置；资源刷新会
+  更新已有 manager 的候选并关闭已删除组，健康连接不因排序变化而中断）；
+- ~~`clientResource` 定期刷新与原子发布~~（`ResourceCache` 同时代际化资源正文与 `ResourceIndex`；
+  失败保留 last-known-good；`atrust-probe l3-session` 默认每 60 秒刷新，可配置）；
 - ~~按五元组鉴权 JSON（`tcp:` 无 `//`）、conntrack 表、connectToken 状态机~~
   （`atrust-protocol::l3_auth` + `atrust-l3::{conntrack,auth,session,manager}`；8s 超时后由 manager
   重建连接并自动重试一次；并发同流合并为一次 `0x13`）；

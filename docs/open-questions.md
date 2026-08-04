@@ -5,6 +5,12 @@
 
 任何 live 失败在归因到「实现 bug」之前，先在本表里找是否已有对应条目。
 
+**给服务端实现者：** 本文按「客户端还不确定什么」组织。若你要的是
+「一台服务端需要表现出什么行为才能与真实客户端互通」，读
+[`server-behaviour-inferences.md`](server-behaviour-inferences.md)——
+同一批实测结果，按服务端视角重写，并标出了与 `Hermes-aTrust-Server`
+现有 `docs/protocol.md` 的分歧点。
+
 ## 依据强度分级
 
 | 级别 | 含义 |
@@ -65,7 +71,12 @@ n = u16::from_be(body[0..2])
 下行 `data_resp layout=length_prefixed`（TCP SYN 应答 44 字节 IP 包）。
 未见 `connect_token_ambiguous`。**A1 在西电首样本上成立。**
 
-**判定实验：** [E5](#e5)——token 长度已决；大包/token 分支样本仍待。
+**L0 第二样本（2026-08-04，经 `atrust-client` 门面回环）：** 目标
+`202.117.115.138:80`，另一个 `appId`、另一个会话、另一个 VIP，仍是
+`connect_token_len=32`、下行 `layout=length_prefixed`（44 字节 TCP 应答），
+无 `connect_token_ambiguous`、无 `ignored_command`。两个独立样本都落在安全区间。
+
+**判定实验：** [E5](#e5)——token 长度已决；大包/token 分支样本仍待（[E6](#e6)）。
 
 **已加固（2026-07-31）：** `L3Session` 拿到 `connectToken` 时若长度 < 17
 （`MIN_UNAMBIGUOUS_CONNECT_TOKEN`）立即发 `connect_token_ambiguous` WARN，
@@ -192,10 +203,23 @@ Hermes 现在用一个临时随机 SignKey，对参考服务端能打通——�
 **西电当前不硬校验 TCP init 的 HMAC**（或等价于未绑定 + 不学习）。
 临时随机 SignKey 模型在西电 TCP 路径上**不阻塞**；[B1](#b1) 降级为非阻塞。
 
-**仍未决：** 是否存在独立注册接口；L3 `0x13` 路径是否与 TCP 不同策略
-（E5 用同一 provisional key 的 L3 flow auth 已成功，至少「随机 key + HMAC 可算」可过）。
+**L0（2026-08-04 E3b）：L3 `0x13` 路径同样不校验 HMAC。** 同一 CAS 会话下，正确 key
+与仅翻转 `sign_key_hex` 首字符的坏 key 都返回了 32 字节 connect token；换新源端口
+（新 flow key）重跑坏 key 仍然授权，排除了「命中服务端对上一次的缓存授权」。
 
-**判定实验：** [E3](#e3)——已跑；L3 侧见 [E5](#e5)。
+**因此 [B1](#b1) 整体降级为非阻塞。** 临时随机 SignKey 模型在西电的 TCP 与 L3 两条路径上
+都不阻塞，E5/E6 可以推进。
+
+**仍未决：** 是否存在独立注册接口。注意 L3 auth JSON **不携带 `signKey` 字段**
+（唯一签名相关字段是 `xRequestSig`），所以参考服务端那套「从 wire JSON 的 `signKey`
+first-write-wins 学习」的模型在这条路径上**不可能成立**——服务端根本收不到 key。
+剩下的可能只有「未绑定且不校验」，或者「绑定了别的 key 但不校验」。
+
+**这个结论只覆盖西电，且只覆盖当前配置。** 它是「服务端没开这道校验」，不是
+「协议不需要签名」。另一个网关、或西电改配置后，同样的坏 key 会立刻失败，
+而症状会伪装成帧格式问题——这正是当初把它列为 1 号闸门的理由。
+
+**判定实验：** TCP 侧见 [E3](#e3)；L3 侧见 [E3b](#e3b)。两者均已完成。
 
 ### B2 — Get-IP 请求中的 `0x0053` <a id="b2"></a>
 
@@ -229,7 +253,34 @@ flow key 里是 `4`。两者都是经验值。
 
 `L3SessionManager` 现在拥有节点组的一条可重建会话：连接关闭时最多重连 5 次；8 秒 flow-auth
 超时会作废整条连接、重新 Get-IP 和鉴权一次。显式策略拒绝、坏帧和配置错误不重试。
+建连类瞬时失败和连接失效会轮转到同组下一可达端点；显式 `--node` 仍固定单点。
+`L3SessionManagerCache` 按 `nodeGroupId` 复用 manager，且只在同一 SID/TLS 作用域内共享。
 这与 zju-connect 的边界一致，同时保持 TUN、DNS 和系统路由在管理器之外。
+
+### B7 — 网关会话寿命与失效信号 <a id="b7"></a>
+
+**依据：L0（2026-08-03 实测一次）。**
+
+15:16 保存的 CAS 会话在 18:56 复用时被拒：`code 75500002 / "The session is invalid"`。
+因此**寿命上界 < 3 小时 40 分**；是绝对 TTL 还是空闲超时**未区分**——两次使用之间没有
+任何请求，两种模型都能解释这次观测。区分实验：保存后每 30 分钟打一次 `onlineInfo`，
+看它能否延到 3.7 小时以上。
+
+**实现后果（已处理）：** 同一个业务码会经由两个不同的错误类型到达调用方——`authConfig`
+报 `AuthError::AuthenticationRejected`，`clientResource` 报 `AuthError::Resource(Rejected)`，
+`AuthError::is_session_invalid()` 同时识别两者。`ResourceCache` 据此把它**升级**为
+`HermesEvent::SessionInvalidated` 而不是计入连续失败计数：重试永远修不好它，而一个只会
+反复 `warn` 的刷新循环会让整个运行时停在一张只会越来越旧的资源表上。
+
+**对实验纪律的影响：** 任何需要正负对照的实验（[E3](#e3)、[E3b](#e3b)）必须在同一个会话里
+连续跑完，中间不能夹一次重新登录。
+
+### B6 — 资源定期刷新（已实现，刷新周期仍需 live 调优） <a id="b6"></a>
+
+`ResourceCache` 原子发布同一响应生成的 `ClientResources + ResourceIndex`，刷新失败时保留最后一次
+成功代际。L3 的刷新通知会更新已有节点组 manager 的后续重连候选，并驱逐服务端已删除的节点组；
+不会仅因候选排序变化中断健康会话。当前默认周期 60 秒是客户端策略，服务端没有声明 TTL，仍需
+通过长会话观察请求成本、策略生效延迟和会话过期行为。
 
 ---
 
@@ -512,6 +563,78 @@ chmod 600 ~/.hermes/xidian-session-badsig.json
 
 **跑完立即删除** `xidian-session-badsig.json`。
 
+### E3b — L3 `0x13` 是否校验 HMAC（[B1](#b1) 的另一半） <a id="e3b"></a>
+
+**为什么不能沿用 E3 的结论：** E3 测的是 TCP init 的签名，L3 flow auth 是另一段 JSON、
+另一个签名覆盖范围，服务端可以只在一侧启用校验。E5 只有正样本，不具备区分力。
+
+**判据选 `l3-session --auth-only` 而不是 `tcp-dial`：** 它在 2026-08-03 的 E9 里有一次
+**同日正样本**（`202.117.112.71:8081` + `316772f0…` 返回了 connect token），一次往返约
+1 秒，且把「鉴权」与「数据面」隔开，失败原因唯一。
+
+```bash
+# A 组：正确的 SignKey（正对照，应当返回 connect token）
+./target/debug/atrust-probe --host atrust.xidian.edu.cn --insecure-tls \
+  --log-file /tmp/e3b-good.log \
+  l3-session --session-file ~/.hermes/xidian-session.json \
+  --node 61.150.43.94:441 --target 202.117.112.71:8081 \
+  --probe tcp-syn --auth-only --connect-timeout-seconds 20
+
+# B 组：同一会话，只翻转 sign_key_hex 的首字符
+python3 - <<'EOF'
+import json, pathlib
+p = pathlib.Path.home() / ".hermes/xidian-session.json"
+d = json.loads(p.read_text())
+k = d["sign_key_hex"]
+d["sign_key_hex"] = ("1" if k[0] == "0" else "0") + k[1:]
+out = p.with_name("xidian-session-badsig.json")
+out.write_text(json.dumps(d)); out.chmod(0o600)
+EOF
+
+./target/debug/atrust-probe --host atrust.xidian.edu.cn --insecure-tls \
+  --log-file /tmp/e3b-bad.log \
+  l3-session --session-file ~/.hermes/xidian-session-badsig.json \
+  --node 61.150.43.94:441 --target 202.117.112.71:8081 \
+  --probe tcp-syn --auth-only --connect-timeout-seconds 20
+
+rm -f ~/.hermes/xidian-session-badsig.json
+grep -E "flow_authorized|flow_rejected|auth status" /tmp/e3b-good.log /tmp/e3b-bad.log
+```
+
+**判读表：**
+
+| A 组 | B 组 | 结论 |
+|---|---|---|
+| 授权 | 拒绝 | **L3 硬校验 HMAC。** provisional key 模型在 L3 上不成立，SignKey 来源变成 L3 的阻塞项 |
+| 授权 | 授权 | **L3 也不校验。** [B1](#b1) 整体降级为非阻塞，E5/E6 可以放心推进 |
+| 拒绝 | 拒绝 | **不可判读**（会话过期 / appId 不再覆盖 / 节点不可达），先修再重跑 |
+| 拒绝 | 授权 | 实验有误，检查是否用错了文件 |
+
+**实测结果（L0，2026-08-04，会话保存于 10:40，三次运行均在 02:44–02:48 UTC 内）：**
+
+| 组 | SignKey | flow key | 结果 |
+|---|---|---|---|
+| A | 正确 | `4:10.210.29.114:40000-202.117.112.71:8081` | 授权，`connect_token_len=32` |
+| B | 首字符翻转（`0`→`1`，其余 63 字符相同） | 同 A | 授权，`connect_token_len=32` |
+| C | 同 B | `…:40077-…`（新源端口） | 授权，`connect_token_len=32` |
+
+**C 组是必须的。** A 与 B 用了完全相同的五元组，若服务端对该 flow 有缓存授权，
+B 的成功就无法归因到「不校验」。换源端口后仍然授权，该解释被排除。
+
+**判据具备区分力，不是「什么都放行」：** [E9](#e9) 已证明同一条 L3 auth 路径会拒绝——
+无关 `appId` 立刻返回 `auth status 0x82`。所以这里的两次通过是真的通过。
+
+**结论：成功/成功 → 西电 L3 不硬校验 HMAC。** 记入 [B1](#b1)。
+
+**验证过的实现前提：** `restore_session` 走 `StoredSession::to_material()`，其中
+`SignKey::from_hex(&self.sign_key_hex)` 直接取文件里的值——不会在恢复时重新生成
+provisional key。若走的是 CAS/密码登录路径（`build_session_material`），key 是新随机的，
+这个实验就不成立。
+
+**两组必须在同一个会话里连续跑完。** 网关会话寿命实测 < 3.7 小时
+（2026-08-03：15:16 保存的会话在 18:56 复用时返回 `75500002 / The session is invalid`），
+中间隔一次重新登录就等于换了变量。
+
 ### E4 — VIP 帧真实布局（[A2](#a2)） <a id="e4"></a>
 
 一次 TLS 连接的代价，不启动 L3 会话、不动 TUN／DNS／路由。
@@ -622,7 +745,8 @@ timeout 会在 `0x03` 到达前先报超时，E9 必须使用至少 20 秒。两
 |---|---|---|---|
 | [E1](#e1) | 节点组原始形态与两个端点来源（[D1](#d1)） | 人工 CAS 登录 | **否** |
 | [E2](#e2) | 资源表重叠量化（[C1](#c1)） | E1 的 `--save-body` | **否**（纯离线） |
-| [E3](#e3) | SignKey 是否真被校验（[B1](#b1)） | E1、E2 | **否** |
+| [E3](#e3) | SignKey 是否真被校验，TCP 侧（[B1](#b1)，已完成） | E1、E2 | **否** |
+| [E3b](#e3b) | SignKey 是否真被校验，L3 `0x13` 侧（[B1](#b1)，已完成） | 一个新鲜会话 | **否** |
 | [E4](#e4) | VIP 帧真实布局（[A2](#a2)、[A5](#a5)） | E1 | **否** |
 | [E5](#e5) | `0x94` 分支与 token 长度（[A1](#a1)、[A3](#a3)、[A4](#a4)） | E3 判定通过 | **否** |
 | **[E9](#e9)** | **服务端是否按 `appId` 裁决（[C1](#c1)，已完成）** | E2 的分歧清单 | **否** |
