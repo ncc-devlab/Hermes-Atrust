@@ -35,4 +35,9 @@ pub struct NodeGroupStats {
     /// `atrust_l3::L3_CONNTRACK_CAPACITY`; a value pinned at the cap means the
     /// table is thrashing rather than merely busy.
     pub tracked_flows: usize,
+    pub flow_auth_requests_sent: u64,
+    pub flow_auth_outcomes_received: u64,
+    pub flow_auth_timeouts: u64,
+    pub flow_auth_in_flight: u64,
+    pub flow_auth_peak_in_flight: u64,
 }

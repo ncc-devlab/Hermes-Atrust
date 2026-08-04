@@ -103,6 +103,7 @@ impl AtrustClient {
             Arc::clone(&managers),
             config.gateway.clone(),
             config.endpoint_override.clone(),
+            config.endpoint_override_node_group_id.clone(),
         );
 
         let snapshot = resources.snapshot().await;
@@ -172,12 +173,18 @@ impl AtrustClient {
         let mut groups = Vec::new();
         for manager in self.managers.managers() {
             let session = manager.current_session().await;
+            let auth = session.as_ref().map(|session| session.flow_auth_stats());
             groups.push(NodeGroupStats {
                 node_group_id: manager.node_group_id().to_owned(),
                 vip: manager.last_vip().await,
                 connected: session.is_some(),
                 dropped_packets: session.as_ref().map_or(0, |s| s.dropped_packets()),
                 tracked_flows: session.as_ref().map_or(0, |s| s.conntrack_len()),
+                flow_auth_requests_sent: auth.map_or(0, |stats| stats.requests_sent),
+                flow_auth_outcomes_received: auth.map_or(0, |stats| stats.outcomes_received),
+                flow_auth_timeouts: auth.map_or(0, |stats| stats.timeouts),
+                flow_auth_in_flight: auth.map_or(0, |stats| stats.in_flight),
+                flow_auth_peak_in_flight: auth.map_or(0, |stats| stats.peak_in_flight),
             });
         }
         groups.sort_by(|left, right| left.node_group_id.cmp(&right.node_group_id));
@@ -289,7 +296,12 @@ impl AtrustClient {
         snapshot: &ResourceSnapshot,
         node_group_id: &str,
     ) -> Vec<L3NodeEndpoint> {
-        if let Some(override_endpoints) = &self.config.endpoint_override {
+        let override_matches = self.config.endpoint_override_node_group_id.as_deref()
+            == Some(node_group_id)
+            || (self.config.endpoint_override_node_group_id.is_none()
+                && snapshot.resources().node_groups.len() == 1
+                && snapshot.resources().node_groups[0].id == node_group_id);
+        if override_matches && let Some(override_endpoints) = &self.config.endpoint_override {
             return override_endpoints.clone();
         }
         snapshot
@@ -487,6 +499,7 @@ impl Reconciler {
         managers: Arc<L3SessionManagerCache>,
         gateway: hermes_model::GatewayEndpoint,
         endpoint_override: Option<Vec<L3NodeEndpoint>>,
+        endpoint_override_node_group_id: Option<String>,
     ) -> Self {
         let (stop, mut stop_rx) = watch::channel(false);
         let task = tokio::spawn(async move {
@@ -497,14 +510,22 @@ impl Reconciler {
                             break;
                         }
                         let snapshot = Arc::clone(&updates.borrow_and_update());
-                        let groups = snapshot
-                            .resources()
-                            .resolve_node_groups(&gateway)
+                        let resolved_groups = snapshot.resources().resolve_node_groups(&gateway);
+                        let apply_unbound_override = endpoint_override_node_group_id.is_none()
+                            && resolved_groups.len() == 1;
+                        let groups = resolved_groups
                             .into_iter()
                             .map(|group| {
-                                let endpoints = match &endpoint_override {
-                                    Some(endpoints) => endpoints.clone(),
-                                    None => group
+                                let endpoints = match (
+                                    &endpoint_override_node_group_id,
+                                    &endpoint_override,
+                                ) {
+                                    (Some(override_group), Some(endpoints))
+                                        if override_group == &group.id => endpoints.clone(),
+                                    (None, Some(endpoints)) if apply_unbound_override => {
+                                        endpoints.clone()
+                                    }
+                                    _ => group
                                         .endpoints
                                         .into_iter()
                                         .map(|endpoint| {
@@ -619,6 +640,15 @@ mod tests {
         }
     }
 
+    fn multi_group_resource_response() -> HttpResponse {
+        HttpResponse {
+            status: 200,
+            location: None,
+            body: br#"{"code":0,"data":{"appList":{"data":{"config":{"nodeGroupConf":{"nodeGroupList":[{"id":"group-1","addressInfo":[{"address":"advertised-1.test:441","addressType":"domain"}]},{"id":"group-2","addressInfo":[{"address":"advertised-2.test","port":"8443","addressType":"domain"}]}]}}}},"sdpPolicy":{"data":{}}}}"#
+                .to_vec(),
+        }
+    }
+
     fn configuration() -> AuthConfiguration {
         AuthConfiguration {
             login_state: atrust_auth::LoginState::LoggedIn,
@@ -670,6 +700,64 @@ mod tests {
         AtrustClient::start(auth, configuration(), material(), config)
             .await
             .expect("client starts")
+    }
+
+    #[tokio::test]
+    async fn endpoint_override_only_applies_to_its_node_group() {
+        let transport = Arc::new(QueueTransport {
+            responses: StdMutex::new(VecDeque::from(vec![multi_group_resource_response()])),
+        });
+        let gateway = GatewayEndpoint::new("gateway.test", 443).expect("gateway");
+        let auth = Arc::new(AuthClient::new(gateway.clone(), transport));
+        let config = AtrustClientConfig::new(gateway, TlsPolicy::Verify)
+            .with_resource_refresh_interval(Duration::from_secs(3600))
+            .with_node_group_endpoint_override(
+                "group-1",
+                Some(vec![L3NodeEndpoint::new("override.test".to_owned(), 9443)]),
+            );
+        let client = AtrustClient::start(auth, configuration(), material(), config)
+            .await
+            .expect("client starts");
+        let snapshot = client.resources().await;
+
+        assert_eq!(
+            client.endpoints_for(&snapshot, "group-1"),
+            vec![L3NodeEndpoint::new("override.test".to_owned(), 9443)]
+        );
+        assert_eq!(
+            client.endpoints_for(&snapshot, "group-2"),
+            vec![L3NodeEndpoint::new("advertised-2.test".to_owned(), 8443)]
+        );
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn legacy_unbound_override_does_not_pollute_multiple_groups() {
+        let transport = Arc::new(QueueTransport {
+            responses: StdMutex::new(VecDeque::from(vec![multi_group_resource_response()])),
+        });
+        let gateway = GatewayEndpoint::new("gateway.test", 443).expect("gateway");
+        let auth = Arc::new(AuthClient::new(gateway.clone(), transport));
+        let config = AtrustClientConfig::new(gateway, TlsPolicy::Verify)
+            .with_resource_refresh_interval(Duration::from_secs(3600))
+            .with_endpoint_override(Some(vec![L3NodeEndpoint::new(
+                "legacy-override.test".to_owned(),
+                9443,
+            )]));
+        let client = AtrustClient::start(auth, configuration(), material(), config)
+            .await
+            .expect("client starts");
+        let snapshot = client.resources().await;
+
+        assert_eq!(
+            client.endpoints_for(&snapshot, "group-1"),
+            vec![L3NodeEndpoint::new("advertised-1.test".to_owned(), 441)]
+        );
+        assert_eq!(
+            client.endpoints_for(&snapshot, "group-2"),
+            vec![L3NodeEndpoint::new("advertised-2.test".to_owned(), 8443)]
+        );
+        client.shutdown().await;
     }
 
     #[tokio::test]

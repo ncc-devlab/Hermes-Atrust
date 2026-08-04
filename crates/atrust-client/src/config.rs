@@ -29,7 +29,7 @@ pub struct AtrustClientConfig {
     /// How often a complete `clientResource` generation is fetched. A failure
     /// keeps the previous generation; see `ResourceCache`.
     pub resource_refresh_interval: Duration,
-    /// Replaces the advertised endpoint list for every node group.
+    /// Endpoint list used when `endpoint_override_node_group_id` matches.
     ///
     /// Exists because advertised order is not preference order: Xidian lists
     /// the unreachable internal address first, so a caller that has already
@@ -37,6 +37,8 @@ pub struct AtrustClientConfig {
     /// still applies *within* the supplied list; a single-element list is
     /// therefore also the fail-closed `--node` pin.
     pub endpoint_override: Option<Vec<L3NodeEndpoint>>,
+    /// Node group to which `endpoint_override` belongs.
+    pub endpoint_override_node_group_id: Option<String>,
     /// `lang` field carried in signed auth requests.
     pub lang: String,
 }
@@ -56,6 +58,7 @@ impl AtrustClientConfig {
             tcp_handshake_timeout: Duration::from_secs(20),
             resource_refresh_interval: Duration::from_secs(300),
             endpoint_override: None,
+            endpoint_override_node_group_id: None,
             lang: "en-US".to_owned(),
         }
     }
@@ -63,6 +66,12 @@ impl AtrustClientConfig {
     #[must_use]
     pub fn with_connect_timeout(mut self, connect_timeout: Duration) -> Self {
         self.connect_timeout = connect_timeout;
+        self
+    }
+
+    #[must_use]
+    pub fn with_heartbeat_interval(mut self, heartbeat_interval: Duration) -> Self {
+        self.heartbeat_interval = heartbeat_interval.max(Duration::from_secs(1));
         self
     }
 
@@ -79,8 +88,30 @@ impl AtrustClientConfig {
     }
 
     #[must_use]
+    /// Sets override endpoints without binding them to a group.
+    ///
+    /// Retained for source compatibility. An unbound override is applied only
+    /// when the resource table advertises exactly one group; use
+    /// `with_node_group_endpoint_override` when multiple groups are possible.
     pub fn with_endpoint_override(mut self, endpoints: Option<Vec<L3NodeEndpoint>>) -> Self {
         self.endpoint_override = endpoints.filter(|endpoints| !endpoints.is_empty());
+        self.endpoint_override_node_group_id = None;
+        self
+    }
+
+    #[must_use]
+    pub fn with_node_group_endpoint_override(
+        mut self,
+        node_group_id: impl Into<String>,
+        endpoints: Option<Vec<L3NodeEndpoint>>,
+    ) -> Self {
+        let node_group_id = node_group_id.into();
+        self.endpoint_override = endpoints.filter(|endpoints| !endpoints.is_empty());
+        self.endpoint_override_node_group_id = self
+            .endpoint_override
+            .as_ref()
+            .filter(|_| !node_group_id.is_empty())
+            .map(|_| node_group_id);
         self
     }
 }
