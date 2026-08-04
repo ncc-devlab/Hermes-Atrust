@@ -13,7 +13,6 @@ use atrust_auth::{
     extract_sid_from_cookies, select_node,
 };
 use atrust_browser::{BrowserKind, WebDriverBrowser, append_trace_event};
-use atrust_tcp::{DialTcpRequest, TCP_DIAL_RETRIES, TunnelTarget, dial_tcp_with_retry};
 use clap::{Parser, Subcommand};
 use hermes_logging::{LogFormat, LoggerConfig};
 use hermes_model::{DeviceId, GatewayEndpoint, SecretString};
@@ -301,6 +300,9 @@ enum Command {
         /// How long to wait for one inbound packet after sending.
         #[arg(long, default_value_t = 10)]
         reply_timeout_seconds: u64,
+        /// Refresh clientResource in the background while this L3 owner is alive.
+        #[arg(long, default_value_t = 60)]
+        resource_refresh_seconds: u64,
     },
 }
 
@@ -396,7 +398,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         timeout_ms = http_timeout.as_millis(),
         max_response_body
     );
-    let client = AuthClient::new(endpoint.clone(), transport.clone());
+    let client = Arc::new(AuthClient::new(endpoint.clone(), transport.clone()));
 
     match cli.command {
         Command::AuthConfig {
@@ -947,8 +949,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 session_material_trace(&material),
             )?;
 
-            // 2. Resource policy is mandatory: appId and nodeGroupId come from
-            // one match and are never assembled independently.
+            // Resource match, node selection and the dial itself now belong to
+            // the runtime. This arm keeps only the diagnostic parts: reporting
+            // which resource authorized the target, measuring endpoint latency,
+            // and the optional application round trip.
             let resources = client.client_resource(&configuration).await?;
             log_client_resources(&endpoint, &resources);
             let (target_host, target_port) = parse_host_port(&target)?;
@@ -961,30 +965,20 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 false,
                 cli.browser_trace_file.as_deref(),
             )?;
-            let route = resources
+            let node_group_id = resources
                 .routing_index()
                 .match_destination(&target_host, target_port, FlowProtocol::Tcp)
-                .map(|destination| destination.to_matched_resource())
+                .map(|destination| destination.node_group_id().to_owned())
                 .ok_or_else(|| {
                     format!(
                         "resource table does not authorize TCP target {target_host}:{target_port}"
                     )
                 })?;
-            if let Some(asserted) = app_id.as_deref()
-                && asserted != route.app_id
-            {
-                return Err(format!(
-                    "--app-id {asserted} does not match resource appId {}",
-                    route.app_id
-                )
-                .into());
-            }
 
-            // 3. Probe only endpoints belonging to the matched node group.
-            let (node_host, node_port) = select_data_node(
+            let nodes = select_data_nodes(
                 &resources,
                 &endpoint,
-                Some(&route.node_group_id),
+                Some(&node_group_id),
                 NodeChoice {
                     node: node.as_deref(),
                     allow_unadvertised: allow_unadvertised_node,
@@ -994,41 +988,62 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 },
             )
             .await?;
+            let endpoint_override = nodes
+                .into_iter()
+                .map(|node| atrust_client::L3NodeEndpoint::new(node.host, node.port))
+                .collect::<Vec<_>>();
 
-            // 4. Build the destination with the appId from that same resource.
-            let tunnel_target = build_tunnel_target(&target_host, target_port, &route.app_id);
+            let runtime = atrust_client::AtrustClient::start(
+                Arc::clone(&client),
+                configuration,
+                material,
+                atrust_client::AtrustClientConfig::new(endpoint.clone(), tls_policy)
+                    .with_connect_timeout(Duration::from_secs(connect_timeout_seconds.max(1)))
+                    .with_tcp_handshake_timeout(Duration::from_secs(
+                        handshake_timeout_seconds.max(1),
+                    ))
+                    .with_endpoint_override(Some(endpoint_override)),
+            )
+            .await?;
+            let events = report_events(runtime.events());
 
-            // 7. Dial + complete the aTrust TCP handshake.
-            info!(
-                event = "probe.tcp_dial.begin",
-                node_port,
-                target_port,
-                app_id_present = !route.app_id.is_empty(),
-                node_group_id = %route.node_group_id,
-                send_http
-            );
-            let request = DialTcpRequest {
-                node_host: &node_host,
-                node_port,
-                tls_policy,
-                sid: &material.sid,
-                device_id: &material.device_id,
-                connection_id: &material.connection_id,
-                sign_key: &material.sign_key,
-                username: material.username.as_deref().unwrap_or_default(),
-                target: tunnel_target,
-                process: None,
-                lang: "en-US",
-                connect_timeout: Duration::from_secs(connect_timeout_seconds.max(1)),
-                handshake_timeout: Duration::from_secs(handshake_timeout_seconds.max(1)),
+            if let Some(asserted) = app_id.as_deref() {
+                let matched = runtime
+                    .route(&target_host, target_port, FlowProtocol::Tcp)
+                    .await
+                    .ok_or_else(|| {
+                        format!(
+                            "resource table does not authorize TCP target {target_host}:{target_port}"
+                        )
+                    })?;
+                if asserted != matched.app_id {
+                    runtime.shutdown().await;
+                    events.stop().await;
+                    return Err(format!(
+                        "--app-id {asserted} does not match resource appId {}",
+                        matched.app_id
+                    )
+                    .into());
+                }
+            }
+
+            info!(event = "probe.tcp_dial.begin", target_port, send_http);
+            let dialed = match runtime.dial_tcp(&target_host, target_port).await {
+                Ok(dialed) => dialed,
+                Err(error) => {
+                    runtime.shutdown().await;
+                    events.stop().await;
+                    return Err(error.into());
+                }
             };
-            let mut tunnel = dial_tcp_with_retry(request, TCP_DIAL_RETRIES).await?;
+            let mut tunnel = dialed.tunnel;
             info!(
                 event = "probe.tcp_dial.handshake_ok",
-                node_port, target_port
+                node_port = dialed.node_port,
+                target_port
             );
 
-            // 8. Optional application-layer round trip through the established tunnel.
+            // Optional application-layer round trip through the established tunnel.
             if send_http {
                 let http_request = format!(
                     "GET / HTTP/1.0\r\nHost: {target_host}\r\nUser-Agent: hermes-probe\r\nConnection: close\r\n\r\n"
@@ -1044,6 +1059,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            runtime.shutdown().await;
+            events.stop().await;
             tunnel.close().await?;
             info!(event = "probe.tcp_dial.closed");
         }
@@ -1115,8 +1132,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             auth_only,
             connect_timeout_seconds,
             reply_timeout_seconds,
+            resource_refresh_seconds,
         } => {
-            // 1. Session material, exactly as the TCP path establishes it.
+            // Everything below is assembly the runtime owns: this arm only
+            // supplies diagnostics-specific choices (which node, which probe
+            // packet) and reports what came back.
             let session = match session_file.as_deref() {
                 Some(path) => restore_session(&client, transport.as_ref(), &endpoint, path).await?,
                 None => {
@@ -1130,20 +1150,23 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             } = session;
             log_session_material(&material);
 
-            // 2. L3 carries IP packets, so the destination must already be an
+            // L3 carries IP packets, so the destination must already be an
             // address. Resolving a name here would authorize a five-tuple the
             // server's domain resource never covered.
             let (target_host, target_port) = parse_host_port(&target)?;
             let target_ip: std::net::Ipv4Addr = target_host.parse().map_err(|_| {
                 format!("--target must be an IPv4 literal for L3, got {target_host}")
             })?;
-
-            // 3. Resource match atomically decides appId and node group.
-            let resources = client.client_resource(&configuration).await?;
             let flow_protocol = match probe {
                 L3Probe::IcmpEcho => FlowProtocol::Icmp,
                 L3Probe::TcpSyn => FlowProtocol::Tcp,
             };
+
+            // Node choice stays here: the probe measures reachability and
+            // reports it, then hands the runtime an ordered candidate list.
+            // The advertised order is not preference order (Xidian lists the
+            // unreachable internal address first), so this ordering matters.
+            let resources = client.client_resource(&configuration).await?;
             log_client_resources(&endpoint, &resources);
             report_resource_match(
                 &resources,
@@ -1154,30 +1177,20 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 false,
                 cli.browser_trace_file.as_deref(),
             )?;
-            let route = resources
+            let node_group_id = resources
                 .routing_index()
                 .match_destination(&target_host, target_port, flow_protocol)
-                .map(|destination| destination.to_matched_resource())
+                .map(|destination| destination.node_group_id().to_owned())
                 .ok_or_else(|| {
                     format!(
                         "resource table does not authorize {} target {target_host}:{target_port}",
                         flow_protocol.as_str()
                     )
                 })?;
-            if let Some(asserted) = app_id.as_deref()
-                && asserted != route.app_id
-            {
-                return Err(format!(
-                    "--app-id {asserted} does not match resource appId {}",
-                    route.app_id
-                )
-                .into());
-            }
-
-            let (node_host, node_port) = select_data_node(
+            let nodes = select_data_nodes(
                 &resources,
                 &endpoint,
-                Some(&route.node_group_id),
+                Some(&node_group_id),
                 NodeChoice {
                     node: node.as_deref(),
                     allow_unadvertised: allow_unadvertised_node,
@@ -1187,10 +1200,48 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 },
             )
             .await?;
+            let node_port = nodes.first().expect("selection always returns a node").port;
+            let endpoint_override = nodes
+                .into_iter()
+                .map(|node| atrust_client::L3NodeEndpoint::new(node.host, node.port))
+                .collect::<Vec<_>>();
 
-            // 4. Establish, authorize and optionally send. Closed connections
-            // are rebuilt up to the zju-connect limit; auth timeout gets one
-            // retry on a fresh connection. Policy failures are never retried.
+            let runtime = atrust_client::AtrustClient::start(
+                Arc::clone(&client),
+                configuration,
+                material,
+                atrust_client::AtrustClientConfig::new(endpoint.clone(), tls_policy)
+                    .with_connect_timeout(Duration::from_secs(connect_timeout_seconds.max(1)))
+                    .with_resource_refresh_interval(Duration::from_secs(
+                        resource_refresh_seconds.max(1),
+                    ))
+                    .with_endpoint_override(Some(endpoint_override)),
+            )
+            .await?;
+            // Subscribed before the first packet, so the establish and any VIP
+            // change are on the stream rather than only in the log.
+            let events = report_events(runtime.events());
+
+            let route = runtime
+                .route(&target_host, target_port, flow_protocol)
+                .await
+                .ok_or_else(|| {
+                    format!(
+                        "resource table does not authorize {} target {target_host}:{target_port}",
+                        flow_protocol.as_str()
+                    )
+                })?;
+            if let Some(asserted) = app_id.as_deref()
+                && asserted != route.app_id
+            {
+                runtime.shutdown().await;
+                return Err(format!(
+                    "--app-id {asserted} does not match resource appId {}",
+                    route.app_id
+                )
+                .into());
+            }
+
             info!(
                 event = "probe.l3_session.begin",
                 node_port,
@@ -1199,110 +1250,195 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 app_id_present = !route.app_id.is_empty(),
                 node_group_id = %route.node_group_id
             );
-            let process = atrust_l3::ProcessIdentity::default_for_port(target_port);
-            let ctx = atrust_l3::L3AuthContext {
-                sid: &material.sid,
-                device_id: &material.device_id,
-                connection_id: &material.connection_id,
-                sign_key: &material.sign_key,
-                process: &process,
-                lang: "en-US",
-            };
-            let manager = atrust_l3::L3SessionManager::new(
-                atrust_l3::L3SessionManagerConfig::with_default_heartbeat(
-                    node_host,
+
+            // Ctrl-C must reach `shutdown`, not abort the process: an aborted
+            // run leaves the node connection open and the gateway holding a
+            // session it can only time out on its own.
+            let outcome = tokio::select! {
+                result = run_l3_probe(
+                    &runtime,
+                    probe,
+                    target_ip,
+                    target_port,
+                    src_port,
+                    auth_only,
+                    reply_timeout_seconds,
                     node_port,
-                    route.node_group_id.clone(),
-                    tls_policy,
-                    material.sid.clone(),
-                    Duration::from_secs(connect_timeout_seconds.max(1)),
-                ),
-            );
-            let initial = manager.session().await?;
-            report_get_ip(
-                initial.get_ip(),
-                node_port,
-                cli.browser_trace_file.as_deref(),
-            )?;
-            let packet = match probe {
-                L3Probe::IcmpEcho => build_icmp_echo(initial.vip(), target_ip),
-                L3Probe::TcpSyn => build_tcp_syn(initial.vip(), src_port, target_ip, target_port),
-            };
-            let flow = atrust_l3::parse_ipv4_flow(&packet)?;
-            let authorized = if auth_only {
-                manager.authorize_flow(&ctx, &route.app_id, &flow).await
-            } else {
-                manager
-                    .authorize_and_send(&ctx, &route.app_id, &flow, &packet)
-                    .await
-            };
-            let authorized = match authorized {
-                Ok(authorized) => authorized,
-                Err(error) => {
-                    append_probe_trace(
-                        cli.browser_trace_file.as_deref(),
-                        "l3_flow_auth_failed",
-                        json!({
-                            "flow": flow.flow_key().as_str(),
-                            "app_id": route.app_id.as_str(),
-                            "error": error.to_string(),
-                        }),
-                    )?;
-                    manager.close().await;
-                    return Err(error.into());
+                    cli.browser_trace_file.as_deref(),
+                ) => result,
+                signal = tokio::signal::ctrl_c() => {
+                    warn!(event = "probe.l3_session.interrupted");
+                    signal.map_err(Into::into)
                 }
             };
-            let token = authorized.connect_token();
-            info!(
-                event = "probe.l3_session.flow_authorized",
-                flow = %flow.flow_key(),
-                connect_token_present = !token.is_empty()
-            );
-            append_probe_trace(
-                cli.browser_trace_file.as_deref(),
-                "l3_flow_authorized",
-                json!({
-                    "flow": flow.flow_key().as_str(),
-                    "app_id": route.app_id.as_str(),
-                    "node_group_id": route.node_group_id.as_str(),
-                    "connect_token": token,
-                }),
-            )?;
 
-            if !auth_only {
-                info!(
-                    event = "probe.l3_session.packet_sent",
-                    bytes = packet.len(),
-                    probe = ?probe
-                );
-                match tokio::time::timeout(
-                    Duration::from_secs(reply_timeout_seconds.max(1)),
-                    authorized.session().recv_packet(),
-                )
-                .await
-                {
-                    Ok(Some(reply)) => {
-                        let parsed = atrust_l3::parse_ipv4_flow(&reply).ok();
-                        info!(
-                            event = "probe.l3_session.packet_received",
-                            bytes = reply.len(),
-                            parsed_as_ipv4 = parsed.is_some(),
-                            protocol = parsed
-                                .as_ref()
-                                .map(|flow| flow.protocol.scheme())
-                                .unwrap_or("<unparsed>")
-                        );
+            runtime.shutdown().await;
+            events.stop().await;
+            info!(event = "probe.l3_session.closed");
+            outcome?;
+        }
+    }
+    Ok(())
+}
+
+/// Mirrors the runtime event stream into the log for a diagnostic run.
+///
+/// The runtime publishes state changes whether or not anyone listens; this
+/// turns them into log lines so a probe run records the VIP change, reconnect
+/// or protocol finding that a bare error return would have hidden.
+struct EventReporter {
+    stop: tokio::sync::watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl EventReporter {
+    async fn stop(mut self) {
+        let _ = self.stop.send(true);
+        let _ = (&mut self.task).await;
+    }
+}
+
+fn report_events(mut stream: atrust_client::EventStream) -> EventReporter {
+    let (stop, mut stop_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                delivery = stream.recv() => {
+                    let Some(delivery) = delivery else { break };
+                    match delivery {
+                        atrust_client::EventDelivery::Event(event) => info!(
+                            event = "probe.runtime_event",
+                            kind = event.kind(),
+                            severity = ?event.severity(),
+                            detail = ?event
+                        ),
+                        // Losing an event is itself worth a line: a skipped VIP
+                        // change would leave any consumer out of sync.
+                        atrust_client::EventDelivery::Lagged { skipped } => warn!(
+                            event = "probe.runtime_event_lagged",
+                            skipped
+                        ),
                     }
-                    Ok(None) => warn!(event = "probe.l3_session.closed_before_reply"),
-                    Err(_) => warn!(
-                        event = "probe.l3_session.reply_timeout",
-                        seconds = reply_timeout_seconds
-                    ),
+                }
+                changed = stop_rx.changed() => {
+                    if changed.is_err() || *stop_rx.borrow() {
+                        break;
+                    }
                 }
             }
-            manager.close().await;
-            info!(event = "probe.l3_session.closed");
         }
+    });
+    EventReporter { stop, task }
+}
+
+/// Brings the node group up, sends one hand-built packet, and reports the reply.
+///
+/// The VIP has to be known before the packet is built: it is the source address
+/// the gateway authorized, and a packet carrying anything else is rejected by
+/// the runtime rather than sent.
+#[allow(clippy::too_many_arguments)]
+async fn run_l3_probe(
+    runtime: &atrust_client::AtrustClient,
+    probe: L3Probe,
+    target_ip: std::net::Ipv4Addr,
+    target_port: u16,
+    src_port: u16,
+    auth_only: bool,
+    reply_timeout_seconds: u64,
+    node_port: u16,
+    trace_file: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let route = runtime
+        .route(
+            &target_ip.to_string(),
+            target_port,
+            match probe {
+                L3Probe::IcmpEcho => FlowProtocol::Icmp,
+                L3Probe::TcpSyn => FlowProtocol::Tcp,
+            },
+        )
+        .await
+        .ok_or("resource table does not authorize the target")?;
+
+    let session = runtime.connect_node_group(&route.node_group_id).await?;
+    report_get_ip(session.get_ip(), node_port, trace_file)?;
+    let vip = session.vip();
+
+    let packet = match probe {
+        L3Probe::IcmpEcho => build_icmp_echo(vip, target_ip),
+        L3Probe::TcpSyn => build_tcp_syn(vip, src_port, target_ip, target_port),
+    };
+
+    let sent = if auth_only {
+        runtime.authorize_ipv4(&packet).await
+    } else {
+        runtime.send_ipv4(&packet).await
+    };
+    let sent = match sent {
+        Ok(sent) => sent,
+        Err(error) => {
+            append_probe_trace(
+                trace_file,
+                "l3_flow_auth_failed",
+                json!({
+                    "target": format!("{target_ip}:{target_port}"),
+                    "app_id": route.app_id.as_str(),
+                    "error": error.to_string(),
+                }),
+            )?;
+            return Err(error.into());
+        }
+    };
+
+    info!(
+        event = "probe.l3_session.flow_authorized",
+        flow = %sent.flow.flow_key(),
+        connect_token_present = sent.connect_token_len > 0,
+        connect_token_len = sent.connect_token_len
+    );
+    append_probe_trace(
+        trace_file,
+        "l3_flow_authorized",
+        json!({
+            "flow": sent.flow.flow_key().as_str(),
+            "app_id": sent.app_id.as_str(),
+            "node_group_id": sent.node_group_id.as_str(),
+            "connect_token_len": sent.connect_token_len,
+        }),
+    )?;
+
+    if auth_only {
+        return Ok(());
+    }
+
+    info!(
+        event = "probe.l3_session.packet_sent",
+        bytes = packet.len(),
+        probe = ?probe
+    );
+    match tokio::time::timeout(
+        Duration::from_secs(reply_timeout_seconds.max(1)),
+        sent.session.recv_packet(),
+    )
+    .await
+    {
+        Ok(Some(reply)) => {
+            let parsed = atrust_client::parse_ipv4_flow(&reply).ok();
+            info!(
+                event = "probe.l3_session.packet_received",
+                bytes = reply.len(),
+                parsed_as_ipv4 = parsed.is_some(),
+                protocol = parsed
+                    .as_ref()
+                    .map(|flow| flow.protocol.scheme())
+                    .unwrap_or("<unparsed>")
+            );
+        }
+        Ok(None) => warn!(event = "probe.l3_session.closed_before_reply"),
+        Err(_) => warn!(
+            event = "probe.l3_session.reply_timeout",
+            seconds = reply_timeout_seconds
+        ),
     }
     Ok(())
 }
@@ -1343,6 +1479,19 @@ async fn select_data_node(
     node_group_id: Option<&str>,
     request: NodeChoice<'_>,
 ) -> Result<(String, u16), Box<dyn std::error::Error>> {
+    let nodes = select_data_nodes(resources, endpoint, node_group_id, request).await?;
+    let chosen = nodes.first().expect("selection always returns a node");
+    Ok((chosen.host.clone(), chosen.port))
+}
+
+/// Returns all reachable endpoints in failover order. An explicit node remains
+/// pinned and therefore yields exactly one candidate.
+async fn select_data_nodes(
+    resources: &atrust_auth::ClientResources,
+    endpoint: &GatewayEndpoint,
+    node_group_id: Option<&str>,
+    request: NodeChoice<'_>,
+) -> Result<Vec<atrust_auth::ResolvedNodeEndpoint>, Box<dyn std::error::Error>> {
     let candidates = match node_group_id {
         Some(group_id) => resources
             .node_group_endpoints(group_id, endpoint)
@@ -1365,7 +1514,7 @@ async fn select_data_node(
     )
     .await?;
     report_node_selection(&selection, request.trace_file)?;
-    Ok(selection.host_port())
+    Ok(selection.failover_endpoints())
 }
 
 /// Logs the full latency ranking, not just the winner: the alternatives are the
@@ -1554,22 +1703,6 @@ fn ones_complement_sum(data: &[u8]) -> u16 {
 
 /// Builds a data-plane destination: raw IPv4 target when `host` parses as an IPv4
 /// literal, otherwise a domain target (handshake sends the domain bytes verbatim).
-fn build_tunnel_target(host: &str, port: u16, app_id: &str) -> TunnelTarget {
-    match host.parse::<std::net::Ipv4Addr>() {
-        Ok(ip) => TunnelTarget::Ipv4 {
-            ip,
-            port,
-            app_id: app_id.to_owned(),
-        },
-        Err(_) => TunnelTarget::Domain {
-            host: host.to_owned(),
-            port,
-            app_id: app_id.to_owned(),
-            resolved: None,
-        },
-    }
-}
-
 /// Reports which resource authorizes a destination, and therefore which `appId`
 /// and node group would carry it. Pure lookup: it never dials, sends an init
 /// frame, or opens a tunnel, and `matched=false` is a valid result — that is

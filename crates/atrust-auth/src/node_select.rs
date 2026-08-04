@@ -89,6 +89,23 @@ impl NodeSelection {
     pub fn host_port(&self) -> (String, u16) {
         (self.chosen.endpoint.host.clone(), self.chosen.endpoint.port)
     }
+
+    /// Candidates for operational failover. Explicit requests remain pinned;
+    /// automatic selection keeps every endpoint that passed the TLS probe.
+    #[must_use]
+    pub fn failover_endpoints(&self) -> Vec<ResolvedNodeEndpoint> {
+        match self.source {
+            SelectionSource::Requested | SelectionSource::RequestedUnadvertised => {
+                vec![self.chosen.endpoint.clone()]
+            }
+            SelectionSource::LowestLatency => self
+                .ranked
+                .iter()
+                .filter(|measurement| measurement.reachable())
+                .map(|measurement| measurement.endpoint.clone())
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -370,6 +387,7 @@ mod tests {
         assert_eq!(selection.ranked[0].endpoint.host, "61.150.43.94");
         assert_eq!(selection.ranked[1].endpoint.host, "slow.example.edu");
         assert!(!selection.ranked[2].reachable());
+        assert_eq!(selection.failover_endpoints().len(), 2);
     }
 
     #[tokio::test]
@@ -421,6 +439,7 @@ mod tests {
         // The alternatives were still measured, so the cost of the override is
         // visible in the log rather than inferred.
         assert_eq!(selection.ranked.len(), 2);
+        assert_eq!(selection.failover_endpoints().len(), 1);
     }
 
     #[tokio::test]
