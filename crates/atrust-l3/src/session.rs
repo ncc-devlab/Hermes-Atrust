@@ -50,6 +50,16 @@ use crate::packet::Ipv4Flow;
 /// Heartbeat cadence for one L3 connection (Go: every 25 seconds).
 pub const L3_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
 
+/// Monotonic flow-authorization counters for diagnostics and concurrency tests.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FlowAuthStats {
+    pub requests_sent: u64,
+    pub outcomes_received: u64,
+    pub timeouts: u64,
+    pub in_flight: u64,
+    pub peak_in_flight: u64,
+}
+
 /// Second-VIP response command (`05 96 <status> <u16 len> <json>`).
 const L3_SECOND_VIP_RESP: u8 = 0x96;
 
@@ -102,6 +112,11 @@ struct SessionShared {
     closed: AtomicBool,
     /// Inbound packets discarded because the consumer was not keeping up.
     dropped_packets: AtomicU64,
+    auth_requests_sent: AtomicU64,
+    auth_outcomes_received: AtomicU64,
+    auth_timeouts: AtomicU64,
+    auth_in_flight: AtomicU64,
+    auth_peak_in_flight: AtomicU64,
     /// Broadcast stop signal. Every task selects on it, so closing a session
     /// does not have to wait for a task's own timer to fire.
     stop_tx: watch::Sender<bool>,
@@ -122,6 +137,11 @@ impl SessionShared {
             waiters: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
             dropped_packets: AtomicU64::new(0),
+            auth_requests_sent: AtomicU64::new(0),
+            auth_outcomes_received: AtomicU64::new(0),
+            auth_timeouts: AtomicU64::new(0),
+            auth_in_flight: AtomicU64::new(0),
+            auth_peak_in_flight: AtomicU64::new(0),
             stop_tx: watch::channel(false).0,
             events,
             seen_length_prefixed: AtomicBool::new(false),
@@ -164,6 +184,26 @@ impl SessionShared {
 
     fn stop_signal(&self) -> watch::Receiver<bool> {
         self.stop_tx.subscribe()
+    }
+
+    fn record_auth_sent(&self) {
+        self.auth_requests_sent.fetch_add(1, Ordering::Relaxed);
+        let in_flight = self.auth_in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        self.auth_peak_in_flight
+            .fetch_max(in_flight, Ordering::Relaxed);
+    }
+
+    fn settle_auth(&self, timed_out: bool) {
+        if timed_out {
+            self.auth_timeouts.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.auth_outcomes_received.fetch_add(1, Ordering::Relaxed);
+        }
+        let _ = self
+            .auth_in_flight
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_sub(1))
+            });
     }
 
     fn notify(&self, auth_id: u64, outcome: &AuthOutcome) {
@@ -381,6 +421,17 @@ impl L3Session {
         self.shared.dropped_packets.load(Ordering::Relaxed)
     }
 
+    #[must_use]
+    pub fn flow_auth_stats(&self) -> FlowAuthStats {
+        FlowAuthStats {
+            requests_sent: self.shared.auth_requests_sent.load(Ordering::Relaxed),
+            outcomes_received: self.shared.auth_outcomes_received.load(Ordering::Relaxed),
+            timeouts: self.shared.auth_timeouts.load(Ordering::Relaxed),
+            in_flight: self.shared.auth_in_flight.load(Ordering::Relaxed),
+            peak_in_flight: self.shared.auth_peak_in_flight.load(Ordering::Relaxed),
+        }
+    }
+
     /// Authorizes one flow and returns its connect token.
     ///
     /// Repeat calls for an already-authorized flow return the cached token
@@ -475,6 +526,7 @@ impl L3Session {
                 self.abandon_flow(&key, auth_id);
                 return Err(L3SessionError::Closed);
             }
+            self.shared.record_auth_sent();
         }
 
         match timeout(L3_AUTH_TIMEOUT, receiver).await {
@@ -486,6 +538,9 @@ impl L3Session {
             Ok(Err(_)) => Err(L3SessionError::Closed),
             Err(_) => {
                 self.abandon_flow(&key, auth_id);
+                if must_send {
+                    self.shared.settle_auth(true);
+                }
                 warn!(
                     event = "atrust_l3.session.auth_timeout",
                     auth_id,
@@ -775,6 +830,7 @@ fn dispatch(
                         .cloned();
                     drop(table);
                     if let Some(outcome) = outcome {
+                        shared.settle_auth(false);
                         debug!(
                             event = "atrust_l3.session.auth_settled",
                             auth_id,

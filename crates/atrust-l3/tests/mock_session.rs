@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use atrust_l3::{Ipv4Flow, L3AuthContext, L3Session, L3SessionError, parse_ipv4_flow};
+use atrust_l3::{
+    FlowAuthStats, Ipv4Flow, L3AuthContext, L3Session, L3SessionError, parse_ipv4_flow,
+};
 use atrust_protocol::ProcessIdentity;
 use hermes_model::{ConnectionId, DeviceId, SessionId, SignKey};
 use serde_json::Value;
@@ -24,6 +26,12 @@ const IDLE_HEARTBEAT: Duration = Duration::from_secs(3600);
 enum AuthBehaviour {
     Grant {
         token: String,
+    },
+    /// Hold responses until this many distinct wire requests arrive, proving
+    /// the client can have several authorizations outstanding at once.
+    BatchGrant {
+        token: String,
+        batch_size: usize,
     },
     Deny {
         code: i64,
@@ -120,6 +128,7 @@ fn spawn_peer(
             .expect("vip");
 
         let mut pending: Vec<u8> = Vec::new();
+        let mut pending_auth = Vec::new();
         let mut chunk = vec![0u8; 8192];
         loop {
             // Consume every whole frame currently buffered.
@@ -141,6 +150,20 @@ fn spawn_peer(
                                     .write_all(&encode_auth_resp(0, body.as_bytes()))
                                     .await
                                     .expect("auth grant");
+                            }
+                            AuthBehaviour::BatchGrant { token, batch_size } => {
+                                pending_auth.push(hash);
+                                if pending_auth.len() == *batch_size {
+                                    for hash in pending_auth.drain(..).rev() {
+                                        let body = format!(
+                                            r#"{{"code":0,"message":"OK","data":{{"conntrackHash":{hash},"connectToken":"{token}"}}}}"#
+                                        );
+                                        server
+                                            .write_all(&encode_auth_resp(0, body.as_bytes()))
+                                            .await
+                                            .expect("batched auth grant");
+                                    }
+                                }
                             }
                             AuthBehaviour::Deny { code, message } => {
                                 let body = format!(
@@ -406,6 +429,73 @@ async fn concurrent_callers_for_one_flow_send_a_single_auth() {
         assert_eq!(token, "tok-shared");
     }
     assert_eq!(stats.auth_requests(), 1, "one 0x13 for one racing flow");
+    assert_eq!(
+        session.flow_auth_stats(),
+        FlowAuthStats {
+            requests_sent: 1,
+            outcomes_received: 1,
+            timeouts: 0,
+            in_flight: 0,
+            peak_in_flight: 1,
+        }
+    );
+}
+
+#[tokio::test]
+async fn concurrent_distinct_flows_are_in_flight_and_each_deduplicated() {
+    let (session, stats, _peer) = session_with(
+        AuthBehaviour::BatchGrant {
+            token: "tok-batch".to_owned(),
+            batch_size: 2,
+        },
+        IDLE_HEARTBEAT,
+    )
+    .await;
+    let session = Arc::new(session);
+    let barrier = Arc::new(tokio::sync::Barrier::new(5));
+    let mut handles = Vec::new();
+    for src_port in [40_000, 40_001] {
+        for _ in 0..2 {
+            let session = Arc::clone(&session);
+            let barrier = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                let (device, connection, key, process) = auth_ids();
+                let session_id = sid();
+                let ctx = L3AuthContext {
+                    sid: &session_id,
+                    device_id: &device,
+                    connection_id: &connection,
+                    sign_key: &key,
+                    process: &process,
+                    lang: "en-US",
+                };
+                let flow = flow_of(&tcp_packet(src_port, 443, b""));
+                barrier.wait().await;
+                session
+                    .authorize_flow(&ctx, "app-1", "group-1", &flow)
+                    .await
+            }));
+        }
+    }
+    barrier.wait().await;
+    for handle in handles {
+        assert_eq!(
+            handle.await.expect("task").expect("authorized"),
+            "tok-batch"
+        );
+    }
+    assert_eq!(stats.auth_requests(), 2);
+    assert_eq!(session.conntrack_len(), 2);
+    assert_eq!(
+        session.flow_auth_stats(),
+        FlowAuthStats {
+            requests_sent: 2,
+            outcomes_received: 2,
+            timeouts: 0,
+            in_flight: 0,
+            peak_in_flight: 2,
+        }
+    );
 }
 
 #[tokio::test]

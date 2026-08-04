@@ -31,7 +31,9 @@ pub use manager::{
     L3SessionManagerConfig, L3SessionManagerError,
 };
 pub use packet::{FLOW_KEY_ATYPE_IPV4, Ipv4Flow, PacketError, parse_ipv4_flow};
-pub use session::{L3_HEARTBEAT_INTERVAL, L3Session, L3SessionConfig, L3SessionError};
+pub use session::{
+    FlowAuthStats, L3_HEARTBEAT_INTERVAL, L3Session, L3SessionConfig, L3SessionError,
+};
 
 /// Match zju-connect's retry boundary: five reconnects after a closed L3
 /// connection, and one fresh-connection retry after flow-auth timeout.
