@@ -51,7 +51,7 @@ impl LoginMethod {
 /// `device_id`, `connection_id`, and `sign_key` are stored rather than
 /// regenerated: `connection_id` is derived from `device_id`, and a gateway that
 /// binds either to the session would reject a process that invented new ones.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct StoredSession {
     pub version: u32,
     pub saved_unix_ms: u128,
@@ -70,7 +70,7 @@ pub struct StoredSession {
     pub username: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct StoredCookie {
     pub name: String,
     pub value: String,
@@ -78,6 +78,43 @@ pub struct StoredCookie {
     pub path: Option<String>,
     pub secure: bool,
     pub http_only: bool,
+}
+
+impl std::fmt::Debug for StoredCookie {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StoredCookie")
+            .field("name", &self.name)
+            .field("value", &"[REDACTED]")
+            .field("domain", &self.domain)
+            .field("path", &self.path)
+            .field("secure", &self.secure)
+            .field("http_only", &self.http_only)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for StoredSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StoredSession")
+            .field("version", &self.version)
+            .field("saved_unix_ms", &self.saved_unix_ms)
+            .field("gateway_host", &self.gateway_host)
+            .field("gateway_port", &self.gateway_port)
+            .field("login_method", &self.login_method)
+            .field("login_domain", &self.login_domain)
+            .field("cookies", &self.cookies)
+            .field("sid", &"[REDACTED]")
+            .field("sid_cookie_name", &self.sid_cookie_name)
+            .field("sid_sig_present", &self.sid_sig_present)
+            .field("device_id", &"[REDACTED]")
+            .field("connection_id", &"[REDACTED]")
+            .field("sign_key_hex", &"[REDACTED]")
+            .field("sign_key_provisional", &self.sign_key_provisional)
+            .field("username", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl From<&GatewayCookie> for StoredCookie {
@@ -346,5 +383,29 @@ mod tests {
             Err(SessionStoreError::Decode(_)) | Err(SessionStoreError::UnsupportedVersion(999))
         ));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn debug_redacts_stored_session_secrets() {
+        let gateway = GatewayEndpoint::new("gateway.test", 443).unwrap();
+        let session = StoredSession::capture(
+            &gateway,
+            LoginMethod::Cas,
+            Some("cas-domain".to_owned()),
+            &[cookie("sid", "cookie-secret")],
+            &material(),
+        );
+
+        let debug = format!("{session:?}");
+        assert!(debug.contains("[REDACTED]"));
+        for secret in [
+            "cookie-secret",
+            "sid-cookie-value",
+            "device-abc",
+            "aabbccdd",
+            "student",
+        ] {
+            assert!(!debug.contains(secret), "debug leaked {secret}");
+        }
     }
 }

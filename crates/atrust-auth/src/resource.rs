@@ -5,6 +5,7 @@ use std::str::FromStr;
 use atrust_protocol::to_wire_json;
 use hermes_model::GatewayEndpoint;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 
 /// Default aTrust data-plane node port when the resource omits an explicit port.
@@ -404,8 +405,40 @@ struct NodeGroupItem {
 struct NodeAddressItem {
     #[serde(default, alias = "Address")]
     address: String,
-    #[serde(default, rename = "type", alias = "Type")]
+    #[serde(
+        default,
+        rename = "type",
+        alias = "Type",
+        alias = "addressType",
+        alias = "AddressType"
+    )]
     address_type: String,
+    #[serde(default, alias = "Port")]
+    port: Option<WirePort>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum WirePort {
+    String(String),
+    Number(serde_json::Number),
+    Other(Value),
+}
+
+impl WirePort {
+    fn get(&self) -> Option<u16> {
+        match self {
+            Self::String(port) => port.parse().ok().filter(|port| *port != 0),
+            Self::Number(port) => port
+                .as_u64()
+                .and_then(|port| u16::try_from(port).ok())
+                .filter(|port| *port != 0),
+            Self::Other(value) => {
+                let _ = value;
+                None
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -550,7 +583,7 @@ impl ClientResources {
                 .into_iter()
                 .filter(|item| !item.address.is_empty())
                 .map(|item| NodeAddress {
-                    address: item.address,
+                    address: node_address_with_wire_port(&item.address, item.port.as_ref()),
                     address_type: item.address_type,
                 })
                 .collect();
@@ -575,6 +608,20 @@ impl ClientResources {
             major_node_group_id,
             dns,
         }
+    }
+}
+
+fn node_address_with_wire_port(address: &str, port: Option<&WirePort>) -> String {
+    let Some(port) = port.and_then(WirePort::get) else {
+        return address.to_owned();
+    };
+    let Some((host, resolved_port)) = split_host_port(address, port) else {
+        return address.to_owned();
+    };
+    if host.contains(':') {
+        format!("[{host}]:{resolved_port}")
+    } else {
+        format!("{host}:{resolved_port}")
     }
 }
 
@@ -735,6 +782,35 @@ mod tests {
         assert_eq!(resources.dns.primary.as_deref(), Some("10.8.8.8"));
         assert_eq!(resources.dns.secondary.as_deref(), Some("10.8.4.4"));
         assert!(!format!("{resources:?}").contains("app-1"));
+    }
+
+    #[test]
+    fn node_wire_port_is_used_but_embedded_port_wins() {
+        let body = br#"{
+            "code":0,
+            "data":{"appList":{"data":{"config":{"nodeGroupConf":{"nodeGroupList":[{
+                "id":"ng-1",
+                "addressInfo":[
+                    {"address":"node-a.test","port":"8443","addressType":"domain"},
+                    {"address":"node-b.test:9443","port":8443,"addressType":"domain"},
+                    {"address":"node-c.test","port":70000,"addressType":"domain"},
+                    {"address":"node-d.test","port":1.5,"addressType":"domain"}
+                ]
+            }]}}}}}
+        }"#;
+        let resources = ClientResources::parse_bytes(body).unwrap();
+        let gateway = GatewayEndpoint::new("gateway.test", 443).unwrap();
+        let endpoints = &resources.resolve_node_groups(&gateway)[0].endpoints;
+
+        assert_eq!(endpoints[0].host, "node-a.test");
+        assert_eq!(endpoints[0].port, 8443);
+        assert_eq!(endpoints[0].address_type, "domain");
+        assert_eq!(endpoints[1].host, "node-b.test");
+        assert_eq!(endpoints[1].port, 9443);
+        assert_eq!(endpoints[2].host, "node-c.test");
+        assert_eq!(endpoints[2].port, DEFAULT_NODE_PORT);
+        assert_eq!(endpoints[3].host, "node-d.test");
+        assert_eq!(endpoints[3].port, DEFAULT_NODE_PORT);
     }
 
     #[test]

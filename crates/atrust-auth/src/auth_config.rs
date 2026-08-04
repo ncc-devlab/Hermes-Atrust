@@ -58,7 +58,10 @@ pub struct AuthInfo {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct AuthConfigEnvelope {
-    pub data: AuthConfigData,
+    pub code: Option<i64>,
+    #[serde(default)]
+    pub message: String,
+    pub data: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]

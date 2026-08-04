@@ -98,7 +98,22 @@ impl AuthClient {
         }
         let envelope: AuthConfigEnvelope =
             serde_json::from_slice(&response.body).map_err(AuthError::InvalidResponse)?;
-        let configuration = AuthConfiguration::from(envelope.data);
+        if let Some(code) = envelope.code
+            && code != 0
+        {
+            return Err(AuthError::AuthenticationRejected {
+                code,
+                message: envelope.message,
+            });
+        }
+        let data = envelope.data.ok_or_else(|| {
+            AuthError::InvalidResponse(<serde_json::Error as serde::de::Error>::custom(
+                "authConfig response is missing data",
+            ))
+        })?;
+        let data: crate::auth_config::AuthConfigData =
+            serde_json::from_value(data).map_err(AuthError::InvalidResponse)?;
+        let configuration = AuthConfiguration::from(data);
         debug!(
             event = "atrust.auth_config.complete",
             host = self.endpoint.host(),
@@ -731,12 +746,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_error_envelope_without_data() {
-        let (client, _) = client_with_response(br#"{"code":500,"message":"failed"}"#);
+    async fn rejects_error_envelope_as_authentication_rejected() {
+        let (client, _) = client_with_response(
+            br#"{"code":500,"message":"failed","data":"not a successful payload"}"#,
+        );
         assert!(matches!(
             client.auth_config(AuthConfigOptions::default()).await,
-            Err(AuthError::InvalidResponse(_))
+            Err(AuthError::AuthenticationRejected { code: 500, message }) if message == "failed"
         ));
+    }
+
+    #[tokio::test]
+    async fn recognizes_session_invalid_auth_config_envelope() {
+        let (client, _) =
+            client_with_response(br#"{"code":75500002,"message":"The session is invalid"}"#);
+        let error = client
+            .auth_config(AuthConfigOptions::default())
+            .await
+            .unwrap_err();
+
+        assert!(error.is_session_invalid(), "got {error}");
+    }
+
+    #[tokio::test]
+    async fn accepts_zero_code_auth_config_envelope() {
+        let (client, _) =
+            client_with_response(br#"{"code":0,"message":"OK","data":{"isLogin":1}}"#);
+        let configuration = client
+            .auth_config(AuthConfigOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(configuration.login_state, LoginState::LoggedIn);
     }
 
     #[tokio::test]
