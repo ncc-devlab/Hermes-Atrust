@@ -290,6 +290,10 @@ enum Command {
         /// Packet to send after authorization.
         #[arg(long, value_enum, default_value_t = L3Probe::IcmpEcho)]
         probe: L3Probe,
+        /// UDP application payload bytes, excluding the IPv4 and UDP headers.
+        /// Valid only with `--probe udp`.
+        #[arg(long, value_parser = clap::value_parser!(u16).range(0..=65507))]
+        payload_bytes: Option<u16>,
         /// Skip the packet round trip and stop after authorization.
         #[arg(long)]
         auth_only: bool,
@@ -314,6 +318,9 @@ enum L3Probe {
     IcmpEcho,
     /// TCP SYN. Proves the five-tuple path but needs a listener to answer.
     TcpSyn,
+    /// UDP datagram with a deterministic payload. E6 requires an authorized
+    /// echo service so the returned bytes can be checked exactly.
+    Udp,
 }
 
 #[tokio::main]
@@ -1129,6 +1136,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             app_id,
             src_port,
             probe,
+            payload_bytes,
             auth_only,
             connect_timeout_seconds,
             reply_timeout_seconds,
@@ -1137,6 +1145,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // Everything below is assembly the runtime owns: this arm only
             // supplies diagnostics-specific choices (which node, which probe
             // packet) and reports what came back.
+            let payload_bytes = match (probe, payload_bytes) {
+                (L3Probe::Udp, Some(bytes)) => usize::from(bytes),
+                (L3Probe::Udp, None) => 32,
+                (_, Some(_)) => {
+                    return Err("--payload-bytes is valid only with --probe udp".into());
+                }
+                (_, None) => 0,
+            };
             let session = match session_file.as_deref() {
                 Some(path) => restore_session(&client, transport.as_ref(), &endpoint, path).await?,
                 None => {
@@ -1160,8 +1176,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let flow_protocol = match probe {
                 L3Probe::IcmpEcho => FlowProtocol::Icmp,
                 L3Probe::TcpSyn => FlowProtocol::Tcp,
+                L3Probe::Udp => FlowProtocol::Udp,
             };
-
             // Node choice stays here: the probe measures reachability and
             // reports it, then hands the runtime an ordered candidate list.
             // The advertised order is not preference order (Xidian lists the
@@ -1261,6 +1277,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     target_ip,
                     target_port,
                     src_port,
+                    payload_bytes,
                     auth_only,
                     reply_timeout_seconds,
                     node_port,
@@ -1343,6 +1360,7 @@ async fn run_l3_probe(
     target_ip: std::net::Ipv4Addr,
     target_port: u16,
     src_port: u16,
+    payload_bytes: usize,
     auth_only: bool,
     reply_timeout_seconds: u64,
     node_port: u16,
@@ -1355,6 +1373,7 @@ async fn run_l3_probe(
             match probe {
                 L3Probe::IcmpEcho => FlowProtocol::Icmp,
                 L3Probe::TcpSyn => FlowProtocol::Tcp,
+                L3Probe::Udp => FlowProtocol::Udp,
             },
         )
         .await
@@ -1367,6 +1386,7 @@ async fn run_l3_probe(
     let packet = match probe {
         L3Probe::IcmpEcho => build_icmp_echo(vip, target_ip),
         L3Probe::TcpSyn => build_tcp_syn(vip, src_port, target_ip, target_port),
+        L3Probe::Udp => build_udp_probe(vip, src_port, target_ip, target_port, payload_bytes),
     };
 
     let sent = if auth_only {
@@ -1423,6 +1443,17 @@ async fn run_l3_probe(
     .await
     {
         Ok(Some(reply)) => {
+            if matches!(probe, L3Probe::Udp) {
+                validate_udp_echo(
+                    &reply,
+                    target_ip,
+                    target_port,
+                    vip,
+                    src_port,
+                    &udp_probe_payload(payload_bytes),
+                )
+                .map_err(|error| format!("UDP echo validation failed: {error}"))?;
+            }
             let parsed = atrust_client::parse_ipv4_flow(&reply).ok();
             info!(
                 event = "probe.l3_session.packet_received",
@@ -1434,7 +1465,13 @@ async fn run_l3_probe(
                     .unwrap_or("<unparsed>")
             );
         }
+        Ok(None) if matches!(probe, L3Probe::Udp) => {
+            return Err("L3 session closed before the UDP echo reply".into());
+        }
         Ok(None) => warn!(event = "probe.l3_session.closed_before_reply"),
+        Err(_) if matches!(probe, L3Probe::Udp) => {
+            return Err(format!("UDP echo timed out after {reply_timeout_seconds}s").into());
+        }
         Err(_) => warn!(
             event = "probe.l3_session.reply_timeout",
             seconds = reply_timeout_seconds
@@ -1656,6 +1693,117 @@ fn build_tcp_syn(
     tcp[16..18].copy_from_slice(&checksum.to_be_bytes());
 
     ipv4_packet(src, dst, 6, &tcp)
+}
+
+fn udp_probe_payload(length: usize) -> Vec<u8> {
+    (0..length)
+        .map(|index| (index as u8).wrapping_mul(31).wrapping_add(17))
+        .collect()
+}
+
+/// Builds one UDP datagram whose payload can be reproduced for echo validation.
+fn build_udp_probe(
+    src: std::net::Ipv4Addr,
+    src_port: u16,
+    dst: std::net::Ipv4Addr,
+    dst_port: u16,
+    payload_bytes: usize,
+) -> Vec<u8> {
+    debug_assert!(payload_bytes <= 65_507);
+    let payload = udp_probe_payload(payload_bytes);
+    let udp_len = u16::try_from(8 + payload.len()).expect("validated UDP payload length");
+    let mut udp = Vec::with_capacity(usize::from(udp_len));
+    udp.extend_from_slice(&src_port.to_be_bytes());
+    udp.extend_from_slice(&dst_port.to_be_bytes());
+    udp.extend_from_slice(&udp_len.to_be_bytes());
+    udp.extend_from_slice(&[0, 0]);
+    udp.extend_from_slice(&payload);
+
+    let mut pseudo = Vec::with_capacity(12 + udp.len());
+    pseudo.extend_from_slice(&src.octets());
+    pseudo.extend_from_slice(&dst.octets());
+    pseudo.extend_from_slice(&[0, 17]);
+    pseudo.extend_from_slice(&udp_len.to_be_bytes());
+    pseudo.extend_from_slice(&udp);
+    let checksum = match ones_complement_sum(&pseudo) {
+        0 => u16::MAX,
+        checksum => checksum,
+    };
+    udp[6..8].copy_from_slice(&checksum.to_be_bytes());
+    ipv4_packet(src, dst, 17, &udp)
+}
+
+fn validate_udp_echo(
+    packet: &[u8],
+    expected_src: std::net::Ipv4Addr,
+    expected_src_port: u16,
+    expected_dst: std::net::Ipv4Addr,
+    expected_dst_port: u16,
+    expected_payload: &[u8],
+) -> Result<(), String> {
+    if packet.len() < 28 || packet[0] >> 4 != 4 {
+        return Err("reply is not a complete IPv4 UDP packet".to_owned());
+    }
+    let header_len = usize::from(packet[0] & 0x0f) * 4;
+    if header_len < 20 || header_len + 8 > packet.len() {
+        return Err("reply has an invalid IPv4 header length".to_owned());
+    }
+    let total_len = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
+    if total_len != packet.len() {
+        return Err(format!(
+            "IPv4 length says {total_len} bytes but received {}",
+            packet.len()
+        ));
+    }
+    if ones_complement_sum(&packet[..header_len]) != 0 {
+        return Err("invalid IPv4 header checksum".to_owned());
+    }
+    if packet[9] != 17 {
+        return Err(format!("expected UDP protocol 17, got {}", packet[9]));
+    }
+    let fragment = u16::from_be_bytes([packet[6], packet[7]]);
+    if fragment & 0x3fff != 0 {
+        return Err("fragmented UDP replies are not supported".to_owned());
+    }
+    let src = std::net::Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+    let dst = std::net::Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+    if src != expected_src || dst != expected_dst {
+        return Err(format!("unexpected addresses {src} -> {dst}"));
+    }
+
+    let udp = &packet[header_len..];
+    let src_port = u16::from_be_bytes([udp[0], udp[1]]);
+    let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
+    if src_port != expected_src_port || dst_port != expected_dst_port {
+        return Err(format!("unexpected UDP ports {src_port} -> {dst_port}"));
+    }
+    let udp_len = usize::from(u16::from_be_bytes([udp[4], udp[5]]));
+    if udp_len != udp.len() || udp_len < 8 {
+        return Err(format!(
+            "UDP length says {udp_len} bytes but received {}",
+            udp.len()
+        ));
+    }
+    if udp[8..] != *expected_payload {
+        return Err(format!(
+            "UDP payload mismatch: expected {} bytes, received {}",
+            expected_payload.len(),
+            udp.len() - 8
+        ));
+    }
+    let checksum = u16::from_be_bytes([udp[6], udp[7]]);
+    if checksum != 0 {
+        let mut pseudo = Vec::with_capacity(12 + udp.len());
+        pseudo.extend_from_slice(&src.octets());
+        pseudo.extend_from_slice(&dst.octets());
+        pseudo.extend_from_slice(&[0, 17]);
+        pseudo.extend_from_slice(&(udp.len() as u16).to_be_bytes());
+        pseudo.extend_from_slice(udp);
+        if ones_complement_sum(&pseudo) != 0 {
+            return Err("invalid UDP checksum".to_owned());
+        }
+    }
+    Ok(())
 }
 
 /// Wraps `payload` in an IPv4 header with a valid header checksum.
@@ -2272,6 +2420,79 @@ mod tests {
                 from_sdpc_placeholder: false,
             },
         )
+    }
+
+    #[test]
+    fn udp_probe_has_valid_lengths_checksums_and_payload() {
+        let src = "10.210.29.48".parse().unwrap();
+        let dst = "202.117.112.71".parse().unwrap();
+        let packet = build_udp_probe(src, 40_000, dst, 7, 1_372);
+
+        assert_eq!(packet.len(), 1_400);
+        assert_eq!(packet[9], 17);
+        assert_eq!(ones_complement_sum(&packet[..20]), 0);
+        assert_eq!(u16::from_be_bytes([packet[2], packet[3]]), 1_400);
+        assert_eq!(u16::from_be_bytes([packet[24], packet[25]]), 1_380);
+        assert_eq!(&packet[28..], udp_probe_payload(1_372));
+    }
+
+    #[test]
+    fn udp_echo_validation_accepts_exact_echo_and_rejects_corruption() {
+        let vip = "10.210.29.48".parse().unwrap();
+        let target = "202.117.112.71".parse().unwrap();
+        let payload = udp_probe_payload(33);
+        let mut reply = build_udp_probe(target, 7, vip, 40_000, payload.len());
+
+        validate_udp_echo(&reply, target, 7, vip, 40_000, &payload).unwrap();
+        *reply.last_mut().unwrap() ^= 1;
+        assert!(
+            validate_udp_echo(&reply, target, 7, vip, 40_000, &payload)
+                .unwrap_err()
+                .contains("payload mismatch")
+        );
+    }
+
+    #[test]
+    fn udp_probe_supports_ipv4_maximum_payload() {
+        let packet = build_udp_probe(
+            "192.0.2.1".parse().unwrap(),
+            1,
+            "198.51.100.2".parse().unwrap(),
+            2,
+            65_507,
+        );
+        assert_eq!(packet.len(), usize::from(u16::MAX));
+    }
+
+    #[test]
+    fn cli_accepts_udp_payload_size_and_rejects_oversize() {
+        let valid = Cli::try_parse_from([
+            "atrust-probe",
+            "--host",
+            "gateway.test",
+            "l3-session",
+            "--target",
+            "192.0.2.1:7",
+            "--probe",
+            "udp",
+            "--payload-bytes",
+            "1372",
+        ]);
+        assert!(valid.is_ok());
+
+        let oversized = Cli::try_parse_from([
+            "atrust-probe",
+            "--host",
+            "gateway.test",
+            "l3-session",
+            "--target",
+            "192.0.2.1:7",
+            "--probe",
+            "udp",
+            "--payload-bytes",
+            "65508",
+        ]);
+        assert!(oversized.is_err());
     }
 
     #[tokio::test]
