@@ -475,9 +475,9 @@ mock 只能证明实现自洽，证据级别不是 L0。
 目标不再策略拒绝，而是在约 15 秒收到 `05 03 network unreachable`，说明当前数据节点到该
 内网地址无路由。Hermes 的 specificity 在这两个目标上选择了正确的软件正版化资源。
 
-**仍未决：** 外层 TLS 会话中哪个不可见差异触发数据节点关闭尚未定位。下述完整差分已经排除
-内层 ClientHello 和可见的外层 ClientHello；不能通过关闭证书验证或继续调整内层扩展解决。
-此前两个 HTTP 80 目标的关闭是另一组样本，不应再与本次问题合并归因。
+**已解决（2026-08-05，见本节末尾）：** 此处及以下关于“外层 TLS 会话存在不可见差异”的推论
+全部是错误方向——根因是本端把节点的 padding 读成了关闭。保留这些记录是为了说明排除过程，
+不要再据此继续做 TLS 层实验。此前两个 HTTP 80 目标的关闭是另一组样本，不应与本问题合并归因。
 
 **ClientHello wire 差分（2026-08-05）：** 本地无凭据捕获确认 Go classic 和 rustls 分别为
 281 B、246 B，都是一个 TLS record，并各自落入一个 aTrust app frame。两边共同发送 SNI、
@@ -512,6 +512,70 @@ TLS 1.3 / AES-256-GCM；rustls TLS 1.2-only、OpenSSL TLS 1.3 和 `TCP_NODELAY` 
 外层会话返回应用数据，但对 Tokio 上的 rustls/OpenSSL 会话返回关闭；差异不在可见 ClientHello、
 协议版本、cipher、TLS record 边界或 aTrust 明文。** 下一步不应继续修改内层 TLS，而应使用
 Go TLS underlay/最小 Go sidecar 做 Hermes 外层对照，或捕获并比较解密后的外层 TLS 会话事件。
+
+**Go FFI underlay 结果（2026-08-05）：仍为阴性。** 新增实验性 Go `c-shared` 库，通过 Unix
+socketpair 把进程内 Go `crypto/tls` 会话暴露给 Tokio，并依次测试三个替换层级：
+
+1. 仅用 Go TLS 替换外层 rustls，Hermes 保持 setup/framing；
+2. Go TLS 同时完成 init、destination、address OK、probe 和 connect status；
+3. Go TLS 同时拥有与 zju `tcpTunnelConn` 相同的 `01 00` application framing。
+
+Rust→Go 桥使用私有长度前缀，确保每次 Rust write 对应一次 Go `tls.Conn.Write`；Go 模块版本也
+与 zju-connect 对齐为 `1.25.6`。三个层级均在首个目标响应前关闭，最后一级表现为桥接端
+`BrokenPipe`。紧接着用同一会话重跑 zju raw ClientHello 阳性对照，约 96 ms 完成 aTrust setup
+并收到 TLS ServerHello，因此不能归因于会话失效、节点限流或目标状态变化。
+
+这推翻了“只要换成 Go TLS/Go framing 就会成功”的产品假设。剩余差异位于 zju `DialTCP` 的
+连接上下文、调度/时序或尚未记录的 socket 行为；下一步应直接在 zju 与 FFI 库内记录同一组
+非敏感时间点和 socket options，而不是继续替换更多 TLS 层。
+
+**已定位并修复（2026-08-05）：根因是本端读帧过严，不在 TLS，也不在 zju 的连接上下文。**
+数据节点在 `05 00` connect status 之后、任何应用数据之前，紧接着发送 8 个字节：
+`01 01 00 00` 后跟 `00 00 00 00`。这段内容对 Hermes 和 zju 是一样的，区别在两边怎么读它：
+
+| 帧 | zju `tcpTunnelConn::Read` | 修复前的 Hermes `try_decode_app` |
+|---|---|---|
+| `01 01 00 00` | trailer 非 `30 30`，消费 4 字节后继续 | 视为服务端关闭，返回 EOF |
+| `00 00`（padding） | 分支链没有 `else`，消费 2 字节后继续 | `UnexpectedFrame` 报错 |
+| `01 01 30 30` | 真正的关闭 | — |
+
+也就是说 `01 01 00 00` **不是**服务端关闭。服务端关闭是 `01 01 30 30`（ASCII `"00"`），
+本次修复后的成功会话在响应读完时确实收到了它（`close_frame trailer0=48 trailer1=48`）。
+`01 01 00 00` 只是本端 `Close()` 发出去的关闭帧，两个方向并不对称。
+
+修复后同一会话、同一节点 `61.150.43.94:441`、同一 appId 下三个目标全部通过，
+**且目标证书是完整校验的（`certificate_verified=true`）**：
+
+| 目标 | HTTP | body | 同日 zju 对照 |
+|---|---:|---:|---:|
+| `gsoft.xidian.edu.cn:443` | 200 | 67361 B | 66583 B |
+| `www.xidian.edu.cn:443` | 200 | 164887 B | 163772 B |
+| `www.cnki.net:443` | 200 | 106360 B | 105912 B |
+
+body 大小是动态内容，两侧不会逐字节相同；量级一致即可。zju 对照是在 Hermes 失败之后、
+用同一个 session 文件当场跑的（94 ms，HTTP 200），所以"两端此刻都可用"是验证过的前提，
+不是引用历史结果。
+
+**为什么此前所有 TLS 实验都是阴性**：失败发生在读第一个响应帧时，早于任何 TLS 指纹能起
+作用的位置。逐字节对齐内层 ClientHello、外层 ClientHello，乃至把整个外层 TLS 换成 Go，
+都不可能改变一个本端解析错误。文档此前把“Hermes 在 ClientHello 之后收到 `01 01 00 00`”
+读成了服务端的响应，实际那 8 个字节在我们发出 ClientHello 之前就已经在缓冲区里——
+日志时间戳相差 66 µs，而该节点 RTT 约 88 ms。
+
+**因此上面 Go FFI 段落的结论作废**：三个层级失败的原因是 FFI 桥
+`copyApplicationResponses` 复制了同一个缺陷（`01 01` 一律终止、未知头 `default: return`），
+桥先自行拆除，Rust 端才看到 `BrokenPipe`，而不是节点关闭。那三条"阴性"不构成关于节点的证据。
+
+**Go FFI 实验已删除。** `crates/hermes-go-tls-ffi`、`experiments/go-tls-ffi`，以及
+`HERMES_NODE_TLS_BACKEND=go-ffi` 相关的 `NodeTlsStream` 枚举、`connect_go_tls_atrust` 和
+`TcpTunnel` 的 framing 旁路全部移除，节点 TLS 回到单一 rustls 实现。保留一个基于错误前提的
+可选传输层，只会让后来者以为"换 Go TLS"仍是一个待验证选项。上面的段落作为排除过程的记录保留。
+
+**已排除（同日实测，负面对照）：** 新增 `tcp-dial --skip-node-probe` 跳过 dial 前的节点
+延迟探测后，失败逐字节不变。dial 前那次“完整 TLS 握手后零应用字节丢弃”的探测与本问题无关。
+
+**现在的容忍规则**：未识别的 2 字节头消费后继续，与 zju 一致，但加了 1024 字节上界，
+使真正的流失步仍然可见。`05 81` 在数据阶段也按 2 字节跳过。
 
 ---
 
