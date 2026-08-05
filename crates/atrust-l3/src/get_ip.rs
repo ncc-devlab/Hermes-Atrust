@@ -9,6 +9,7 @@ use serde::Serialize;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
+use tracing::debug;
 
 const MAX_PROTOCOL_RESPONSE: usize = 64 * 1024;
 /// Bound response framing so a hostile peer cannot keep the reader busy forever.
@@ -100,6 +101,13 @@ where
     for _ in 0..MAX_RESPONSE_FRAMES {
         let mut header = [0u8; 2];
         stream.read_exact(&mut header).await?;
+        // Every header, not just the rejected ones: A9 asks which frames the
+        // node actually emits here, and a successful run is the cheapest sample.
+        debug!(
+            event = "atrust_l3.get_ip.header",
+            h0 = header[0],
+            h1 = header[1]
+        );
 
         if header == [0x05, 0xd0] {
             // Method selection ack: two bytes, no payload.
@@ -150,6 +158,25 @@ where
             });
         }
 
+        // About to fail anyway, so capture what follows before giving up: the
+        // header alone cannot tell whether this frame carries a length field,
+        // which is exactly what A9 needs before the reader can safely skip it.
+        let mut tail = [0u8; 64];
+        let captured = match timeout(Duration::from_millis(500), stream.read(&mut tail)).await {
+            Ok(Ok(read)) => &tail[..read],
+            _ => &[][..],
+        };
+        debug!(
+            event = "atrust_l3.get_ip.unexpected_header",
+            h0 = header[0],
+            h1 = header[1],
+            tail_bytes = captured.len(),
+            tail = %captured
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
         return Err(GetIpv4Error::UnexpectedHeader(header));
     }
 
