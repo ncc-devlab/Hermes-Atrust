@@ -10,15 +10,15 @@ use std::time::Duration;
 use atrust_auth::{
     AuthClient, AuthConfigOptions, AuthConfiguration, FlowProtocol, LoginMethod,
     PasswordCredentials, SessionMaterial, SessionProgress, StoredSession, UnadvertisedNode,
-    extract_sid_from_cookies, select_node,
+    extract_sid_from_cookies, select_node, select_node_with,
 };
 use atrust_browser::{BrowserKind, WebDriverBrowser, append_trace_event};
 use clap::{Parser, Subcommand, ValueEnum};
 use hermes_logging::{LogFormat, LoggerConfig};
 use hermes_model::{DeviceId, GatewayEndpoint, SecretString};
 use hermes_transport::{
-    HttpTransport, ReqwestTransport, ReqwestTransportConfig, TargetTlsProfile, TlsPolicy,
-    connect_tls_over_with_profile, probe_node_tls,
+    HttpTransport, NodeTlsProbeOutcome, ReqwestTransport, ReqwestTransportConfig, TargetTlsProfile,
+    TlsPolicy, connect_tls_over_with_profile, probe_node_tls,
 };
 use rand::Rng as _;
 use serde_json::json;
@@ -234,6 +234,14 @@ enum Command {
         /// the advertised list is itself under investigation.
         #[arg(long)]
         allow_unadvertised_node: bool,
+        /// Dial `--node` directly, without the latency probe that precedes it.
+        ///
+        /// The probe completes a full TLS handshake to the node and drops it
+        /// having sent nothing. This makes the dial the process's only
+        /// connection to the node, matching the zju-connect reference, so the
+        /// probe can be ruled in or out as an influence on the dial.
+        #[arg(long, requires = "node")]
+        skip_node_probe: bool,
         /// Server-side destination the tunnel connects to, as `host:port`.
         #[arg(long)]
         target: String,
@@ -990,6 +998,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             session_file,
             node,
             allow_unadvertised_node,
+            skip_node_probe,
             target,
             app_id,
             send_http,
@@ -1059,6 +1068,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 NodeChoice {
                     node: node.as_deref(),
                     allow_unadvertised: allow_unadvertised_node,
+                    skip_probe: skip_node_probe,
                     tls_policy,
                     connect_timeout: Duration::from_secs(connect_timeout_seconds.max(1)),
                     trace_file: cli.browser_trace_file.as_deref(),
@@ -1228,6 +1238,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 NodeChoice {
                     node: node.as_deref(),
                     allow_unadvertised: allow_unadvertised_node,
+                    skip_probe: false,
                     tls_policy,
                     connect_timeout: Duration::from_secs(timeout_seconds.max(1)),
                     trace_file: cli.browser_trace_file.as_deref(),
@@ -1382,6 +1393,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 NodeChoice {
                     node: node.as_deref(),
                     allow_unadvertised: allow_unadvertised_node,
+                    skip_probe: false,
                     tls_policy,
                     connect_timeout: Duration::from_secs(connect_timeout_seconds.max(1)),
                     trace_file: cli.browser_trace_file.as_deref(),
@@ -2223,6 +2235,9 @@ async fn resolve_data_node(
 struct NodeChoice<'a> {
     node: Option<&'a str>,
     allow_unadvertised: bool,
+    /// Skips the latency probe and takes `node` as given. Only meaningful with
+    /// an explicit `node`, since without one the ranking is what picks.
+    skip_probe: bool,
     tls_policy: TlsPolicy,
     connect_timeout: Duration,
     trace_file: Option<&'a Path>,
@@ -2266,14 +2281,31 @@ async fn select_data_nodes(
     } else {
         UnadvertisedNode::Reject
     };
-    let selection = select_node(
-        &candidates,
-        request.node,
-        unadvertised,
-        request.tls_policy,
-        request.connect_timeout,
-    )
-    .await?;
+    // The probe completes a full TLS handshake and drops it with zero
+    // application bytes. Skipping it leaves the dial as the only connection this
+    // process makes to the node, which is what the zju-connect control does.
+    let selection = if request.skip_probe {
+        warn!(
+            event = "probe.node_select.probe_skipped",
+            requested = request.node.unwrap_or_default()
+        );
+        select_node_with(
+            &candidates,
+            request.node,
+            unadvertised,
+            |_host, _port| async { (NodeTlsProbeOutcome::Ok, Duration::ZERO) },
+        )
+        .await?
+    } else {
+        select_node(
+            &candidates,
+            request.node,
+            unadvertised,
+            request.tls_policy,
+            request.connect_timeout,
+        )
+        .await?
+    };
     report_node_selection(&selection, request.trace_file)?;
     Ok(selection.failover_endpoints())
 }
