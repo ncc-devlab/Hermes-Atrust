@@ -4,8 +4,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rustls::ClientConfig;
+use rustls::client::Resumption;
 use rustls::pki_types::ServerName;
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
@@ -123,7 +125,57 @@ pub async fn connect_tls(
     let stream = TcpStream::connect(addr)
         .await
         .map_err(TlsConnectError::Tcp)?;
-    let connector = TlsConnector::from(Arc::new(client_config(tls_policy)));
+    let connector = TlsConnector::from(Arc::new(client_config(tls_policy, false)));
+    let tls = connector
+        .connect(server_name, stream)
+        .await
+        .map_err(TlsConnectError::Tls)?;
+    debug!(
+        event = "transport.node_tls_connected",
+        protocol_version = ?tls.get_ref().1.protocol_version(),
+        cipher_suite = ?tls.get_ref().1.negotiated_cipher_suite().map(|suite| suite.suite())
+    );
+    Ok(tls)
+}
+
+/// Establishes target TLS over an existing byte stream, with normal target SNI.
+pub async fn connect_tls_over<S>(
+    stream: S,
+    server_name: &str,
+    tls_policy: TlsPolicy,
+) -> Result<tokio_rustls::client::TlsStream<S>, TlsConnectError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    connect_tls_over_with_profile(stream, server_name, tls_policy, TargetTlsProfile::Default).await
+}
+
+/// TLS protocol and resumption settings used for target-side compatibility probes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TargetTlsProfile {
+    #[default]
+    Default,
+    NoResumption,
+    Tls12Only,
+    Tls12OnlyNoResumption,
+    Tls13Only,
+}
+
+/// Establishes target TLS with an explicit compatibility-test profile.
+pub async fn connect_tls_over_with_profile<S>(
+    stream: S,
+    server_name: &str,
+    tls_policy: TlsPolicy,
+    profile: TargetTlsProfile,
+) -> Result<tokio_rustls::client::TlsStream<S>, TlsConnectError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let server_name = ServerName::try_from(server_name.to_owned())
+        .map_err(|_| TlsConnectError::InvalidServerName)?;
+    let connector = TlsConnector::from(Arc::new(client_config_with_profile(
+        tls_policy, true, profile,
+    )));
     connector
         .connect(server_name, stream)
         .await
@@ -152,20 +204,43 @@ async fn resolve_first(host: &str, port: u16) -> Result<SocketAddr, std::io::Err
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no addresses"))
 }
 
-fn client_config(policy: TlsPolicy) -> ClientConfig {
+fn client_config(policy: TlsPolicy, enable_sni: bool) -> ClientConfig {
+    client_config_with_profile(policy, enable_sni, TargetTlsProfile::Default)
+}
+
+fn client_config_with_profile(
+    policy: TlsPolicy,
+    enable_sni: bool,
+    profile: TargetTlsProfile,
+) -> ClientConfig {
+    let versions: &[&'static rustls::SupportedProtocolVersion] = match profile {
+        TargetTlsProfile::Tls12Only | TargetTlsProfile::Tls12OnlyNoResumption => {
+            &[&rustls::version::TLS12]
+        }
+        TargetTlsProfile::Tls13Only => &[&rustls::version::TLS13],
+        TargetTlsProfile::Default | TargetTlsProfile::NoResumption => rustls::ALL_VERSIONS,
+    };
+    let builder =
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(versions)
+            .expect("ring provider supports the selected TLS versions");
     let mut config = match policy {
         TlsPolicy::Verify => {
             let mut roots = rustls::RootCertStore::empty();
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth()
+            builder.with_root_certificates(roots).with_no_client_auth()
         }
-        TlsPolicy::DangerousAcceptInvalidCertificates => ClientConfig::builder()
+        TlsPolicy::DangerousAcceptInvalidCertificates => builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
             .with_no_client_auth(),
     };
+    if matches!(
+        profile,
+        TargetTlsProfile::NoResumption | TargetTlsProfile::Tls12OnlyNoResumption
+    ) {
+        config.resumption = Resumption::disabled();
+    }
     // Data-plane nodes are SDP gateways, not name-based virtual hosts: the real
     // Xidian node (`61.150.43.94:441`) silently discards any ClientHello that
     // carries an SNI extension, regardless of the name inside it. Relying on
@@ -174,7 +249,7 @@ fn client_config(policy: TlsPolicy) -> ClientConfig {
     // `{{sdpcHost}}` substitution) hanging with no error and no diagnosis.
     // Certificate name verification is unaffected; it uses the `ServerName`
     // passed to `connect`, not this flag.
-    config.enable_sni = false;
+    config.enable_sni = enable_sni;
     config
 }
 
@@ -246,8 +321,23 @@ mod tests {
     /// path runs under `Verify`, the dial path usually under the dangerous one.
     #[test]
     fn data_plane_tls_never_sends_sni() {
-        assert!(!client_config(TlsPolicy::Verify).enable_sni);
-        assert!(!client_config(TlsPolicy::DangerousAcceptInvalidCertificates).enable_sni);
+        assert!(!client_config(TlsPolicy::Verify, false).enable_sni);
+        assert!(client_config(TlsPolicy::Verify, true).enable_sni);
+        assert!(!client_config(TlsPolicy::DangerousAcceptInvalidCertificates, false).enable_sni);
+        assert!(client_config(TlsPolicy::DangerousAcceptInvalidCertificates, true).enable_sni);
+    }
+
+    #[test]
+    fn target_tls_profiles_select_versions_and_resumption() {
+        let tls12 = client_config_with_profile(
+            TlsPolicy::Verify,
+            true,
+            TargetTlsProfile::Tls12OnlyNoResumption,
+        );
+        let tls13 =
+            client_config_with_profile(TlsPolicy::Verify, true, TargetTlsProfile::Tls13Only);
+        assert!(tls12.enable_sni);
+        assert!(tls13.enable_sni);
     }
 
     #[tokio::test]

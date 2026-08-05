@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use atrust_l3::{
-    FlowAuthStats, Ipv4Flow, L3AuthContext, L3Session, L3SessionError, parse_ipv4_flow,
+    FlowAuthStats, Ipv4Flow, L3AuthContext, L3CloseReason, L3Session, L3SessionError,
+    parse_ipv4_flow,
 };
 use atrust_protocol::ProcessIdentity;
 use hermes_model::{ConnectionId, DeviceId, SessionId, SignKey};
@@ -556,6 +557,9 @@ async fn peer_disconnect_wakes_the_waiter_without_waiting_for_the_timeout() {
     .expect_err("no token on a dead connection");
     assert!(matches!(error, L3SessionError::Closed), "{error}");
     assert!(session.is_closed());
+    let close = session.close_info().expect("peer closure is retained");
+    assert_eq!(close.reason, L3CloseReason::PeerEof);
+    assert!(close.detail.contains("closed by peer"));
 }
 
 /// A peer that accepts `0x13` and never answers must not wedge the flow: the
@@ -613,7 +617,33 @@ async fn heartbeats_are_emitted_on_the_configured_interval() {
     tokio::time::sleep(Duration::from_millis(260)).await;
     let beats = stats.heartbeats();
     assert!(beats >= 2, "expected repeated heartbeats, saw {beats}");
+    let heartbeat = session.heartbeat_stats();
+    assert!(heartbeat.requests_sent >= 2, "{heartbeat:?}");
+    assert!(heartbeat.acknowledgements_received >= 2, "{heartbeat:?}");
+    assert!(
+        heartbeat.requests_sent >= heartbeat.acknowledgements_received,
+        "{heartbeat:?}"
+    );
+    assert!(heartbeat.last_ack_at.is_some(), "{heartbeat:?}");
+    assert!(heartbeat.last_ack_age.is_some(), "{heartbeat:?}");
     assert!(!session.is_closed());
+}
+
+#[tokio::test]
+async fn caller_close_records_the_first_close_reason() {
+    let (session, _stats, peer) = session_with(
+        AuthBehaviour::Grant {
+            token: "tok".to_owned(),
+        },
+        IDLE_HEARTBEAT,
+    )
+    .await;
+
+    session.close().await;
+    let close = session.close_info().expect("caller closure is retained");
+    assert_eq!(close.reason, L3CloseReason::Caller);
+    assert!(close.detail.contains("caller"));
+    let _ = peer.await;
 }
 
 #[tokio::test]

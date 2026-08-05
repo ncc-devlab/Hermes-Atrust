@@ -440,6 +440,79 @@ rustls 就会发 SNI，连接静默挂死且无任何错误。
 `61.150.43.94:441` 可能根本不在列表里。**跑完 E1 之后就不应该再需要它**——
 如果还需要，那本身就是一条要记录的发现。
 
+### D4 — TCP connect 成功后首个应用数据触发关闭 <a id="d4"></a>
+
+**参考行为（L1）：** zju-connect 的 `tcpTunnelConn` 将 `01 00 <u16 len> <payload>` 暴露为
+普通 `net.Conn`；上层 `net/http.Transport` 对 HTTPS 自然再套一层目标 TLS。Hermes 的
+`TcpTunnel` 同样实现 `AsyncRead + AsyncWrite`，并按相同布局封装数据。目标 TLS 必须启用
+目标域名 SNI，不能继承数据节点的 no-SNI 特例。
+
+**本地状态：** `atrust-probe tcp-dial --send-https` 已实现双层 TLS、独立目标证书策略、
+有界多帧响应累计和总超时。空 AsyncWrite 不再错误地产生零长度 probe 帧；数据阶段的
+结构化 `code=0, message=OK` 与地址阶段使用同一严格成功判定。以上均有本地测试，但本地
+mock 只能证明实现自洽，证据级别不是 L0。
+
+**L0（2026-08-05，同会话 zju-connect 对照）：** live-only 测试从 `0600` Hermes session 文件
+注入完全相同的 SID、DeviceID、ConnectionID、SignKey 和资源正文，固定使用广告节点
+`61.150.43.94:441`。精确资源旁路下三个域名均完成 aTrust 授权、目标 TLS 和 HTTP 200：
+
+| 目标 | aTrust 授权 | 目标 TLS | HTTP body |
+|---|---:|---:|---:|
+| `www.xidian.edu.cn:443` | 约 140 ms | TLS 1.2 | 163772 B |
+| `www.cnki.net:443` | 约 271 ms | TLS 1.3 | 105912 B |
+| `gsoft.xidian.edu.cn:443` | 约 102 ms | TLS 1.2 | 66583 B |
+
+这证明 `01 00 <u16 len> <payload>` 应用帧布局和透明流分层正确，推翻了“目标服务或 appId
+普遍不可用”的解释。Hermes 对同一个 gsoft 目标仍在 rustls ClientHello 后收到
+`01 01 00 00` 并报 `tls handshake eof`。Go 默认 ClientHello 为 1507 B；禁用 PQ key-share、
+只保留 X25519/P-256 后缩为 281 B，仍协商 TLS 1.2 `0xc030` 并成功。Rustls ClientHello 为
+246 B。因此问题已经收敛为**目标 TLS ClientHello 扩展/指纹差异**，不是长度、PQ、SNI、
+基础 cipher suite 或 aTrust 应用 framing。
+
+**zju-connect 资源匹配的两个独立缺陷（不应复制）：** 同域名的 80/443 条目写入单值 map 时
+互相覆盖，使 www.xidian/CNKI 的原生 443 匹配为空；IP 重叠使用 last-match，使
+`10.255.72.81:80/443` 选到无关 appId 并立即收到 `no 'appId' field`。注入精确资源后两个 IP
+目标不再策略拒绝，而是在约 15 秒收到 `05 03 network unreachable`，说明当前数据节点到该
+内网地址无路由。Hermes 的 specificity 在这两个目标上选择了正确的软件正版化资源。
+
+**仍未决：** 外层 TLS 会话中哪个不可见差异触发数据节点关闭尚未定位。下述完整差分已经排除
+内层 ClientHello 和可见的外层 ClientHello；不能通过关闭证书验证或继续调整内层扩展解决。
+此前两个 HTTP 80 目标的关闭是另一组样本，不应再与本次问题合并归因。
+
+**ClientHello wire 差分（2026-08-05）：** 本地无凭据捕获确认 Go classic 和 rustls 分别为
+281 B、246 B，都是一个 TLS record，并各自落入一个 aTrust app frame。两边共同发送 SNI、
+status request、EMS、point formats、TLS 1.2/1.3、X25519 key share，且都不发 ALPN。Go 独有
+`renegotiation_info`、SCT、`signature_algorithms_cert`；rustls 独有 `psk_key_exchange_modes`、
+空 `session_ticket`，并用 SCSV 表示安全重协商。扩展顺序和 cipher 顺序完全不同，JA3 分别为
+`5c4e3d1520f523c80030e4bb4085e740` 与 `a59be6093cc1047d346455f4726ab681`。
+
+把 Go 限制为与 rustls 相同的 6 个 TLS 1.2 AEAD suites，并使用
+`X25519/P-256/P-384` 后，ClientHello 为 275 B，gsoft 仍协商 TLS 1.2 `0xc030` 并返回
+HTTP 200。因此 CBC 支持、supported groups 集合和 TLS 1.2 suite 能力基本可排除；下一轮应
+优先比较/消除扩展集合与顺序、signature algorithms 顺序和 TLS 1.3 suite 排序。
+
+**完整差分结果（2026-08-05）：内层 ClientHello 不是根因。** rustls 0.23.42 临时分支增加了
+实验 profile，可精确控制扩展集合/顺序、signature algorithms 和 cipher 顺序。生成的 275 B
+内层 ClientHello 与成功的 Go 样本除 random、session ID 和 X25519 公钥外逐字节一致，Hermes
+仍收到 `01 01 00 00`。交叉注入给出决定性反证：
+
+| 外层隧道 | 注入的内层 ClientHello | 结果 |
+|---|---|---|
+| zju-connect / Go TLS | rustls 生成的 275 B 精确 Go profile | 返回 TLS ServerHello |
+| Hermes / rustls | 已成功的 Go 275 B 原始样本 | `01 01 00 00` |
+| Hermes / rustls | 直接 `write_app/read_app`，绕过 AsyncRead/AsyncWrite | `01 01 00 00` |
+
+因此内层 rustls、X25519 公钥、`TcpTunnel` 流适配层均可排除。两端的签名后 init frame（906 B）
+和 destination frame（26 B）SHA-256 完全一致；透明代理还确认 Hermes 外层 TLS 对 init、dest、
+probe、app 分别产生单独 record，明文长度依次为 906、26、4、279，与 Go 相同。外层均协商
+TLS 1.3 / AES-256-GCM；rustls TLS 1.2-only、OpenSSL TLS 1.3 和 `TCP_NODELAY` 也全部失败。
+
+进一步把外层 rustls ClientHello 魔改为 Go classic profile 后，两者均为 247 B，除三个随机字段
+外逐字节一致，结果仍不变。当前最窄结论是：**数据节点在完成相同 aTrust 握手后，对 Go TLS
+外层会话返回应用数据，但对 Tokio 上的 rustls/OpenSSL 会话返回关闭；差异不在可见 ClientHello、
+协议版本、cipher、TLS record 边界或 aTrust 明文。** 下一步不应继续修改内层 TLS，而应使用
+Go TLS underlay/最小 Go sidecar 做 Hermes 外层对照，或捕获并比较解密后的外层 TLS 会话事件。
+
 ---
 
 ## E. 判定实验
@@ -829,9 +902,81 @@ drop=0；探针随即以 `E7 session closed during the hold` 非零退出，没�
 因此这不是「4 小时失败后的模糊结果」，而是**西电已建立 L3 连接寿命落在 57–58 分钟**的直接样本。
 日志 `/tmp/e7-4h.log`。
 
+历史调试日志已按文件修改日期归档到本地 `debug_logs/`，命名为 `日期-简述.log`；目录可能包含有效期内
+会话信息，因此保持 git ignored，不进入版本库。上述两份 E7 日志分别归档为
+`debug_logs/2026-08-04-e7-30s.log` 和 `debug_logs/2026-08-04-e7-4h.log`。
+
 本组隔离了控制面刷新，尚不能判断断开是服务端 L3 绝对寿命、heartbeat ACK 容忍策略，还是控制面
 SID 在连接内的联动失效。下一组应保持其它变量不变，只把 resource refresh 改为 60 秒；若仍在约
-58 分钟断开，控制面续期解释基本可排除。另应给 heartbeat ACK 增加计数，以确认断开前是否先停止 ACK。
+58 分钟断开，控制面续期解释基本可排除。heartbeat ACK 计数现已增加，可确认断开前是否先停止 ACK。
+
+**2026-08-04 诊断增强：** session 现在分别记录成功 write+flush 的 heartbeat 数、收到的 `0x95` ACK
+数、最后 ACK 的墙钟时间与单调 age。关闭时首个原因按 `peer_eof`、`read_error`、`write_error`、
+`flush_error`、`framing_error` 等稳定类别保留，同时保存详情和关闭时间，后续 caller shutdown 不再覆盖
+真正原因。E7 每个 sample 及 trace 都包含这些字段。
+
+`--reconnect-after-close` 保持原 E7 默认判据不变，但在观测到原 session 关闭后，通过正常 manager 路径
+建立新 session，按新 VIP 重建源端口 `+1` 的 packet 并授权；只有 session pointer 已替换、新连接未关闭、
+新授权恰好产生一个 request/verdict 且无 timeout 才通过。固定 lease 与自动重连可用同一次 70 分钟运行验证：
+
+```bash
+./target/debug/atrust-probe --host atrust.xidian.edu.cn --insecure-tls \
+  --log-file /tmp/e7-lease-refresh60-reconnect.log \
+  l3-session --session-file ~/.hermes/xidian-session.json \
+  --node 61.150.43.94:441 --target 202.117.112.71:8081 \
+  --probe tcp-syn --auth-only --src-port 45000 \
+  --hold-seconds 4200 --heartbeat-seconds 25 --status-interval-seconds 10 \
+  --resource-refresh-seconds 60 --connect-timeout-seconds 20 \
+  --reconnect-after-close
+```
+
+若 ACK 一直增长且最后 ACK age 在断开前仍接近 25 秒，同时 refresh=60 的连接仍在约 57–58 分钟收到
+`peer_eof`，则固定 L3 lease 的解释得到强支持。2026-08-04 的新指标 live 预检被控制面在建连前以
+`75500002 / The session is invalid` 拒绝，未产生 L3 样本；日志归档为
+`debug_logs/2026-08-04-e7-heartbeat-metrics-session-invalid.log`，需新鲜 CAS 会话后复跑上述命令。
+
+**refresh=60 + ACK + 重连结果（L0，2026-08-04 09:56–10:50 UTC）：原连接关闭，重连失败。**
+原 session 在 elapsed=3240 秒仍健康，3250 秒采样首次 closed；关闭类别为 `read_error`，详情是 peer
+未发送 TLS `close_notify` 的 unexpected EOF。断开前 heartbeat sent=129、ACK=129，没有未应答心跳；
+最后 ACK 在关闭采样前约 25.6 秒返回。资源 generation 44 在关闭前约 17 秒仍刷新成功，drop=0、auth
+in-flight=0，因此 heartbeat 丢失、资源刷新停止、本地拥塞和 systemd 终止均可排除。manager 随即尝试
+新 Get-IP，但 peer 直接 `early eof`，所以本次进程 FAIL 的直接原因是新 session 无法建立，而不是原
+session 的关闭原因未识别。
+
+本次 L3 连接自身约存活 54 分 10 秒，低于上一样本的 57–58 分钟；但按 CAS 会话文件保存时间对齐，
+两次从保存到断开分别约为 62 分 43 秒和 63 分 30 秒。连接寿命随“登录后多久才开始 E7”而变化，
+登录到断开的绝对时间却都接近 63 分钟。这组证据反对“Get-IP 后固定 L3 lease”，更支持认证/SID 派生的
+约一小时绝对到期；周期 `clientResource` 成功不续期该数据面授权。到期后用同一 SID 自动重连预计无法
+成功，因此固定寿命和 manager 重连不能再合并为一个 PASS：下一次应在新鲜会话建立后主动关闭 L3，
+单独验证 SID 有效期内的自动重连；认证到期则需要上层重新登录并替换 runtime session material。
+
+完整日志：`debug_logs/2026-08-04-e7-lease-refresh60-reconnect.log`。
+
+**新鲜 SID 主动断线重连（L0，2026-08-05 02:30 UTC）：通过。** 为避免再次把认证到期和重连能力
+混在一起，E7 新增 `--force-reconnect-after-seconds`，仅与 `--reconnect-after-close` 配合使用。该模式
+在指定时间调用 runtime 的正常 reconnect 控制路径，保留原 session 统计，再要求 manager 建立不同
+`Arc<L3Session>`、按新 VIP 重建 packet 并授权一个新源端口流：
+
+```bash
+HERMES_LOG=info ./target/debug/atrust-probe \
+  --host atrust.xidian.edu.cn --insecure-tls \
+  --log-file /tmp/e7-fresh-forced-reconnect.log \
+  l3-session --session-file ~/.hermes/xidian-session.json \
+  --node 61.150.43.94:441 --target 202.117.112.71:8081 \
+  --probe tcp-syn --auth-only --src-port 46000 \
+  --hold-seconds 90 --heartbeat-seconds 25 --status-interval-seconds 10 \
+  --resource-refresh-seconds 60 --connect-timeout-seconds 20 \
+  --reconnect-after-close --force-reconnect-after-seconds 30
+```
+
+原 session 在 30 秒时以 `caller` 原因关闭，关闭前 heartbeat sent=1、ACK=1、drop=0；原 VIP 为
+`10.210.29.66`。manager 在约 98 ms 内完成新 Get-IP，session pointer 确认已替换，新 VIP 仍为
+`10.210.29.66`，因此没有 `L3VipChanged` 事件。新 Get-IP status 仍为 code=0/OK，源端口 `46001`
+的新流在 replacement session 上产生且仅产生一个 wire request、一个 verdict、零 timeout。由关闭到
+新流授权完成约 124 ms。这证明 SID 有效期内的主动断线、惰性重建、VIP 复核和新流授权链路正常；
+此前自然到期后的 early EOF 应归因于凭证生命周期，而不是通用 L3 重连故障。
+
+日志：`debug_logs/2026-08-05-e7-fresh-forced-reconnect.log`。
 
 ### E8 — 并发多流与同流去重 <a id="e8"></a>
 

@@ -79,7 +79,8 @@ TLS 到节点
    `calculate_request_signature`（HMAC-SHA256 大写 hex）。
 3. **禁止** `fmt::sprintf` 拼签名 JSON（Go 现网有此模式，Rust 重写必须强类型）。
 4. 首个联调目标：校内已知 HTTP 端口或用户指定 `host:port`，只验证读写回环。
-5. 超时、取消、半关闭、short-write：本地 mock duplex 握手 + 应用帧回环已单测；live 仍 ignored。
+5. 超时、取消、半关闭、short-write：握手 + 应用帧回环已有基础 mock；完整半关闭和
+   short-write 对端行为仍待补，不能视为已覆盖。
 
 **状态（2026-07-29）：已 live 打通（公网参考服务端）。** `atrust-probe tcp-dial` 对
 `Hermes-aTrust-Server`（`103.99.178.36`，control `:8443` / data `:8444`）完成：
@@ -89,6 +90,10 @@ psw 登录 → jar 导出 SID → `SessionMaterial`（`sign_key_provisional=true
 `1.1.1.1:80`）→ 干净关闭。证实：客户端临时随机 SignKey 模型正确（服务端 UnboundAccepted
 兼容放行）、帧与状态机逐字节互通。节点 `--node` 覆盖为必需（`policy.json` 广告的是
 服务端本机 `127.0.0.1:8444`）。拨号 TLS connect+handshake 约 6.3s（链路较慢），超时预算宜放宽。
+
+2026-08-05 同会话 zju-connect 对照已证明西电 TCP 应用 framing 和隧道内 TLS 可用；三个 HTTPS
+目标均返回 HTTP 200。Hermes 的 rustls ClientHello 被目标路径关闭，问题已收敛到 TLS 指纹差异，
+不是 aTrust `01 00` 布局。完整结果和 zju 资源匹配缺陷登记在 `open-questions.md` 的 D4。
 
 ### Phase D — L3（Get-IP 探针已落地）
 

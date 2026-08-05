@@ -93,9 +93,20 @@ pub fn parse_status_payload(input: &[u8]) -> Result<&[u8], TcpFrameError> {
     Ok(&input[4..end])
 }
 
-/// True when payload is the ASCII `OK` success body (any surrounding whitespace rejected).
+/// True for either the short `OK` body or the gateway's structured success body.
 pub fn is_status_ok(payload: &[u8]) -> bool {
-    payload == b"OK"
+    if payload == b"OK" {
+        return true;
+    }
+
+    #[derive(serde::Deserialize)]
+    struct StatusBody {
+        code: i64,
+        message: String,
+    }
+
+    serde_json::from_slice::<StatusBody>(payload)
+        .is_ok_and(|body| body.code == 0 && body.message == "OK")
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -153,6 +164,11 @@ mod tests {
         let mut buf = vec![0x53, 0x00, 0x00, 0x02];
         buf.extend_from_slice(b"OK");
         assert!(is_status_ok(parse_status_payload(&buf).unwrap()));
+        assert!(is_status_ok(
+            br#"{"code":0,"data":{"vip":"10.0.0.1"},"message":"OK"}"#
+        ));
+        assert!(!is_status_ok(br#"{"code":1,"message":"OK"}"#));
+        assert!(!is_status_ok(br#"{"code":0,"message":"failed"}"#));
         assert_eq!(
             parse_status_payload(&[0x05, 0x00, 0x00, 0x00]),
             Err(TcpFrameError::UnexpectedStatusHeader { got: [0x05, 0x00] })

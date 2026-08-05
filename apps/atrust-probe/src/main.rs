@@ -13,14 +13,16 @@ use atrust_auth::{
     extract_sid_from_cookies, select_node,
 };
 use atrust_browser::{BrowserKind, WebDriverBrowser, append_trace_event};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use hermes_logging::{LogFormat, LoggerConfig};
 use hermes_model::{DeviceId, GatewayEndpoint, SecretString};
 use hermes_transport::{
-    HttpTransport, ReqwestTransport, ReqwestTransportConfig, TlsPolicy, probe_node_tls,
+    HttpTransport, ReqwestTransport, ReqwestTransportConfig, TargetTlsProfile, TlsPolicy,
+    connect_tls_over_with_profile, probe_node_tls,
 };
 use rand::Rng as _;
 use serde_json::json;
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tracing::{error, info, warn};
 use url::Url;
 
@@ -59,6 +61,28 @@ struct Cli {
     max_response_body: usize,
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum TargetTlsProfileArg {
+    #[default]
+    Default,
+    NoResumption,
+    Tls12Only,
+    Tls12OnlyNoResumption,
+    Tls13Only,
+}
+
+impl From<TargetTlsProfileArg> for TargetTlsProfile {
+    fn from(value: TargetTlsProfileArg) -> Self {
+        match value {
+            TargetTlsProfileArg::Default => Self::Default,
+            TargetTlsProfileArg::NoResumption => Self::NoResumption,
+            TargetTlsProfileArg::Tls12Only => Self::Tls12Only,
+            TargetTlsProfileArg::Tls12OnlyNoResumption => Self::Tls12OnlyNoResumption,
+            TargetTlsProfileArg::Tls13Only => Self::Tls13Only,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -217,9 +241,24 @@ enum Command {
         /// rejected; this never overrides server policy.
         #[arg(long)]
         app_id: Option<String>,
-        /// After the handshake, send a minimal `GET / HTTP/1.0` and read one app frame.
-        #[arg(long)]
+        /// After the handshake, send a plaintext GET and accumulate the response.
+        #[arg(long, conflicts_with = "send_https")]
         send_http: bool,
+        /// Establish TLS to the target inside the aTrust tunnel, then GET `/`.
+        #[arg(long, conflicts_with = "send_http")]
+        send_https: bool,
+        /// Send one captured ClientHello and report only the TLS record header response.
+        #[arg(long, conflicts_with_all = ["send_http", "send_https"])]
+        raw_client_hello_file: Option<PathBuf>,
+        /// Disable certificate verification only for target TLS inside the tunnel.
+        #[arg(long, requires = "send_https")]
+        insecure_target_tls: bool,
+        /// Target-side TLS compatibility profile; never affects node TLS.
+        #[arg(long, value_enum, default_value_t)]
+        target_tls_profile: TargetTlsProfileArg,
+        /// Whole application probe budget, including target TLS and response reads.
+        #[arg(long, default_value_t = 30)]
+        application_timeout_seconds: u64,
         #[arg(long, default_value_t = atrust_tcp::TCP_DIAL_TIMEOUT.as_secs())]
         connect_timeout_seconds: u64,
         #[arg(long, default_value_t = atrust_tcp::TCP_DIAL_TIMEOUT.as_secs())]
@@ -316,6 +355,14 @@ enum Command {
         /// E7 status sampling cadence during the hold.
         #[arg(long, default_value_t = 60)]
         status_interval_seconds: u64,
+        /// E7: after observing closure, require the manager to establish a new
+        /// session and authorize a fresh flow on it.
+        #[arg(long)]
+        reconnect_after_close: bool,
+        /// E7: deliberately close the original L3 connection after this many
+        /// seconds, then exercise `--reconnect-after-close` while the SID is fresh.
+        #[arg(long)]
+        force_reconnect_after_seconds: Option<u64>,
         /// E8: number of distinct source-port flows authorized together.
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..=64))]
         concurrent_flows: u16,
@@ -946,6 +993,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             target,
             app_id,
             send_http,
+            send_https,
+            raw_client_hello_file,
+            insecure_target_tls,
+            target_tls_profile,
+            application_timeout_seconds,
             connect_timeout_seconds,
             handshake_timeout_seconds,
         } => {
@@ -1055,7 +1107,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            info!(event = "probe.tcp_dial.begin", target_port, send_http);
+            info!(
+                event = "probe.tcp_dial.begin",
+                target_port,
+                send_http,
+                send_https,
+                send_raw_client_hello = raw_client_hello_file.is_some()
+            );
             let dialed = match runtime.dial_tcp(&target_host, target_port).await {
                 Ok(dialed) => dialed,
                 Err(error) => {
@@ -1072,25 +1130,81 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             );
 
             // Optional application-layer round trip through the established tunnel.
-            if send_http {
-                let http_request = format!(
-                    "GET / HTTP/1.0\r\nHost: {target_host}\r\nUser-Agent: hermes-probe\r\nConnection: close\r\n\r\n"
-                );
-                tunnel.write_app(http_request.as_bytes()).await?;
-                match tunnel.read_app().await? {
-                    Some(data) => info!(
-                        event = "probe.tcp_dial.app_response",
-                        bytes = data.len(),
-                        looks_like_http = data.starts_with(b"HTTP/")
-                    ),
-                    None => info!(event = "probe.tcp_dial.app_closed_by_peer"),
+            let application_result: Result<(), Box<dyn std::error::Error>> = async {
+                if let Some(path) = raw_client_hello_file.as_deref() {
+                    let client_hello = std::fs::read(path)?;
+                    tunnel.write_app(&client_hello).await?;
+                    let response = tunnel.read_app().await?.ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "tunnel closed before raw ClientHello response",
+                        )
+                    })?;
+                    let header: [u8; 5] = response
+                        .get(..5)
+                        .ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "short TLS response to raw ClientHello",
+                            )
+                        })?
+                        .try_into()
+                        .expect("five-byte slice");
+                    info!(
+                        event = "probe.tcp_dial.raw_client_hello_response",
+                        content_type = header[0],
+                        record_version = u16::from_be_bytes([header[1], header[2]]),
+                        record_bytes = u16::from_be_bytes([header[3], header[4]])
+                    );
+                    tunnel.close().await?;
+                } else if send_http {
+                    let stats = tokio::time::timeout(
+                        Duration::from_secs(application_timeout_seconds.max(1)),
+                        probe_http_stream(
+                            &mut tunnel,
+                            &target_host,
+                            target_port,
+                            false,
+                            max_response_body,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| application_timeout_error())??;
+                    log_http_probe("http", &stats);
+                    tunnel.close().await?;
+                } else if send_https {
+                    let target_tls_policy = if insecure_target_tls {
+                        warn!(event = "probe.target_tls_insecure_enabled");
+                        TlsPolicy::DangerousAcceptInvalidCertificates
+                    } else {
+                        TlsPolicy::Verify
+                    };
+                    let stats = tokio::time::timeout(
+                        Duration::from_secs(application_timeout_seconds.max(1)),
+                        probe_https_stream(
+                            tunnel,
+                            &target_host,
+                            target_port,
+                            target_tls_policy,
+                            target_tls_profile.into(),
+                            !insecure_target_tls,
+                            max_response_body,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| application_timeout_error())??;
+                    log_http_probe("https", &stats);
+                } else {
+                    tunnel.close().await?;
                 }
+                Ok(())
             }
+            .await;
 
             runtime.shutdown().await;
             events.stop().await;
-            tunnel.close().await?;
             info!(event = "probe.tcp_dial.closed");
+            application_result?;
         }
 
         Command::GetIp {
@@ -1165,6 +1279,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             hold_seconds,
             heartbeat_seconds,
             status_interval_seconds,
+            reconnect_after_close,
+            force_reconnect_after_seconds,
             concurrent_flows,
             callers_per_flow,
             experiment_timeout_seconds,
@@ -1191,6 +1307,17 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             if hold_seconds > 0 && e8 {
                 return Err("run E7 hold and E8 concurrency as separate experiments".into());
+            }
+            if reconnect_after_close && hold_seconds == 0 {
+                return Err("--reconnect-after-close requires --hold-seconds".into());
+            }
+            if let Some(seconds) = force_reconnect_after_seconds
+                && (!reconnect_after_close || seconds == 0 || seconds >= hold_seconds)
+            {
+                return Err(
+                    "--force-reconnect-after-seconds requires --reconnect-after-close and a value between 1 and hold-seconds - 1"
+                        .into(),
+                );
             }
             let last_port_offset = concurrent_flows.saturating_sub(1);
             if src_port.checked_add(last_port_offset).is_none()
@@ -1325,6 +1452,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         run_l3_longevity(
                             &runtime, probe, target_ip, target_port, src_port, payload_bytes,
                             hold_seconds, status_interval_seconds, node_port,
+                            reconnect_after_close, force_reconnect_after_seconds,
                             cli.browser_trace_file.as_deref(),
                         ).await
                     } else if e8 {
@@ -1355,6 +1483,137 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct HttpProbeStats {
+    response_bytes: usize,
+    read_chunks: usize,
+    looks_like_http: bool,
+    status_code: Option<u16>,
+    clean_eof: bool,
+}
+
+async fn probe_https_stream<S>(
+    stream: S,
+    host: &str,
+    port: u16,
+    tls_policy: TlsPolicy,
+    tls_profile: TargetTlsProfile,
+    certificate_verified: bool,
+    max_response_body: usize,
+) -> Result<HttpProbeStats, Box<dyn std::error::Error>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut target_tls =
+        connect_tls_over_with_profile(stream, host, tls_policy, tls_profile).await?;
+    info!(
+        event = "probe.tcp_dial.target_tls_handshake_ok",
+        target_port = port,
+        certificate_verified
+    );
+    let stats = probe_http_stream(&mut target_tls, host, port, true, max_response_body).await?;
+    let _ = target_tls.shutdown().await;
+    Ok(stats)
+}
+
+async fn probe_http_stream<S>(
+    stream: &mut S,
+    host: &str,
+    port: u16,
+    secure: bool,
+    max_response_body: usize,
+) -> Result<HttpProbeStats, std::io::Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if host.is_empty() || host.bytes().any(|byte| byte <= b' ' || byte == 0x7f) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "target host contains invalid HTTP header bytes",
+        ));
+    }
+    let default_port = if secure { 443 } else { 80 };
+    let authority = if port == default_port {
+        host.to_owned()
+    } else {
+        format!("{host}:{port}")
+    };
+    let request = format!(
+        "GET / HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: hermes-probe\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await?;
+    stream.flush().await?;
+
+    let mut response_bytes = 0usize;
+    let mut read_chunks = 0usize;
+    let mut prefix = Vec::with_capacity(16);
+    let mut clean_eof = true;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = match stream.read(&mut buffer).await {
+            Ok(read) => read,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::UnexpectedEof && response_bytes > 0 =>
+            {
+                clean_eof = false;
+                break;
+            }
+            Err(error) => return Err(error),
+        };
+        if read == 0 {
+            break;
+        }
+        response_bytes = response_bytes.checked_add(read).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HTTP response size overflow",
+            )
+        })?;
+        if response_bytes > max_response_body {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("HTTP response exceeds {max_response_body} bytes"),
+            ));
+        }
+        read_chunks += 1;
+        let prefix_remaining = 16usize.saturating_sub(prefix.len());
+        prefix.extend_from_slice(&buffer[..read.min(prefix_remaining)]);
+    }
+
+    let looks_like_http = prefix.starts_with(b"HTTP/");
+    let status_code = std::str::from_utf8(&prefix)
+        .ok()
+        .and_then(|value| value.split_ascii_whitespace().nth(1))
+        .and_then(|value| value.parse().ok());
+    Ok(HttpProbeStats {
+        response_bytes,
+        read_chunks,
+        looks_like_http,
+        status_code,
+        clean_eof,
+    })
+}
+
+fn log_http_probe(scheme: &'static str, stats: &HttpProbeStats) {
+    info!(
+        event = "probe.tcp_dial.app_response",
+        scheme,
+        bytes = stats.response_bytes,
+        read_chunks = stats.read_chunks,
+        looks_like_http = stats.looks_like_http,
+        status_code_present = stats.status_code.is_some(),
+        status_code = stats.status_code.unwrap_or_default(),
+        clean_eof = stats.clean_eof
+    );
+}
+
+fn application_timeout_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "tunneled application probe timed out",
+    )
 }
 
 /// Mirrors the runtime event stream into the log for a diagnostic run.
@@ -1441,6 +1700,8 @@ async fn run_l3_longevity(
     hold_seconds: u64,
     status_interval_seconds: u64,
     node_port: u16,
+    reconnect_after_close: bool,
+    force_reconnect_after_seconds: Option<u64>,
     trace_file: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let route = runtime
@@ -1465,25 +1726,153 @@ async fn run_l3_longevity(
     let started = tokio::time::Instant::now();
     let deadline = started + Duration::from_secs(hold_seconds);
     let sample_every = Duration::from_secs(status_interval_seconds.max(1));
+    let mut force_reconnect_after_seconds = force_reconnect_after_seconds;
     loop {
         let now = tokio::time::Instant::now();
         if now >= deadline {
             break;
         }
         tokio::time::sleep((deadline - now).min(sample_every)).await;
+        if force_reconnect_after_seconds
+            .is_some_and(|seconds| started.elapsed() >= Duration::from_secs(seconds))
+        {
+            force_reconnect_after_seconds = None;
+            info!(
+                event = "probe.e7.force_reconnect",
+                elapsed_seconds = started.elapsed().as_secs(),
+                old_vip = %vip,
+                heartbeat_requests_sent = session.heartbeat_stats().requests_sent,
+                heartbeat_acks_received = session.heartbeat_stats().acknowledgements_received
+            );
+            runtime.reconnect(&route.node_group_id).await;
+        }
         let stats = session.flow_auth_stats();
+        let heartbeat = session.heartbeat_stats();
+        let last_ack_unix_ms = heartbeat.last_ack_at.and_then(|timestamp| {
+            timestamp
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|elapsed| elapsed.as_millis())
+        });
+        let close = session.close_info();
         info!(
             event = "probe.e7.sample",
             elapsed_seconds = started.elapsed().as_secs(),
             session_closed = session.is_closed(),
+            close_reason = close.as_ref().map(|info| info.reason.as_str()),
+            close_detail = close.as_ref().map(|info| info.detail.as_str()),
             tracked_flows = session.conntrack_len(),
             auth_requests_sent = stats.requests_sent,
             auth_in_flight = stats.in_flight,
+            heartbeat_requests_sent = heartbeat.requests_sent,
+            heartbeat_acks_received = heartbeat.acknowledgements_received,
+            last_heartbeat_ack_unix_ms = ?last_ack_unix_ms,
+            last_heartbeat_ack_age_ms = ?heartbeat.last_ack_age.map(|age| age.as_millis()),
             dropped_packets = session.dropped_packets()
         );
         if session.is_closed() {
-            return Err("E7 session closed during the hold".into());
+            append_probe_trace(
+                trace_file,
+                "e7_session_closed",
+                json!({
+                    "elapsed_seconds": started.elapsed().as_secs(),
+                    "close_reason": close.as_ref().map(|info| info.reason.as_str()),
+                    "close_detail": close.as_ref().map(|info| info.detail.as_str()),
+                    "heartbeat_requests_sent": heartbeat.requests_sent,
+                    "heartbeat_acks_received": heartbeat.acknowledgements_received,
+                    "last_heartbeat_ack_unix_ms": last_ack_unix_ms,
+                    "last_heartbeat_ack_age_ms": heartbeat.last_ack_age.map(|age| age.as_millis()),
+                }),
+            )?;
+            if !reconnect_after_close {
+                return Err("E7 session closed during the hold".into());
+            }
+
+            let reconnect_started = tokio::time::Instant::now();
+            let replacement = match runtime.connect_node_group(&route.node_group_id).await {
+                Ok(replacement) => replacement,
+                Err(error) => {
+                    let reconnect_elapsed_ms = reconnect_started.elapsed().as_millis();
+                    warn!(
+                        event = "probe.e7.reconnect_result",
+                        passed = false,
+                        reconnect_elapsed_ms,
+                        old_vip = %vip,
+                        error = %error
+                    );
+                    append_probe_trace(
+                        trace_file,
+                        "e7_reconnect_result",
+                        json!({
+                            "passed": false,
+                            "reconnect_elapsed_ms": reconnect_elapsed_ms,
+                            "old_vip": vip.to_string(),
+                            "error": error.to_string(),
+                        }),
+                    )?;
+                    return Err(error.into());
+                }
+            };
+            let reconnect_elapsed_ms = reconnect_started.elapsed().as_millis();
+            report_get_ip(replacement.get_ip(), node_port, trace_file)?;
+            let replacement_packet = build_l3_probe_packet(
+                probe,
+                replacement.vip(),
+                src_port.checked_add(1).expect("validated E7 port range"),
+                target_ip,
+                target_port,
+                payload_bytes,
+            );
+            let authorized = runtime.authorize_ipv4(&replacement_packet).await?;
+            let replacement_stats = replacement.flow_auth_stats();
+            let replaced = !Arc::ptr_eq(&session, &replacement);
+            let authorization_used_replacement = Arc::ptr_eq(&replacement, &authorized.session);
+            let passed = replaced
+                && !replacement.is_closed()
+                && authorization_used_replacement
+                && replacement_stats.requests_sent == 1
+                && replacement_stats.outcomes_received == 1
+                && replacement_stats.timeouts == 0;
+            info!(
+                event = "probe.e7.reconnect_result",
+                passed,
+                replaced,
+                authorization_used_replacement,
+                reconnect_elapsed_ms,
+                old_vip = %vip,
+                new_vip = %replacement.vip(),
+                vip_changed = replacement.vip() != vip,
+                new_get_ip_status = replacement.get_ip().status_text(),
+                wire_auth_requests = replacement_stats.requests_sent,
+                auth_outcomes = replacement_stats.outcomes_received,
+                auth_timeouts = replacement_stats.timeouts
+            );
+            append_probe_trace(
+                trace_file,
+                "e7_reconnect_result",
+                json!({
+                    "passed": passed,
+                    "replaced": replaced,
+                    "authorization_used_replacement": authorization_used_replacement,
+                    "reconnect_elapsed_ms": reconnect_elapsed_ms,
+                    "old_vip": vip.to_string(),
+                    "new_vip": replacement.vip().to_string(),
+                    "vip_changed": replacement.vip() != vip,
+                    "new_get_ip_status": replacement.get_ip().status_text(),
+                    "wire_auth_requests": replacement_stats.requests_sent,
+                    "auth_outcomes": replacement_stats.outcomes_received,
+                    "auth_timeouts": replacement_stats.timeouts,
+                }),
+            )?;
+            if !passed {
+                return Err("E7 automatic reconnect criteria were not met".into());
+            }
+            return Ok(());
         }
+    }
+
+    if reconnect_after_close {
+        return Err("E7 session did not close before the reconnect deadline".into());
     }
 
     let final_port = src_port.checked_add(1).expect("validated E7 port range");
@@ -1497,6 +1886,7 @@ async fn run_l3_longevity(
     );
     let final_flow = runtime.authorize_ipv4(&final_packet).await?;
     let final_stats = session.flow_auth_stats();
+    let heartbeat = session.heartbeat_stats();
     let same_session = Arc::ptr_eq(&session, &final_flow.session);
     let requests = final_stats.requests_sent - baseline.requests_sent;
     let outcomes = final_stats.outcomes_received - baseline.outcomes_received;
@@ -1515,6 +1905,9 @@ async fn run_l3_longevity(
         wire_auth_requests = requests,
         auth_outcomes = outcomes,
         auth_timeouts = final_stats.timeouts - baseline.timeouts,
+        heartbeat_requests_sent = heartbeat.requests_sent,
+        heartbeat_acks_received = heartbeat.acknowledgements_received,
+        last_heartbeat_ack_age_ms = ?heartbeat.last_ack_age.map(|age| age.as_millis()),
         tracked_flows = session.conntrack_len()
     );
     append_probe_trace(
@@ -1528,6 +1921,9 @@ async fn run_l3_longevity(
             "wire_auth_requests": requests,
             "auth_outcomes": outcomes,
             "auth_timeouts": final_stats.timeouts - baseline.timeouts,
+            "heartbeat_requests_sent": heartbeat.requests_sent,
+            "heartbeat_acks_received": heartbeat.acknowledgements_received,
+            "last_heartbeat_ack_age_ms": heartbeat.last_ack_age.map(|age| age.as_millis()),
         }),
     )?;
     if !passed {
@@ -1865,7 +2261,7 @@ async fn select_data_nodes(
             .collect(),
         None => resources.all_nodes(endpoint),
     };
-    let unadvertised = if request.allow_unadvertised && node_group_id.is_none() {
+    let unadvertised = if request.allow_unadvertised {
         UnadvertisedNode::Allow
     } else {
         UnadvertisedNode::Reject
@@ -2821,6 +3217,80 @@ mod tests {
             "65508",
         ]);
         assert!(oversized.is_err());
+    }
+
+    #[test]
+    fn cli_separates_plain_and_tunneled_tls_http() {
+        let https = Cli::try_parse_from([
+            "atrust-probe",
+            "--host",
+            "gateway.test",
+            "tcp-dial",
+            "--target",
+            "service.test:443",
+            "--send-https",
+            "--target-tls-profile",
+            "tls12-only-no-resumption",
+        ]);
+        assert!(https.is_ok());
+
+        let conflicting = Cli::try_parse_from([
+            "atrust-probe",
+            "--host",
+            "gateway.test",
+            "tcp-dial",
+            "--target",
+            "service.test:443",
+            "--send-http",
+            "--send-https",
+        ]);
+        assert!(conflicting.is_err());
+
+        let raw_conflicting = Cli::try_parse_from([
+            "atrust-probe",
+            "--host",
+            "gateway.test",
+            "tcp-dial",
+            "--target",
+            "service.test:443",
+            "--send-https",
+            "--raw-client-hello-file",
+            "/tmp/client-hello.bin",
+        ]);
+        assert!(raw_conflicting.is_err());
+    }
+
+    #[tokio::test]
+    async fn http_probe_accumulates_split_response_without_exposing_body() {
+        let (mut client, mut server) = tokio::io::duplex(512);
+        let peer = tokio::spawn(async move {
+            let mut request = vec![0_u8; 256];
+            let read = server.read(&mut request).await.unwrap();
+            let request = &request[..read];
+            assert!(request.starts_with(b"GET / HTTP/1.1\r\n"));
+            assert!(
+                request
+                    .windows(b"Host: service.test\r\n".len())
+                    .any(|window| window == b"Host: service.test\r\n")
+            );
+            server
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n")
+                .await
+                .unwrap();
+            server
+                .write_all(b"Connection: close\r\n\r\nhello")
+                .await
+                .unwrap();
+        });
+
+        let stats = probe_http_stream(&mut client, "service.test", 443, true, 1024)
+            .await
+            .unwrap();
+        peer.await.unwrap();
+        assert_eq!(stats.response_bytes, 62);
+        assert!(stats.looks_like_http);
+        assert_eq!(stats.status_code, Some(200));
+        assert!(stats.clean_eof);
     }
 
     #[tokio::test]

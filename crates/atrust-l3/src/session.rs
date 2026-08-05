@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use atrust_protocol::{
     DataRespPackets, L3_VERSION, L3FrameError, decode_l3_data_resp_body, encode_l3_data_req,
@@ -60,6 +60,56 @@ pub struct FlowAuthStats {
     pub peak_in_flight: u64,
 }
 
+/// Monotonic heartbeat counters and the most recent gateway acknowledgement.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HeartbeatStats {
+    /// Heartbeats successfully written and flushed to the connection.
+    pub requests_sent: u64,
+    pub acknowledgements_received: u64,
+    pub last_ack_at: Option<SystemTime>,
+    /// Monotonic age of `last_ack_at`, unaffected by wall-clock adjustments.
+    pub last_ack_age: Option<Duration>,
+}
+
+/// Stable category for the first event that closed an L3 connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum L3CloseReason {
+    Caller,
+    PeerEof,
+    ReadError,
+    WriteError,
+    FlushError,
+    FramingError,
+    InboundBufferLimit,
+    PacketConsumerDropped,
+    Dropped,
+}
+
+impl L3CloseReason {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Caller => "caller",
+            Self::PeerEof => "peer_eof",
+            Self::ReadError => "read_error",
+            Self::WriteError => "write_error",
+            Self::FlushError => "flush_error",
+            Self::FramingError => "framing_error",
+            Self::InboundBufferLimit => "inbound_buffer_limit",
+            Self::PacketConsumerDropped => "packet_consumer_dropped",
+            Self::Dropped => "dropped",
+        }
+    }
+}
+
+/// First-wins closure diagnostic retained after the connection is gone.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct L3CloseInfo {
+    pub reason: L3CloseReason,
+    pub detail: String,
+    pub closed_at: SystemTime,
+}
+
 /// Second-VIP response command (`05 96 <status> <u16 len> <json>`).
 const L3_SECOND_VIP_RESP: u8 = 0x96;
 
@@ -82,6 +132,7 @@ const PACKET_QUEUE_DEPTH: usize = 256;
 struct OutboundFrame {
     bytes: Vec<u8>,
     written: Option<oneshot::Sender<Result<(), ()>>>,
+    heartbeat: bool,
 }
 
 /// Inputs for establishing one L3 session against a data-plane node.
@@ -110,6 +161,7 @@ struct SessionShared {
     /// one waiter when several packets race into the same unauthorized flow.
     waiters: Mutex<HashMap<u64, Vec<oneshot::Sender<AuthOutcome>>>>,
     closed: AtomicBool,
+    close_info: Mutex<Option<L3CloseInfo>>,
     /// Inbound packets discarded because the consumer was not keeping up.
     dropped_packets: AtomicU64,
     auth_requests_sent: AtomicU64,
@@ -117,6 +169,9 @@ struct SessionShared {
     auth_timeouts: AtomicU64,
     auth_in_flight: AtomicU64,
     auth_peak_in_flight: AtomicU64,
+    heartbeat_requests_sent: AtomicU64,
+    heartbeat_acks_received: AtomicU64,
+    last_heartbeat_ack: Mutex<Option<(SystemTime, Instant)>>,
     /// Broadcast stop signal. Every task selects on it, so closing a session
     /// does not have to wait for a task's own timer to fire.
     stop_tx: watch::Sender<bool>,
@@ -136,12 +191,16 @@ impl SessionShared {
             conntrack: Mutex::new(ConntrackTable::new()),
             waiters: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
+            close_info: Mutex::new(None),
             dropped_packets: AtomicU64::new(0),
             auth_requests_sent: AtomicU64::new(0),
             auth_outcomes_received: AtomicU64::new(0),
             auth_timeouts: AtomicU64::new(0),
             auth_in_flight: AtomicU64::new(0),
             auth_peak_in_flight: AtomicU64::new(0),
+            heartbeat_requests_sent: AtomicU64::new(0),
+            heartbeat_acks_received: AtomicU64::new(0),
+            last_heartbeat_ack: Mutex::new(None),
             stop_tx: watch::channel(false).0,
             events,
             seen_length_prefixed: AtomicBool::new(false),
@@ -226,9 +285,19 @@ impl SessionShared {
     /// synthetic `Failed`: "the connection died" and "the server denied this
     /// flow" are different outcomes, and only the latter should look like a
     /// policy decision to the caller.
-    fn shutdown(&self, reason: &str) {
-        if self.closed.swap(true, Ordering::SeqCst) {
-            return;
+    fn shutdown(&self, reason: L3CloseReason, detail: impl Into<String>) {
+        let detail = detail.into();
+        {
+            let mut close_info = self.close_info.lock().expect("close info mutex");
+            if close_info.is_some() {
+                return;
+            }
+            *close_info = Some(L3CloseInfo {
+                reason,
+                detail: detail.clone(),
+                closed_at: SystemTime::now(),
+            });
+            self.closed.store(true, Ordering::SeqCst);
         }
         let _ = self.stop_tx.send(true);
         let drained: Vec<_> = self
@@ -238,7 +307,17 @@ impl SessionShared {
             .drain()
             .collect();
         drop(drained);
-        debug!(event = "atrust_l3.session.shutdown", reason);
+        debug!(
+            event = "atrust_l3.session.shutdown",
+            reason = reason.as_str(),
+            detail
+        );
+    }
+
+    fn record_heartbeat_ack(&self) {
+        self.heartbeat_acks_received.fetch_add(1, Ordering::Relaxed);
+        *self.last_heartbeat_ack.lock().expect("heartbeat ack mutex") =
+            Some((SystemTime::now(), Instant::now()));
     }
 }
 
@@ -319,7 +398,10 @@ impl L3Session {
                                 let _ = written.send(Err(()));
                             }
                             warn!(event = "atrust_l3.session.write_failed", %error);
-                            writer_shared.shutdown("L3 connection write failed");
+                            writer_shared.shutdown(
+                                L3CloseReason::WriteError,
+                                format!("L3 connection write failed: {error}"),
+                            );
                             break;
                         }
                         if let Err(error) = write_half.flush().await {
@@ -327,11 +409,19 @@ impl L3Session {
                                 let _ = written.send(Err(()));
                             }
                             warn!(event = "atrust_l3.session.flush_failed", %error);
-                            writer_shared.shutdown("L3 connection flush failed");
+                            writer_shared.shutdown(
+                                L3CloseReason::FlushError,
+                                format!("L3 connection flush failed: {error}"),
+                            );
                             break;
                         }
                         if let Some(written) = frame.written {
                             let _ = written.send(Ok(()));
+                        }
+                        if frame.heartbeat {
+                            writer_shared
+                                .heartbeat_requests_sent
+                                .fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
@@ -345,10 +435,17 @@ impl L3Session {
         let reader = tokio::spawn(async move {
             let reason = tokio::select! {
                 reason = read_loop(read_half, &reader_shared, &packets_tx) => reason,
-                _ = reader_stop.changed() => "L3 session closed by caller".to_owned(),
+                _ = reader_stop.changed() => ShutdownReason::new(
+                    L3CloseReason::Caller,
+                    "L3 session closed by caller",
+                ),
             };
-            reader_shared.shutdown(&reason);
-            debug!(event = "atrust_l3.session.reader_stopped", reason = %reason);
+            reader_shared.shutdown(reason.reason, reason.detail.clone());
+            debug!(
+                event = "atrust_l3.session.reader_stopped",
+                reason = reason.reason.as_str(),
+                detail = %reason.detail
+            );
         });
 
         let heartbeat_tx = write_tx.clone();
@@ -366,6 +463,7 @@ impl L3Session {
                         if heartbeat_tx.send(OutboundFrame {
                             bytes: encode_l3_heartbeat_req().to_vec(),
                             written: None,
+                            heartbeat: true,
                         }).await.is_err() {
                             break;
                         }
@@ -430,6 +528,32 @@ impl L3Session {
             in_flight: self.shared.auth_in_flight.load(Ordering::Relaxed),
             peak_in_flight: self.shared.auth_peak_in_flight.load(Ordering::Relaxed),
         }
+    }
+
+    /// Heartbeats flushed to the wire and acknowledgements received from the peer.
+    #[must_use]
+    pub fn heartbeat_stats(&self) -> HeartbeatStats {
+        let last_ack = *self
+            .shared
+            .last_heartbeat_ack
+            .lock()
+            .expect("heartbeat ack mutex");
+        HeartbeatStats {
+            requests_sent: self.shared.heartbeat_requests_sent.load(Ordering::Relaxed),
+            acknowledgements_received: self.shared.heartbeat_acks_received.load(Ordering::Relaxed),
+            last_ack_at: last_ack.map(|(wall, _)| wall),
+            last_ack_age: last_ack.map(|(_, monotonic)| monotonic.elapsed()),
+        }
+    }
+
+    /// The first event that ended this connection, retained after shutdown.
+    #[must_use]
+    pub fn close_info(&self) -> Option<L3CloseInfo> {
+        self.shared
+            .close_info
+            .lock()
+            .expect("close info mutex")
+            .clone()
     }
 
     /// Authorizes one flow and returns its connect token.
@@ -599,6 +723,7 @@ impl L3Session {
             .send(OutboundFrame {
                 bytes,
                 written: Some(written),
+                heartbeat: false,
             })
             .await
             .map_err(|_| L3SessionError::Closed)?;
@@ -615,7 +740,8 @@ impl L3Session {
 
     /// Closes the connection and stops the reader, writer and heartbeat tasks.
     pub async fn close(&self) {
-        self.shared.shutdown("L3 session closed by caller");
+        self.shared
+            .shutdown(L3CloseReason::Caller, "L3 session closed by caller");
         let handles: Vec<_> = std::mem::take(&mut *self.tasks.lock().expect("tasks mutex"));
         for handle in handles {
             let _ = handle.await;
@@ -627,7 +753,8 @@ impl L3Session {
 impl Drop for L3Session {
     fn drop(&mut self) {
         // A dropped session must not leave three tasks holding a live socket.
-        self.shared.closed.store(true, Ordering::SeqCst);
+        self.shared
+            .shutdown(L3CloseReason::Dropped, "L3 session object dropped");
         if let Ok(mut tasks) = self.tasks.lock() {
             for handle in tasks.drain(..) {
                 handle.abort();
@@ -729,11 +856,26 @@ fn next_frame(buf: &[u8]) -> Result<Option<(Inbound<'_>, usize)>, L3SessionError
 }
 
 /// Reads and dispatches until the peer goes away. Returns the stop reason.
+#[derive(Debug)]
+struct ShutdownReason {
+    reason: L3CloseReason,
+    detail: String,
+}
+
+impl ShutdownReason {
+    fn new(reason: L3CloseReason, detail: impl Into<String>) -> Self {
+        Self {
+            reason,
+            detail: detail.into(),
+        }
+    }
+}
+
 async fn read_loop<R>(
     mut read_half: R,
     shared: &Arc<SessionShared>,
     packets_tx: &mpsc::Sender<Vec<u8>>,
-) -> String
+) -> ShutdownReason
 where
     R: AsyncRead + Unpin,
 {
@@ -746,20 +888,28 @@ where
             let (action, consumed) = match next_frame(&pending) {
                 Ok(Some((frame, consumed))) => (dispatch(frame, shared, packets_tx), consumed),
                 Ok(None) => break,
-                Err(error) => return format!("L3 framing error: {error}"),
+                Err(error) => {
+                    return ShutdownReason::new(
+                        L3CloseReason::FramingError,
+                        format!("L3 framing error: {error}"),
+                    );
+                }
             };
             pending.drain(..consumed);
             match action {
                 Dispatch::Continue => {}
                 Dispatch::Send(packet) => {
                     if let Some(reason) = deliver(packets_tx, shared, packet) {
-                        return reason;
+                        return ShutdownReason::new(L3CloseReason::PacketConsumerDropped, reason);
                     }
                 }
                 Dispatch::SendMany(packets) => {
                     for packet in packets {
                         if let Some(reason) = deliver(packets_tx, shared, packet) {
-                            return reason;
+                            return ShutdownReason::new(
+                                L3CloseReason::PacketConsumerDropped,
+                                reason,
+                            );
                         }
                     }
                 }
@@ -767,13 +917,23 @@ where
         }
 
         if pending.len() > MAX_PENDING_READ {
-            return format!("L3 inbound buffer exceeded {MAX_PENDING_READ} bytes");
+            return ShutdownReason::new(
+                L3CloseReason::InboundBufferLimit,
+                format!("L3 inbound buffer exceeded {MAX_PENDING_READ} bytes"),
+            );
         }
 
         match read_half.read(&mut chunk).await {
-            Ok(0) => return "L3 connection closed by peer".to_owned(),
+            Ok(0) => {
+                return ShutdownReason::new(L3CloseReason::PeerEof, "L3 connection closed by peer");
+            }
             Ok(n) => pending.extend_from_slice(&chunk[..n]),
-            Err(error) => return format!("L3 connection read failed: {error}"),
+            Err(error) => {
+                return ShutdownReason::new(
+                    L3CloseReason::ReadError,
+                    format!("L3 connection read failed: {error}"),
+                );
+            }
         }
     }
 }
@@ -895,7 +1055,11 @@ fn dispatch(
             }
         },
         Inbound::Heartbeat => {
-            debug!(event = "atrust_l3.session.heartbeat_ack");
+            shared.record_heartbeat_ack();
+            debug!(
+                event = "atrust_l3.session.heartbeat_ack",
+                acknowledgements_received = shared.heartbeat_acks_received.load(Ordering::Relaxed)
+            );
             Dispatch::Continue
         }
         Inbound::SecondVip { status, json } => {

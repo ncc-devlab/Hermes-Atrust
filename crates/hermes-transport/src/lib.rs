@@ -8,6 +8,7 @@ pub use http::{
     ReqwestTransport, ReqwestTransportConfig, TlsPolicy,
 };
 pub use tls::{
-    NodeTlsProbeOutcome, NodeTlsProbeResult, NodeTlsStream, TlsConnectError, TlsTransportError,
-    connect_tls, probe_node_tls,
+    NodeTlsProbeOutcome, NodeTlsProbeResult, NodeTlsStream, TargetTlsProfile, TlsConnectError,
+    TlsTransportError, connect_tls, connect_tls_over, connect_tls_over_with_profile,
+    probe_node_tls,
 };

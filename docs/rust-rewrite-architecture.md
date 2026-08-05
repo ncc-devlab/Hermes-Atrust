@@ -270,8 +270,12 @@ cargo run -p atrust-probe -- \
 - ~~初始化 JSON DTO、确定性签名~~（已实现）；golden vector 仍待补（与脱敏抓包逐字节）；
 - ~~IPv4/域名目标地址帧~~（已实现）；
 - ~~`05 81`、`53 00` 和 connect status 状态机~~（已实现并 live 验证）；
-- ~~应用数据帧~~（已实现并 live 回环）；半关闭、服务端关闭、short-write 的对端行为测试仍待补；
-- ~~受控 HTTP 目标的真实联调~~（已对公网参考服务端完成；西电真机仍待）。
+- 应用数据帧已实现；同会话 zju-connect 对三个西电授权 HTTPS 目标完成 TLS + HTTP 200，证明
+  framing 可用；Hermes 当前剩余差异是 rustls ClientHello 指纹被目标路径关闭；
+- 隧道内目标 TLS、目标 SNI/证书策略和有界多帧 HTTP 响应累计已实现并有本地测试；
+- 半关闭、服务端关闭、short-write 的对端行为测试仍待补；
+- ~~受控 HTTP 目标的真实联调~~（公网参考服务端和西电 zju 对照已完成；Hermes 目标 TLS 待换用
+  可控 ClientHello 的后端或定位具体扩展差异）。
 
 ### L3 隧道
 
@@ -287,7 +291,8 @@ cargo run -p atrust-probe -- \
 - ~~按五元组鉴权 JSON（`tcp:` 无 `//`）、conntrack 表、connectToken 状态机~~
   （`atrust-protocol::l3_auth` + `atrust-l3::{conntrack,auth,session,manager}`；8s 超时后由 manager
   重建连接并自动重试一次；并发同流合并为一次 `0x13`）；
-- ~~`0x14` 编码 / 下行 `0x94` 双格式 / 心跳请求常量~~；~~读循环与心跳任务~~（已接，25s）；
+- ~~`0x14` 编码 / 下行 `0x94` 双格式 / 心跳请求常量~~；~~读循环与心跳任务~~（已接，25s；记录
+  成功 flush 数、`0x95` ACK 数、最后 ACK 时间/age，并保留首个稳定关闭原因）；
 - ~~IPv4 包五元组解析~~（`atrust-l3::parse_ipv4_flow`，按 IHL 定位传输层）；
 - ICMP、UDP、TCP 的逐阶段真实联调（`atrust-probe l3-session --probe icmp-echo|udp|tcp-syn`；
   UDP 支持 `--payload-bytes` 并校验 echo 回包）；
@@ -308,6 +313,9 @@ cargo run -p atrust-probe -- \
 - codec property test 和 fuzz target；
 - ticket 后认证和资源获取的 ignored live tests；
 - `atrust-probe` 的认证续接、资源、节点、TCP 和 L3 子命令；
+- E7 支持 same-session 长寿命判据及显式 `--reconnect-after-close` 对照；两次 live 断开按 CAS 保存时间
+  对齐均约 63 分钟，反对 Get-IP 后固定 lease、支持认证/SID 绝对到期；有效 SID 下主动断线重连已 live
+  通过（session 已替换、VIP 不变、Get-IP 约 98 ms、新流授权成功）；
 - 日志事件命名规范、敏感字段审计和可选诊断抓包层。
 
 EasyConnect 的全部认证和数据面仍按计划暂缓，不属于当前 aTrust 里程碑。

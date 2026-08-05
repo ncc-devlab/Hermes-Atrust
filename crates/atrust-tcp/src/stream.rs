@@ -1,7 +1,7 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use atrust_protocol::{encode_tcp_app_data, encode_tcp_close, encode_tcp_probe};
+use atrust_protocol::{encode_tcp_app_data, encode_tcp_close, encode_tcp_probe, is_status_ok};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tracing::debug;
@@ -123,11 +123,16 @@ fn try_decode_app(read_buf: &mut Vec<u8>) -> Result<Decode, TunnelError> {
             return Ok(Decode::App(payload));
         }
 
-        // Close: 01 01 ....
+        // Close: 01 01 followed by the peer-specific two-byte trailer.
         if h0 == 0x01 && h1 == 0x01 {
             if read_buf.len() < 4 {
                 return Ok(Decode::NeedMore);
             }
+            debug!(
+                event = "atrust_tcp.tunnel.close_frame",
+                trailer0 = read_buf[2],
+                trailer1 = read_buf[3]
+            );
             read_buf.drain(..4);
             return Ok(Decode::Closed);
         }
@@ -143,7 +148,7 @@ fn try_decode_app(read_buf: &mut Vec<u8>) -> Result<Decode, TunnelError> {
             }
             let body = read_buf[4..4 + len].to_vec();
             read_buf.drain(..4 + len);
-            if body.as_slice() != b"OK" {
+            if !is_status_ok(&body) {
                 return Err(TunnelError::ProtocolError {
                     body: String::from_utf8_lossy(&body).into_owned(),
                 });
@@ -170,9 +175,16 @@ where
                 "tunnel closed",
             )));
         }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
 
         if self.write_pending.is_empty() {
             let chunk_len = buf.len().min(u16::MAX as usize);
+            debug!(
+                event = "atrust_tcp.tunnel.app_frame_write",
+                payload_len = chunk_len
+            );
             let frame = encode_tcp_app_data(&buf[..chunk_len])
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
             self.write_pending = frame;
@@ -254,6 +266,9 @@ where
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         if !self.app_pending.is_empty() {
             let n = buf.remaining().min(self.app_pending.len());
             buf.put_slice(&self.app_pending[..n]);
@@ -267,6 +282,12 @@ where
         loop {
             match try_decode_app(&mut self.read_buf) {
                 Ok(Decode::App(payload)) => {
+                    // A zero-length application frame is a tunnel probe, not
+                    // stream EOF. Returning an unchanged ReadBuf would make
+                    // Tokio/rustls terminate the inner TLS handshake.
+                    if payload.is_empty() {
+                        continue;
+                    }
                     self.app_pending.extend_from_slice(&payload);
                     let n = buf.remaining().min(self.app_pending.len());
                     buf.put_slice(&self.app_pending[..n]);
@@ -332,6 +353,7 @@ pub enum TunnelError {
 mod tests {
     use super::*;
     use atrust_protocol::encode_tcp_app_data;
+    use tokio::time::{Duration, timeout};
 
     #[test]
     fn decode_app_frame_from_buffer() {
@@ -352,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn data_phase_status_requires_exact_ok_body() {
+    fn data_phase_status_rejects_non_success_body() {
         for body in [b"NOT OK".as_slice(), b"OKAY".as_slice()] {
             let mut frame = vec![0x53, 0x00];
             frame.extend_from_slice(&(body.len() as u16).to_be_bytes());
@@ -363,5 +385,38 @@ mod tests {
                 Err(TunnelError::ProtocolError { .. })
             ));
         }
+
+        let body = br#"{"code":0,"message":"OK"}"#;
+        let mut frame = vec![0x53, 0x00];
+        frame.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        frame.extend_from_slice(body);
+        assert!(matches!(try_decode_app(&mut frame), Ok(Decode::NeedMore)));
+    }
+
+    #[tokio::test]
+    async fn async_write_of_empty_buffer_emits_nothing() {
+        let (stream, mut peer) = tokio::io::duplex(64);
+        let mut tunnel = TcpTunnel::from_stream(stream);
+
+        assert_eq!(tunnel.write(&[]).await.unwrap(), 0);
+        let mut byte = [0_u8; 1];
+        assert!(
+            timeout(Duration::from_millis(20), peer.read(&mut byte))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn async_read_skips_zero_length_probe_before_data() {
+        let (stream, mut peer) = tokio::io::duplex(64);
+        let mut tunnel = TcpTunnel::from_stream(stream);
+        let mut wire = encode_tcp_app_data(b"").unwrap();
+        wire.extend_from_slice(&encode_tcp_app_data(b"hello").unwrap());
+        peer.write_all(&wire).await.unwrap();
+
+        let mut payload = [0_u8; 5];
+        tunnel.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"hello");
     }
 }

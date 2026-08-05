@@ -1,3 +1,4 @@
+/debug_logs/
 /target/
 /.env
 *.pem
