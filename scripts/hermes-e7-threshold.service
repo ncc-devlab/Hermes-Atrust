@@ -1,0 +1,32 @@
+[Unit]
+Description=Hermes E7: L3 idle-threshold sweep (parallel arms)
+Documentation=file:/home/nancunchild/projects/Hermes/docs/open-questions.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/nancunchild/projects/Hermes
+ExecStart=/home/nancunchild/projects/Hermes/scripts/e7-idle-threshold.sh
+
+# The arms run sequentially and the longest is capped at HOLD+600s inside the
+# script, so systemd must not be the thing that decides when this ends.
+TimeoutStartSec=infinity
+
+# Diagnostic run, not a service: a restart would silently start a second
+# experiment against the same SID and make every sample unattributable.
+Restart=no
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hermes-e7
+
+[Install]
+WantedBy=default.target
+
+# Install with:
+#   cp scripts/hermes-e7-threshold.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user start hermes-e7-threshold.service
+#
+# The user manager stops at logout unless lingering is enabled
+# (`sudo loginctl enable-linger $USER`), which would end the run early.
