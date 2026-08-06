@@ -363,6 +363,14 @@ enum Command {
         /// E7 status sampling cadence during the hold.
         #[arg(long, default_value_t = 60)]
         status_interval_seconds: u64,
+        /// E7: send one data packet on the authorized flow this often during the
+        /// hold. Zero (default) keeps the session data-idle.
+        ///
+        /// This is the discriminator between an idle timeout and an absolute
+        /// connection lifetime: every long run so far was `--auth-only`, so no
+        /// `0x14` ever went out and the two explanations are indistinguishable.
+        #[arg(long, default_value_t = 0)]
+        data_keepalive_seconds: u64,
         /// E7: after observing closure, require the manager to establish a new
         /// session and authorize a fresh flow on it.
         #[arg(long)]
@@ -1290,6 +1298,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             hold_seconds,
             heartbeat_seconds,
             status_interval_seconds,
+            data_keepalive_seconds,
             reconnect_after_close,
             force_reconnect_after_seconds,
             concurrent_flows,
@@ -1463,8 +1472,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     if hold_seconds > 0 {
                         run_l3_longevity(
                             &runtime, probe, target_ip, target_port, src_port, payload_bytes,
-                            hold_seconds, status_interval_seconds, node_port,
-                            reconnect_after_close, force_reconnect_after_seconds,
+                            hold_seconds, status_interval_seconds, data_keepalive_seconds,
+                            node_port, reconnect_after_close, force_reconnect_after_seconds,
                             cli.browser_trace_file.as_deref(),
                         ).await
                     } else if e8 {
@@ -1711,6 +1720,7 @@ async fn run_l3_longevity(
     payload_bytes: usize,
     hold_seconds: u64,
     status_interval_seconds: u64,
+    data_keepalive_seconds: u64,
     node_port: u16,
     reconnect_after_close: bool,
     force_reconnect_after_seconds: Option<u64>,
@@ -1738,13 +1748,61 @@ async fn run_l3_longevity(
     let started = tokio::time::Instant::now();
     let deadline = started + Duration::from_secs(hold_seconds);
     let sample_every = Duration::from_secs(status_interval_seconds.max(1));
+    // Wake often enough to serve whichever cadence is shorter, so enabling the
+    // keepalive does not silently coarsen the status sampling or vice versa.
+    let tick_every = match data_keepalive_seconds {
+        0 => sample_every,
+        seconds => sample_every.min(Duration::from_secs(seconds.max(1))),
+    };
+    let mut next_keepalive = (data_keepalive_seconds > 0)
+        .then(|| started + Duration::from_secs(data_keepalive_seconds.max(1)));
+    let mut keepalives_sent = 0_u64;
+    let mut keepalive_failures = 0_u64;
     let mut force_reconnect_after_seconds = force_reconnect_after_seconds;
     loop {
         let now = tokio::time::Instant::now();
         if now >= deadline {
             break;
         }
-        tokio::time::sleep((deadline - now).min(sample_every)).await;
+        tokio::time::sleep((deadline - now).min(tick_every)).await;
+
+        // Sent on the flow authorized above, so this exercises the data path
+        // without adding `0x13` traffic that would confound the lifetime result.
+        if let Some(due) = next_keepalive
+            && tokio::time::Instant::now() >= due
+            && !session.is_closed()
+        {
+            next_keepalive = Some(
+                tokio::time::Instant::now() + Duration::from_secs(data_keepalive_seconds.max(1)),
+            );
+            let packet =
+                build_l3_probe_packet(probe, vip, src_port, target_ip, target_port, payload_bytes);
+            match runtime.send_ipv4(&packet).await {
+                Ok(sent) => {
+                    keepalives_sent += 1;
+                    let same_session = Arc::ptr_eq(&session, &sent.session);
+                    info!(
+                        event = "probe.e7.data_keepalive",
+                        elapsed_seconds = started.elapsed().as_secs(),
+                        keepalives_sent,
+                        bytes = packet.len(),
+                        same_session
+                    );
+                }
+                Err(error) => {
+                    keepalive_failures += 1;
+                    // Not fatal on its own: the point of the run is to observe
+                    // when and how the session ends, and the sample loop below
+                    // records that with the full close reason.
+                    warn!(
+                        event = "probe.e7.data_keepalive_failed",
+                        elapsed_seconds = started.elapsed().as_secs(),
+                        keepalive_failures,
+                        error = %error
+                    );
+                }
+            }
+        }
         if force_reconnect_after_seconds
             .is_some_and(|seconds| started.elapsed() >= Duration::from_secs(seconds))
         {
@@ -1767,10 +1825,14 @@ async fn run_l3_longevity(
                 .map(|elapsed| elapsed.as_millis())
         });
         let close = session.close_info();
+        let (protocol_messages_seen, _) = session.protocol_messages();
         info!(
             event = "probe.e7.sample",
             elapsed_seconds = started.elapsed().as_secs(),
             session_closed = session.is_closed(),
+            keepalives_sent,
+            keepalive_failures,
+            protocol_messages_seen,
             close_reason = close.as_ref().map(|info| info.reason.as_str()),
             close_detail = close.as_ref().map(|info| info.detail.as_str()),
             tracked_flows = session.conntrack_len(),
