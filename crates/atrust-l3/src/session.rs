@@ -38,7 +38,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::auth::{FlowAuthError, L3AuthContext, apply_auth_wire_status, build_flow_auth_frame};
 use crate::conntrack::{
@@ -117,6 +117,10 @@ const L3_SECOND_VIP_RESP: u8 = 0x96;
 /// make the reader buffer without bound.
 const MAX_PENDING_READ: usize = 1024 * 1024;
 
+/// A5: bound on retained `53 00` bodies. A run long enough to matter must not
+/// be able to grow this without limit; the counter keeps the true total.
+const MAX_STORED_PROTOCOL_MESSAGES: usize = 64;
+
 /// Shortest `connectToken` for which the `0x94` layout discriminant is safe.
 ///
 /// A token-framed body opens with `tokenLen` followed by the token, so its
@@ -183,6 +187,10 @@ struct SessionShared {
     /// one, because a saturated tunnel would otherwise flood the stream.
     seen_length_prefixed: AtomicBool,
     seen_token_framed: AtomicBool,
+    /// A5: every mid-session `53 00` body, bounded. Kept so a long run can be
+    /// inspected after the fact instead of only while its log is being watched.
+    protocol_messages: Mutex<Vec<String>>,
+    protocol_messages_seen: AtomicU64,
 }
 
 impl SessionShared {
@@ -205,6 +213,8 @@ impl SessionShared {
             events,
             seen_length_prefixed: AtomicBool::new(false),
             seen_token_framed: AtomicBool::new(false),
+            protocol_messages: Mutex::new(Vec::new()),
+            protocol_messages_seen: AtomicU64::new(0),
         }
     }
 
@@ -312,6 +322,17 @@ impl SessionShared {
             reason = reason.as_str(),
             detail
         );
+    }
+
+    fn record_protocol_message(&self, body: &[u8]) {
+        self.protocol_messages_seen.fetch_add(1, Ordering::Relaxed);
+        let mut stored = self
+            .protocol_messages
+            .lock()
+            .expect("protocol message mutex");
+        if stored.len() < MAX_STORED_PROTOCOL_MESSAGES {
+            stored.push(String::from_utf8_lossy(body).into_owned());
+        }
     }
 
     fn record_heartbeat_ack(&self) {
@@ -528,6 +549,24 @@ impl L3Session {
             in_flight: self.shared.auth_in_flight.load(Ordering::Relaxed),
             peak_in_flight: self.shared.auth_peak_in_flight.load(Ordering::Relaxed),
         }
+    }
+
+    /// A5: mid-session `53 00` bodies seen, and the retained sample of them.
+    ///
+    /// The count is the true total; the vector is capped at
+    /// [`MAX_STORED_PROTOCOL_MESSAGES`].
+    #[must_use]
+    pub fn protocol_messages(&self) -> (u64, Vec<String>) {
+        let stored = self
+            .shared
+            .protocol_messages
+            .lock()
+            .expect("protocol message mutex")
+            .clone();
+        (
+            self.shared.protocol_messages_seen.load(Ordering::Relaxed),
+            stored,
+        )
     }
 
     /// Heartbeats flushed to the wire and acknowledgements received from the peer.
@@ -777,7 +816,9 @@ enum Inbound<'a> {
         json: &'a [u8],
     },
     /// Nested `53 00` protocol message.
-    Protocol,
+    Protocol {
+        body: &'a [u8],
+    },
     /// A known-shaped frame this client has no use for.
     Ignored {
         cmd: u8,
@@ -833,7 +874,14 @@ fn next_frame(buf: &[u8]) -> Result<Option<(Inbound<'_>, usize)>, L3SessionError
         if buf[1] != 0 {
             return Err(L3SessionError::ProtocolRejected { status: buf[1] });
         }
-        return Ok(length_prefixed(buf).map(|total| (Inbound::Protocol, total)));
+        return Ok(length_prefixed(buf).map(|total| {
+            (
+                Inbound::Protocol {
+                    body: &buf[4..total],
+                },
+                total,
+            )
+        }));
     }
 
     if buf[0] != L3_VERSION {
@@ -1072,8 +1120,17 @@ fn dispatch(
             );
             Dispatch::Continue
         }
-        Inbound::Protocol => {
-            debug!(event = "atrust_l3.session.protocol_message");
+        Inbound::Protocol { body } => {
+            // A5: the body is logged rather than merely counted. If one of these
+            // ever carries actionable state (session revoked, policy changed,
+            // re-auth required), discarding it shows up as "tunnel healthy but
+            // every flow silently stops working" — with nothing in the log.
+            shared.record_protocol_message(body);
+            info!(
+                event = "atrust_l3.session.protocol_message",
+                len = body.len(),
+                body = %String::from_utf8_lossy(body)
+            );
             Dispatch::Continue
         }
         Inbound::Ignored { cmd } => {
@@ -1215,7 +1272,8 @@ mod tests {
         buf.extend_from_slice(&[L3_VERSION, l3_cmd::DATA_RESP, 0x00, 0x02, 0x01, 0x02]);
 
         let (decoded, consumed) = next_frame(&buf).unwrap().unwrap();
-        assert_eq!(decoded, Inbound::Protocol);
+        // The body is carried, not just counted: A5 needs its contents.
+        assert_eq!(decoded, Inbound::Protocol { body: b"OK" });
         assert_eq!(consumed, 6);
         assert_eq!(
             next_frame(&buf[consumed..]).unwrap().unwrap().0,
