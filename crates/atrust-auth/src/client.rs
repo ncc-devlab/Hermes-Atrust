@@ -7,7 +7,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use hermes_model::{DeviceId, GatewayEndpoint, SecretString};
 use hermes_transport::{HttpMethod, HttpRequest, HttpTransport, HttpTransportError};
 use rand::Rng as _;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 use url::Url;
@@ -253,6 +253,76 @@ impl AuthClient {
             event = "atrust.report_env.complete",
             host = self.endpoint.host()
         );
+        Ok(())
+    }
+
+    /// Converts the current authenticated gateway session into a local-client ticket.
+    ///
+    /// The stock portal calls this only after local client detection, but the
+    /// detection result is not part of this endpoint's HTTP contract.
+    pub async fn ticket_exchange(
+        &self,
+        configuration: &AuthConfiguration,
+    ) -> Result<SecretString, AuthError> {
+        let mut url = self.endpoint_url("/passport/v1/public/ticketExchange")?;
+        self.append_shared_query(&mut url);
+        let body = to_wire_json(&TicketExchangeRequest {})?;
+        let mut request = HttpRequest {
+            method: HttpMethod::Post,
+            url,
+            headers: Vec::new(),
+            body,
+        };
+        self.append_auth_headers(&mut request, configuration, false);
+        let response = self.transport.execute(request).await?;
+        if !response.is_success() {
+            return Err(AuthError::UnexpectedStatus(response.status));
+        }
+        let envelope: BusinessEnvelope<TicketExchangeData> =
+            serde_json::from_slice(&response.body).map_err(AuthError::InvalidSessionResponse)?;
+        if envelope.code != 0 {
+            return Err(AuthError::AuthenticationRejected {
+                code: envelope.code,
+                message: envelope.message,
+            });
+        }
+        if envelope.data.sid_ticket.is_empty() {
+            return Err(AuthError::MissingSidTicket);
+        }
+        Ok(SecretString::new(envelope.data.sid_ticket)
+            .expect("non-empty sidTicket is valid secret material"))
+    }
+
+    /// Attempts to restore a gateway session from a local-client ticket.
+    pub async fn session_id_exchange(
+        &self,
+        configuration: &AuthConfiguration,
+        sid_ticket: &SecretString,
+    ) -> Result<(), AuthError> {
+        let mut url = self.endpoint_url("/passport/v1/public/sessionIdExchange")?;
+        self.append_shared_query(&mut url);
+        let body = to_wire_json(&SessionIdExchangeRequest {
+            sid_ticket: sid_ticket.expose(),
+        })?;
+        let mut request = HttpRequest {
+            method: HttpMethod::Post,
+            url,
+            headers: Vec::new(),
+            body,
+        };
+        self.append_auth_headers(&mut request, configuration, false);
+        let response = self.transport.execute(request).await?;
+        if !response.is_success() {
+            return Err(AuthError::UnexpectedStatus(response.status));
+        }
+        let envelope: BusinessEnvelope<serde_json::Value> =
+            serde_json::from_slice(&response.body).map_err(AuthError::InvalidSessionResponse)?;
+        if envelope.code != 0 {
+            return Err(AuthError::AuthenticationRejected {
+                code: envelope.code,
+                message: envelope.message,
+            });
+        }
         Ok(())
     }
 
@@ -574,6 +644,22 @@ struct DeviceEnvironment<'a> {
     device_id: &'a str,
 }
 
+#[derive(Serialize)]
+struct TicketExchangeRequest {}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TicketExchangeData {
+    #[serde(default)]
+    sid_ticket: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionIdExchangeRequest<'a> {
+    sid_ticket: &'a str,
+}
+
 fn random_trace_id() -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut rng = rand::rng();
@@ -620,6 +706,8 @@ pub enum AuthError {
     InvalidPortalData(#[source] CasError),
     #[error("aTrust CAS redirect does not contain exactly one non-empty portal ticket")]
     MissingPortalTicket,
+    #[error("aTrust ticketExchange did not return a sidTicket")]
+    MissingSidTicket,
     #[error("aTrust returned an invalid session response: {0}")]
     InvalidSessionResponse(#[source] serde_json::Error),
     #[error("aTrust onlineInfo did not return a username")]
@@ -1020,6 +1108,46 @@ mod tests {
                 .any(|(name, value)| name == "x-csrf-token" && value == "csrf-session")
         );
         assert!(!format!("{:?}", requests[0]).contains("portal-ticket"));
+    }
+
+    #[tokio::test]
+    async fn ticket_exchange_and_session_id_exchange_match_portal_contract() {
+        let transport = QueueTransport::new(vec![
+            ok_json(r#"{"code":0,"message":"","data":{"sidTicket":"local-ticket"}}"#),
+            ok_json(r#"{"code":0,"message":"","data":{}}"#),
+        ]);
+        let client = AuthClient::new(
+            GatewayEndpoint::new("atrust.example.edu", 443).unwrap(),
+            transport.clone(),
+        );
+        let configuration = session_configuration();
+
+        let ticket = client.ticket_exchange(&configuration).await.unwrap();
+        client
+            .session_id_exchange(&configuration, &ticket)
+            .await
+            .unwrap();
+
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests[0].url.path(), "/passport/v1/public/ticketExchange");
+        assert_eq!(requests[0].method, HttpMethod::Post);
+        assert_eq!(requests[0].body, b"{}");
+        assert_eq!(
+            requests[1].url.path(),
+            "/passport/v1/public/sessionIdExchange"
+        );
+        assert_eq!(requests[1].method, HttpMethod::Post);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&requests[1].body).unwrap(),
+            serde_json::json!({"sidTicket": "local-ticket"})
+        );
+        assert!(requests.iter().all(|request| {
+            request
+                .headers
+                .iter()
+                .any(|(name, value)| name == "x-csrf-token" && value == "csrf-session")
+        }));
+        assert!(!format!("{:?}", requests[1]).contains("local-ticket"));
     }
 
     #[tokio::test]

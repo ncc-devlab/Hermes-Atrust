@@ -5,17 +5,17 @@ use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use atrust_auth::{
-    AuthClient, AuthConfigOptions, AuthConfiguration, FlowProtocol, LoginMethod,
+    AuthClient, AuthConfigOptions, AuthConfiguration, AuthError, FlowProtocol, LoginMethod,
     PasswordCredentials, SessionMaterial, SessionProgress, StoredSession, UnadvertisedNode,
     extract_sid_from_cookies, select_node, select_node_with,
 };
-use atrust_browser::{BrowserKind, WebDriverBrowser, append_trace_event};
+use atrust_browser::{BrowserKind, BrowserLoginResult, WebDriverBrowser, append_trace_event};
 use clap::{Parser, Subcommand, ValueEnum};
 use hermes_logging::{LogFormat, LoggerConfig};
-use hermes_model::{DeviceId, GatewayEndpoint, SecretString};
+use hermes_model::{DeviceId, GatewayEndpoint, SecretString, SessionId};
 use hermes_transport::{
     HttpTransport, NodeTlsProbeOutcome, ReqwestTransport, ReqwestTransportConfig, TargetTlsProfile,
     TlsPolicy, connect_tls_over_with_profile, probe_node_tls,
@@ -120,6 +120,10 @@ enum Command {
         /// Maximum wait while observing the browser. Harvest starts only after you close it.
         #[arg(long, default_value_t = 1800)]
         timeout_seconds: u64,
+        /// Harvest automatically when the gateway completion page has issued a SID.
+        /// The browser is never clicked or filled; an MFA page therefore times out.
+        #[arg(long)]
+        automatic_completion: bool,
         #[arg(long)]
         keep_browser_open: bool,
         /// Phase B: after harvest + clientResource, TLS-smoke every advertised data-plane
@@ -158,6 +162,82 @@ enum Command {
         /// with `resource-match --resource-file`. Server policy, not credentials.
         #[arg(long)]
         save_body: Option<PathBuf>,
+    },
+    /// Validate a stored session with authConfig and onlineInfo only.
+    SessionCheck {
+        #[arg(long)]
+        session_file: PathBuf,
+    },
+    /// Compare two stored sessions without exposing credential values.
+    SessionCompare {
+        #[arg(long)]
+        baseline: PathBuf,
+        #[arg(long)]
+        candidate: PathBuf,
+    },
+    /// E11 headless candidate: gateway ticketExchange followed by sessionIdExchange.
+    E11HeadlessTicketExchange {
+        /// Fresh externally established session. Read-only.
+        #[arg(long)]
+        session_file: PathBuf,
+        /// Isolated candidate output; the caller validates it before committing.
+        #[arg(long)]
+        s1_temp_file: PathBuf,
+        /// Run the exchange when S0 reaches this age.
+        #[arg(long, default_value_t = 300)]
+        exchange_at_session_age_seconds: u64,
+        #[arg(long, default_value_t = 900)]
+        max_initial_session_age_seconds: u64,
+    },
+    /// E11 R2-B1: keep one browser alive and request a fresh CAS challenge after T0.
+    #[command(name = "e11-r2-short-window")]
+    E11R2ShortWindow {
+        #[arg(long)]
+        login_domain: String,
+        #[arg(long, default_value = "http://127.0.0.1:9518")]
+        webdriver_url: String,
+        #[arg(long, default_value = "chrome")]
+        browser: String,
+        /// Maximum time allowed for the operator to finish the T0 CAS/MFA flow.
+        #[arg(long, default_value_t = 1800)]
+        interaction_timeout_seconds: u64,
+        /// Delay from validated S0 creation to the unattended second challenge.
+        #[arg(long, default_value_t = 300)]
+        renewal_after_seconds: u64,
+        /// Maximum wait for the second challenge; no interaction is permitted.
+        #[arg(long, default_value_t = 300)]
+        unattended_timeout_seconds: u64,
+        #[arg(long)]
+        s0_file: PathBuf,
+        /// Candidate output. The caller must validate data-plane access before renaming it.
+        #[arg(long)]
+        s1_temp_file: PathBuf,
+    },
+    /// E11 R1: test whether authConfig repeatedly extends an existing SID.
+    ///
+    /// Keeps one cookie jar alive across the hold, then proves control-plane and
+    /// Get-IP validity. It never opens a browser or writes session credentials.
+    SessionRenewal {
+        /// Existing externally refreshed session. Read-only.
+        #[arg(long)]
+        session_file: PathBuf,
+        /// Run the first attributable authConfig candidate at this elapsed time.
+        #[arg(long, default_value_t = 7200)]
+        first_renewal_after_seconds: u64,
+        /// Validate the first candidate at this elapsed time, before calling again.
+        #[arg(long, default_value_t = 14400)]
+        first_validation_after_seconds: u64,
+        /// Delay between later validation-and-renewal checkpoints.
+        #[arg(long, default_value_t = 11700)]
+        renewal_interval_seconds: u64,
+        /// Additional renewal intervals after the first decisive validation.
+        #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(0..=4))]
+        repeat_renewals: u8,
+        /// Data-plane node used for the final SID-only Get-IP proof.
+        #[arg(long)]
+        node: String,
+        #[arg(long, default_value_t = 20)]
+        get_ip_timeout_seconds: u64,
     },
     /// Ask the resource matcher which app / node group carries a destination.
     ///
@@ -556,6 +636,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             webdriver_url,
             browser,
             timeout_seconds,
+            automatic_completion,
             keep_browser_open,
             probe_nodes,
             node_connect_timeout_seconds,
@@ -587,14 +668,24 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 event = "probe.cas_browser_waiting",
                 note = "finish IDS + aTrust MFA fully, then manually close the probe browser to harvest"
             );
-            let login = match browser
-                .complete_cas(
-                    challenge,
-                    std::time::Duration::from_secs(timeout_seconds),
-                    cli.browser_trace_file.as_deref(),
-                )
-                .await
-            {
+            let login_result = if automatic_completion {
+                browser
+                    .complete_cas_automatically(
+                        challenge,
+                        std::time::Duration::from_secs(timeout_seconds),
+                        cli.browser_trace_file.as_deref(),
+                    )
+                    .await
+            } else {
+                browser
+                    .complete_cas(
+                        challenge,
+                        std::time::Duration::from_secs(timeout_seconds),
+                        cli.browser_trace_file.as_deref(),
+                    )
+                    .await
+            };
+            let login = match login_result {
                 Ok(login) => login,
                 Err(error) => {
                     // Browser may already be closed by the user; ignore close failures.
@@ -845,6 +936,121 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let _ = browser.close().await;
             let _ = keep_browser_open;
         }
+        Command::E11R2ShortWindow {
+            login_domain,
+            webdriver_url,
+            browser,
+            interaction_timeout_seconds,
+            renewal_after_seconds,
+            unattended_timeout_seconds,
+            s0_file,
+            s1_temp_file,
+        } => {
+            if s0_file.exists() || s1_temp_file.exists() {
+                return Err("E11 R2 output already exists; refusing to overwrite it".into());
+            }
+            let kind = match browser.as_str() {
+                "chrome" => BrowserKind::Chrome,
+                "firefox" => BrowserKind::Firefox,
+                other => {
+                    return Err(
+                        format!("unsupported browser `{other}`; use chrome or firefox").into(),
+                    );
+                }
+            };
+            let initial_configuration = client
+                .auth_config(AuthConfigOptions {
+                    modified: false,
+                    need_ticket: true,
+                })
+                .await?;
+            let initial_challenge = client.prepare_cas(&initial_configuration, &login_domain)?;
+            let browser = WebDriverBrowser::connect(&webdriver_url, kind).await?;
+            info!(
+                event = "probe.e11.r2_short_window.started",
+                renewal_after_seconds,
+                note = "complete T0 CAS/MFA in this browser; do not close it"
+            );
+
+            let experiment = async {
+                let initial_login = browser
+                    .complete_cas_after_interaction(
+                        initial_challenge,
+                        Duration::from_secs(interaction_timeout_seconds.max(1)),
+                        cli.browser_trace_file.as_deref(),
+                    )
+                    .await?;
+                establish_e11_browser_session(
+                    &client,
+                    transport.as_ref(),
+                    &endpoint,
+                    &login_domain,
+                    &initial_login,
+                    &s0_file,
+                    "S0",
+                )
+                .await?;
+                info!(
+                    event = "probe.e11.r2_short_window.s0_ready",
+                    renewal_after_seconds,
+                    note = "keeping the same browser and WebDriver session alive"
+                );
+
+                tokio::time::sleep(Duration::from_secs(renewal_after_seconds)).await;
+
+                // A new empty HTTP jar makes the second CAS challenge independent
+                // from S0. Browser-side IDS and gateway state remain in the same
+                // live Chrome process and are the only reusable authentication state.
+                let renewal_transport = Arc::new(ReqwestTransport::new(&ReqwestTransportConfig {
+                    tls_policy,
+                    timeout: http_timeout,
+                    max_response_body,
+                })?);
+                let renewal_client =
+                    Arc::new(AuthClient::new(endpoint.clone(), renewal_transport.clone()));
+                let renewal_configuration = renewal_client
+                    .auth_config(AuthConfigOptions {
+                        modified: false,
+                        need_ticket: true,
+                    })
+                    .await?;
+                let renewal_challenge =
+                    renewal_client.prepare_cas(&renewal_configuration, &login_domain)?;
+                info!(
+                    event = "probe.e11.r2_short_window.candidate_started",
+                    renewal_after_seconds,
+                    note = "no browser interaction is permitted from this point"
+                );
+                let renewal_login = browser
+                    .complete_cas_automatically(
+                        renewal_challenge,
+                        Duration::from_secs(unattended_timeout_seconds.max(1)),
+                        cli.browser_trace_file.as_deref(),
+                    )
+                    .await?;
+                establish_e11_browser_session(
+                    &renewal_client,
+                    renewal_transport.as_ref(),
+                    &endpoint,
+                    &login_domain,
+                    &renewal_login,
+                    &s1_temp_file,
+                    "S1",
+                )
+                .await?;
+                info!(
+                    event = "probe.e11.r2_short_window.result",
+                    passed = true,
+                    renewal_after_seconds,
+                    note = "S1 control plane passed; data-plane and old-expiry checks remain"
+                );
+                Ok::<(), Box<dyn std::error::Error>>(())
+            }
+            .await;
+
+            let _ = browser.close().await;
+            experiment?;
+        }
         Command::ClientResource {
             session_file,
             save_body,
@@ -876,6 +1082,290 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     path = %path.display()
                 );
             }
+        }
+        Command::SessionCheck { session_file } => {
+            let _ = restore_session(&client, transport.as_ref(), &endpoint, &session_file).await?;
+            info!(event = "probe.session_check.result", passed = true);
+        }
+        Command::SessionCompare {
+            baseline,
+            candidate,
+        } => {
+            let baseline = StoredSession::load(&baseline)?;
+            let candidate = StoredSession::load(&candidate)?;
+            let mut baseline_cookies = baseline
+                .cookies
+                .iter()
+                .map(|cookie| {
+                    (
+                        &cookie.name,
+                        &cookie.value,
+                        &cookie.domain,
+                        &cookie.path,
+                        cookie.secure,
+                        cookie.http_only,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut candidate_cookies = candidate
+                .cookies
+                .iter()
+                .map(|cookie| {
+                    (
+                        &cookie.name,
+                        &cookie.value,
+                        &cookie.domain,
+                        &cookie.path,
+                        cookie.secure,
+                        cookie.http_only,
+                    )
+                })
+                .collect::<Vec<_>>();
+            baseline_cookies.sort_unstable();
+            candidate_cookies.sort_unstable();
+            info!(
+                event = "probe.session_compare.result",
+                sid_rotated = baseline.sid != candidate.sid,
+                cookies_changed = baseline_cookies != candidate_cookies,
+                device_id_changed = baseline.device_id != candidate.device_id,
+                connection_id_changed = baseline.connection_id != candidate.connection_id,
+                cookie_count_before = baseline.cookies.len(),
+                cookie_count_after = candidate.cookies.len()
+            );
+        }
+        Command::E11HeadlessTicketExchange {
+            session_file,
+            s1_temp_file,
+            exchange_at_session_age_seconds,
+            max_initial_session_age_seconds,
+        } => {
+            if s1_temp_file.exists() {
+                return Err("E11 headless candidate output already exists".into());
+            }
+            let session_mtime = std::fs::metadata(&session_file)?.modified()?;
+            let initial_age = SystemTime::now()
+                .duration_since(session_mtime)
+                .map_err(|_| "S0 modification time is in the future")?
+                .as_secs();
+            if initial_age > max_initial_session_age_seconds {
+                return Err(format!(
+                    "S0 is not fresh: age {initial_age}s exceeds {max_initial_session_age_seconds}s"
+                )
+                .into());
+            }
+
+            let stored = import_session_file(transport.as_ref(), &endpoint, &session_file)?;
+            let baseline_material = stored.to_material()?;
+            let baseline_configuration = client
+                .auth_config(AuthConfigOptions {
+                    modified: true,
+                    need_ticket: false,
+                })
+                .await?;
+            client.online_info(&baseline_configuration).await?;
+            client.client_resource(&baseline_configuration).await?;
+            info!(
+                event = "probe.e11.headless_ticket.started",
+                initial_session_age_seconds = initial_age,
+                exchange_at_session_age_seconds,
+                note = "no browser, WebDriver, or local official client is used"
+            );
+
+            let current_age = SystemTime::now()
+                .duration_since(session_mtime)
+                .map_err(|_| "S0 modification time is in the future")?
+                .as_secs();
+            tokio::time::sleep(Duration::from_secs(
+                exchange_at_session_age_seconds.saturating_sub(current_age),
+            ))
+            .await;
+
+            let sid_ticket = client.ticket_exchange(&baseline_configuration).await?;
+            info!(
+                event = "probe.e11.headless_ticket.captured",
+                sid_ticket_present = true,
+                sid_ticket_len = sid_ticket.expose().len(),
+                note = "ticket remains in memory and is never logged or written"
+            );
+
+            let candidate_transport = Arc::new(ReqwestTransport::new(&ReqwestTransportConfig {
+                tls_policy,
+                timeout: http_timeout,
+                max_response_body,
+            })?);
+            let candidate_client = Arc::new(AuthClient::new(
+                endpoint.clone(),
+                candidate_transport.clone(),
+            ));
+            let exchange_configuration = candidate_client
+                .auth_config(AuthConfigOptions {
+                    modified: false,
+                    need_ticket: false,
+                })
+                .await?;
+            candidate_client
+                .session_id_exchange(&exchange_configuration, &sid_ticket)
+                .await?;
+            let candidate_configuration = candidate_client
+                .auth_config(AuthConfigOptions {
+                    modified: true,
+                    need_ticket: false,
+                })
+                .await?;
+            let username = candidate_client
+                .online_info(&candidate_configuration)
+                .await?;
+            let resources = candidate_client
+                .client_resource(&candidate_configuration)
+                .await?;
+            let origin = gateway_origin(&endpoint)?;
+            let candidate_cookies = candidate_transport.session_cookies(&origin);
+            let candidate_material = build_session_material(&candidate_cookies, Some(&username))?;
+            save_session_file(
+                &s1_temp_file,
+                &endpoint,
+                stored.login_method,
+                stored.login_domain,
+                &candidate_cookies,
+                &candidate_material,
+            )?;
+            info!(
+                event = "probe.e11.headless_ticket.result",
+                passed = true,
+                sid_rotated = candidate_material.sid != baseline_material.sid,
+                cookie_count = candidate_cookies.len(),
+                ip_resource_count = resources.ip_resources.len(),
+                domain_resource_count = resources.domain_resources.len(),
+                node_group_count = resources.node_groups.len(),
+                note = "candidate control plane passed; data-plane and old-expiry checks remain"
+            );
+        }
+        Command::SessionRenewal {
+            session_file,
+            first_renewal_after_seconds,
+            first_validation_after_seconds,
+            renewal_interval_seconds,
+            repeat_renewals,
+            node,
+            get_ip_timeout_seconds,
+        } => {
+            let total_seconds = e11_total_seconds(
+                first_renewal_after_seconds,
+                first_validation_after_seconds,
+                renewal_interval_seconds,
+                repeat_renewals,
+            )?;
+
+            // Startup requires authConfig to obtain a usable CSRF value. Candidate
+            // zero is only a precondition check; candidate one is the first call
+            // used for attribution.
+            let stored = import_session_file(transport.as_ref(), &endpoint, &session_file)?;
+            let material = stored.to_material()?;
+            let startup_configuration = run_e11_auth_config_candidate(&client, 0, 0).await?;
+            e11_client_resource_with_retry(&client, &startup_configuration, 0, 0).await?;
+            let origin = gateway_origin(&endpoint)?;
+            let initial_sid = transport
+                .session_cookie_value(&origin, &material.sid_cookie_name)
+                .ok_or("SID cookie missing at E11 start")?;
+            info!(
+                event = "probe.e11.started",
+                model = "R1-authConfig",
+                first_renewal_after_seconds,
+                first_validation_after_seconds,
+                renewal_interval_seconds,
+                repeat_renewals,
+                total_seconds,
+                note = "using an existing session in one cookie jar; no credential file will be written"
+            );
+
+            let started = tokio::time::Instant::now();
+            tokio::time::sleep_until(started + Duration::from_secs(first_renewal_after_seconds))
+                .await;
+            let mut configuration =
+                run_e11_auth_config_candidate(&client, 1, first_renewal_after_seconds).await?;
+            report_e11_cookie_result(
+                transport.as_ref(),
+                &origin,
+                &material.sid_cookie_name,
+                &initial_sid,
+                1,
+            );
+
+            tokio::time::sleep_until(started + Duration::from_secs(first_validation_after_seconds))
+                .await;
+            validate_e11_control_plane(&client, &configuration, 1, first_validation_after_seconds)
+                .await?;
+
+            for cycle in 1..=u64::from(repeat_renewals) {
+                let candidate = cycle + 1;
+                let candidate_elapsed = first_validation_after_seconds
+                    + renewal_interval_seconds.saturating_mul(cycle - 1);
+                configuration =
+                    run_e11_auth_config_candidate(&client, candidate, candidate_elapsed).await?;
+                report_e11_cookie_result(
+                    transport.as_ref(),
+                    &origin,
+                    &material.sid_cookie_name,
+                    &initial_sid,
+                    candidate,
+                );
+                let checkpoint_elapsed =
+                    first_validation_after_seconds + renewal_interval_seconds.saturating_mul(cycle);
+                tokio::time::sleep_until(started + Duration::from_secs(checkpoint_elapsed)).await;
+                validate_e11_control_plane(&client, &configuration, candidate, checkpoint_elapsed)
+                    .await?;
+            }
+
+            let sid_value = transport
+                .session_cookie_value(&origin, &material.sid_cookie_name)
+                .ok_or("SID cookie disappeared during E11 hold")?;
+            let sid_rotated = sid_value != material.sid.as_str();
+            let current_sid = SessionId::new(sid_value)?;
+            let (node_host, node_port) = parse_host_port(&node)?;
+            let response = 'attempts: loop {
+                for attempt in 1..=3_u8 {
+                    match atrust_l3::get_ipv4(atrust_l3::GetIpv4Request {
+                        node_host: &node_host,
+                        node_port,
+                        tls_policy,
+                        sid: &current_sid,
+                        timeout: Duration::from_secs(get_ip_timeout_seconds.max(1)),
+                    })
+                    .await
+                    {
+                        Ok(response) => break 'attempts response,
+                        Err(error) if attempt == 3 => {
+                            error!(
+                                event = "probe.e11.failed",
+                                stage = "final_get_ip",
+                                attempt,
+                                elapsed_seconds = total_seconds,
+                                error = %error
+                            );
+                            return Err(error.into());
+                        }
+                        Err(error) => {
+                            warn!(
+                                event = "probe.e11.transient_retry",
+                                stage = "final_get_ip",
+                                attempt,
+                                elapsed_seconds = total_seconds,
+                                error = %error
+                            );
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                        }
+                    }
+                }
+            };
+            report_get_ip(&response, node_port, cli.browser_trace_file.as_deref())?;
+            info!(
+                event = "probe.e11.result",
+                passed = true,
+                model = "R1-authConfig",
+                elapsed_seconds = total_seconds,
+                successful_candidates = u64::from(repeat_renewals) + 1,
+                sid_rotated
+            );
         }
         Command::ResourceMatch {
             target,
@@ -2878,6 +3368,51 @@ async fn password_session(
     })
 }
 
+async fn establish_e11_browser_session(
+    client: &AuthClient,
+    transport: &ReqwestTransport,
+    endpoint: &GatewayEndpoint,
+    login_domain: &str,
+    login: &BrowserLoginResult,
+    output: &Path,
+    candidate: &'static str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if login.gateway_cookies.is_empty() {
+        return Err(format!("E11 R2 {candidate} browser returned no gateway cookies").into());
+    }
+    let origin = gateway_origin(endpoint)?;
+    transport.import_gateway_cookies(&origin, &login.gateway_cookies)?;
+    let configuration = client
+        .auth_config(AuthConfigOptions {
+            modified: true,
+            need_ticket: false,
+        })
+        .await?;
+    let username = client.online_info(&configuration).await?;
+    let resources = client.client_resource(&configuration).await?;
+    let live_cookies = transport.session_cookies(&origin);
+    let material = build_session_material(&live_cookies, Some(&username))?;
+    save_session_file(
+        output,
+        endpoint,
+        LoginMethod::Cas,
+        Some(login_domain.to_owned()),
+        &live_cookies,
+        &material,
+    )?;
+    info!(
+        event = "probe.e11.r2_short_window.session_ready",
+        candidate,
+        login_state = ?configuration.login_state,
+        portal_hits = login.portal_hits,
+        cookie_count = live_cookies.len(),
+        ip_resource_count = resources.ip_resources.len(),
+        domain_resource_count = resources.domain_resources.len(),
+        node_group_count = resources.node_groups.len()
+    );
+    Ok(())
+}
+
 /// Restores a session persisted by an earlier login, so a CAS + MFA session
 /// harvested in one process can drive the data plane in another.
 ///
@@ -2916,6 +3451,196 @@ async fn restore_session(
         cookies: transport.session_cookies(&origin),
         login_method: stored.login_method,
     })
+}
+
+async fn run_e11_auth_config_candidate(
+    client: &AuthClient,
+    candidate: u64,
+    elapsed_seconds: u64,
+) -> Result<AuthConfiguration, AuthError> {
+    let configuration = 'attempts: loop {
+        for attempt in 1..=3_u8 {
+            match client
+                .auth_config(AuthConfigOptions {
+                    modified: true,
+                    need_ticket: false,
+                })
+                .await
+            {
+                Ok(configuration) => break 'attempts configuration,
+                Err(error) if error.is_session_invalid() || attempt == 3 => {
+                    error!(
+                        event = "probe.e11.failed",
+                        stage = "candidate_auth_config",
+                        candidate,
+                        elapsed_seconds,
+                        attempt,
+                        error = %error
+                    );
+                    return Err(error);
+                }
+                Err(error) => {
+                    warn!(
+                        event = "probe.e11.transient_retry",
+                        stage = "candidate_auth_config",
+                        candidate,
+                        elapsed_seconds,
+                        attempt,
+                        error = %error
+                    );
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+            }
+        }
+    };
+    e11_online_info_with_retry(
+        client,
+        &configuration,
+        "candidate_online_info",
+        candidate,
+        elapsed_seconds,
+    )
+    .await?;
+    info!(
+        event = "probe.e11.candidate_passed",
+        candidate,
+        elapsed_seconds,
+        login_state = ?configuration.login_state
+    );
+    Ok(configuration)
+}
+
+async fn validate_e11_control_plane(
+    client: &AuthClient,
+    configuration: &AuthConfiguration,
+    candidate: u64,
+    elapsed_seconds: u64,
+) -> Result<(), AuthError> {
+    e11_online_info_with_retry(
+        client,
+        configuration,
+        "checkpoint_online_info",
+        candidate,
+        elapsed_seconds,
+    )
+    .await?;
+    e11_client_resource_with_retry(client, configuration, candidate, elapsed_seconds).await?;
+    info!(
+        event = "probe.e11.checkpoint_passed",
+        candidate, elapsed_seconds
+    );
+    Ok(())
+}
+
+async fn e11_online_info_with_retry(
+    client: &AuthClient,
+    configuration: &AuthConfiguration,
+    stage: &'static str,
+    candidate: u64,
+    elapsed_seconds: u64,
+) -> Result<(), AuthError> {
+    for attempt in 1..=3_u8 {
+        match client.online_info(configuration).await {
+            Ok(_) => return Ok(()),
+            Err(error) if error.is_session_invalid() || attempt == 3 => {
+                error!(
+                    event = "probe.e11.failed",
+                    stage,
+                    candidate,
+                    elapsed_seconds,
+                    attempt,
+                    error = %error
+                );
+                return Err(error);
+            }
+            Err(error) => {
+                warn!(
+                    event = "probe.e11.transient_retry",
+                    stage,
+                    candidate,
+                    elapsed_seconds,
+                    attempt,
+                    error = %error
+                );
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        }
+    }
+    unreachable!("three-attempt loop always returns")
+}
+
+async fn e11_client_resource_with_retry(
+    client: &AuthClient,
+    configuration: &AuthConfiguration,
+    candidate: u64,
+    elapsed_seconds: u64,
+) -> Result<(), AuthError> {
+    for attempt in 1..=3_u8 {
+        match client.client_resource(configuration).await {
+            Ok(_) => return Ok(()),
+            Err(error) if error.is_session_invalid() || attempt == 3 => {
+                error!(
+                    event = "probe.e11.failed",
+                    stage = "checkpoint_client_resource",
+                    candidate,
+                    elapsed_seconds,
+                    attempt,
+                    error = %error
+                );
+                return Err(error);
+            }
+            Err(error) => {
+                warn!(
+                    event = "probe.e11.transient_retry",
+                    stage = "checkpoint_client_resource",
+                    candidate,
+                    elapsed_seconds,
+                    attempt,
+                    error = %error
+                );
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        }
+    }
+    unreachable!("three-attempt loop always returns")
+}
+
+fn report_e11_cookie_result(
+    transport: &ReqwestTransport,
+    origin: &Url,
+    sid_cookie_name: &str,
+    initial_sid: &str,
+    candidate: u64,
+) {
+    let sid_present = transport.session_cookie_value(origin, sid_cookie_name);
+    info!(
+        event = "probe.e11.candidate_cookie_result",
+        candidate,
+        sid_present = sid_present.is_some(),
+        sid_rotated = sid_present.is_some_and(|sid| sid != initial_sid)
+    );
+}
+
+fn e11_total_seconds(
+    first_renewal_after_seconds: u64,
+    first_validation_after_seconds: u64,
+    renewal_interval_seconds: u64,
+    repeat_renewals: u8,
+) -> Result<u64, &'static str> {
+    if first_renewal_after_seconds >= first_validation_after_seconds {
+        return Err("first renewal must precede first validation");
+    }
+    let total_seconds = first_validation_after_seconds
+        .checked_add(
+            renewal_interval_seconds
+                .checked_mul(u64::from(repeat_renewals))
+                .ok_or("E11 schedule overflow")?,
+        )
+        .ok_or("E11 schedule overflow")?;
+    if total_seconds > 20 * 60 * 60 {
+        return Err("E11 schedule exceeds the 20 hour experiment budget");
+    }
+    Ok(total_seconds)
 }
 
 /// Loads a stored session and imports its cookies into the process jar.
@@ -3238,6 +3963,19 @@ mod tests {
                 from_sdpc_placeholder: false,
             },
         )
+    }
+
+    #[test]
+    fn e11_schedule_is_seventeen_hours_and_enforces_the_budget() {
+        assert_eq!(e11_total_seconds(7_200, 14_400, 11_700, 4), Ok(61_200));
+        assert_eq!(
+            e11_total_seconds(14_400, 14_400, 11_700, 4),
+            Err("first renewal must precede first validation")
+        );
+        assert_eq!(
+            e11_total_seconds(7_200, 14_400, 11_700, 5),
+            Err("E11 schedule exceeds the 20 hour experiment budget")
+        );
     }
 
     #[test]

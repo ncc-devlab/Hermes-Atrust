@@ -1048,6 +1048,7 @@ timeout 会在 `0x03` 到达前先报超时，E9 必须使用至少 20 秒。两
 | [E5](#e5) | `0x94` 分支与 token 长度（[A1](#a1)、[A3](#a3)、[A4](#a4)） | E3 判定通过 | **否** |
 | **[E9](#e9)** | **服务端是否按 `appId` 裁决（[C1](#c1)，已完成）** | E2 的分歧清单 | **否** |
 | [E10](#a9) | Get-IP 帧头全集（[A9](#a9)，已执行，未触发） | 一个有效会话 | **否** |
+| [E11](#e11) | 无人值守 SID 续期 | 一次人工 CAS/MFA bootstrap + 持久 browser profile | **否** |
 
 **接 TUN 前还欠的三关：**
 
@@ -1293,10 +1294,303 @@ verdict=2、timeout=0、peak in-flight=2、conntrack=2、same session=true，两
 只有当它被服务端标为 major 且排在前面时，才需要在配置层加显式的端点优选。
 它作为**隧道内目的地**的可达性是另一回事，属于 E5 之后的验证。
 
+### E11 — 无人值守 SID 续期 <a id="e11"></a>
+
+**目标不是无人值守首次登录。** 第一次 CAS / IDS / 滑块 / SMS 仍由人完成；本实验只回答：
+在已经完成一次 MFA 后，能否在不再发生任何人工交互的前提下，于旧 SID 到期前取得一份能跨过
+旧到期点的新会话材料。
+
+现有 [B7](#b7) 已排除「普通控制面或数据面活动自然续期」：`clientResource`、L3 heartbeat 和
+真实数据流持续存在时，旧 SID 仍在约 3 小时 48 分失效。`ResourceCache` 目前只能发出
+`SessionInvalidated` 并停止刷新，`AtrustClient` 的 `SessionMaterial` / SID 也不能在启动后替换。
+因此顺序必须是：**先证明网关存在可用的无人值守续期原语，再设计运行时热切换**；不能先实现一套
+没有服务端依据的自动重登状态机。
+
+#### 待证伪模型
+
+| 模型 | 操作 | 可观察结果 |
+|---|---|---|
+| R0：无续期能力 | 只做既有 `onlineInfo` / `clientResource` | 约 3.7 小时后旧 SID 失效；已有三批历史样本，可作基线 |
+| R1：控制面调用续期 | 定期单独调用一个候选接口 | SID 不变但能稳定跨过历史到期点，或 cookie jar 出现新 SID |
+| R2：CAS SSO 静默换票 | 复用首次 MFA 后仍存活的同一浏览器 profile，重新打开一个全新的 CAS challenge | 不出现 IDS/MFA 交互页，自动回到 aTrust portal，并取得新 gateway cookie/SID |
+| R3：必须重新交互 | 同 R2 | 浏览器停在 IDS、滑块、SMS 或 `InteractionRequired`；当前部署无法无人值守续期 |
+
+R1 的候选必须**每次新登录只测一个**，不能把多个调用绑在同一臂里，否则即使成功也无法归因：
+
+1. `authConfig(modified=true, needTicket=false)`；它在过期 SID 下仍可能返回结构，因此只有后续
+   `onlineInfo` / `clientResource` 跨过历史到期点才算成功；
+2. `authCheck`；它可能推进认证状态，风险高于只读接口，只在第 1 项阴性后测试；
+3. `reportEnv` 不列入 R1：它需要 portal ticket，而 ticket 已知单次使用，实际属于 R2 换票路径。
+
+R2 是主实验，因为它同时保留两层可能的 SSO 状态：学校 IDS 浏览器 cookie 与 aTrust portal cookie。
+实验探针必须区分「同一个仍存活的浏览器进程」与「关闭浏览器后只复用磁盘 profile」；后者不会自动
+恢复所有 session cookie。两种生命周期不能合并成一个结论。
+
+#### 主实验时间线
+
+1. **T0 人工 bootstrap：** 使用专用持久 browser profile 完成一次 CAS + MFA；保存旧会话 `S0`，记录
+   SID 和 cookie 集合的 SHA-256 指纹、DeviceID、ConnectionID、建立时间，只在 `0600` 会话文件中保存原值；
+2. **T0 + 1h 静默续期：** 在同一 browser profile 中请求**新生成的** CAS challenge，全程不点击、
+   不输入、不关闭窗口。最多等待 5 分钟；进入任何 IDS/MFA 页面即记为 `interaction_required` 并停止；
+3. **隔离验证：** 将收割结果写为独立的 `S1.tmp`，不得覆盖 `S0`。使用独立 HTTP cookie jar 依次验证
+   `authConfig`、`onlineInfo`、`clientResource`；全部通过后才原子落盘为 `S1`；
+4. **数据面验证：** 保证此刻没有另一条 L3 会话，使用 `S1` 做一次 Get-IP 和一次 `--auth-only` flow；
+   验证后立即关闭，不做并行长跑；
+5. **跨旧到期点验证：** 先立即检查新会话是否使 `S0` 失效；否则从 T0 + 2h 起每 5 分钟验证 `S0`，
+   最晚观察到 T0 + 4h15m。发现 `S0` 返回已知 session-invalid 后，立即验证 `S1` 的 `onlineInfo`、
+   `clientResource`、Get-IP 和单次 flow auth。只有 `S0` 失败且 `S1` 成功才是决定性 PASS；
+6. **续期可重复性：** 第一次 PASS 后再用同一方法从 `S1` 生成 `S2`。只成功一次不能证明能长期运行。
+
+#### 判读矩阵
+
+| 浏览器结果 | SID 指纹 | 跨 T0 + 4h | 结论 |
+|---|---|---|---|
+| 无交互完成 | 新 SID | S0 失败、S1 成功 | **R2 成立；具备实现无人值守续期与热切换的前提** |
+| 无交互完成 | SID 不变 | S1 成功 | 可能是服务端延长同一 SID；再做一轮并记录新的到期边界后才能定论 |
+| 无交互完成 | 任意 | S0/S1 同时失败 | 收割到的只是旧会话或无效 portal 状态，不构成续期 |
+| 进入 IDS/MFA | 任意 | — | 该时间点和浏览器生命周期下需要交互；只有同进程短窗口与持久 profile 两路都失败，才支持 **R3** |
+| 无交互完成 | 新 SID | 旧 SID 立即失效、S1 成功 | 后建会话替换旧会话；续期可用，但产品切换必须先建新 runtime 再停旧 runtime |
+
+#### 实验纪律与停止条件
+
+- 不并发启动 L3 会话；[B8](#b8) 已证明同设备后建者会顶掉前者。控制面验证也使用隔离 cookie jar，
+  防止新旧 cookie 在同一 jar 中合并后失去归因；
+- 不重放旧 portal ticket 或 service ticket。每次续期必须从新 CAS challenge 开始；
+- `S0`、`S1` 和 browser trace 均视为实时凭据，文件权限固定 `0600`；browser profile 使用独立的
+  `0700` 目录。实验结束后全部删除；普通摘要只记录指纹前 12 位、cookie 名称、时间、状态码和业务码，
+  不记录值；
+- 不改变现有日志内容或级别。本实验需要的新判据写入单独的 `0600` 结构化摘要；
+- 遇到 `InteractionRequired`、会话业务拒绝或连续两次传输失败立即停止，不自动循环 CAS/MFA，避免锁号；
+- 首轮只验证续期原语，不修改 `AtrustClient`。R2 连续两轮 PASS 后，下一阶段才设计
+  `SessionMaterial` 原子替换、ResourceCache 重建、旧 L3 manager 排空及 VIP 变化通知。
+
+**当前运行臂（2026-08-07）：R1 `authConfig`。** 凭证已由外部刷新，因此不再启动浏览器或尝试 CAS
+换票。用户级 `hermes-e11-renewal.service` 只读 `~/.hermes/xidian-session.json`，在同一进程和 cookie
+jar 中执行 `authConfig(modified=true)`，保持到会话文件年龄至少 4 小时 15 分后验证 `onlineInfo`、
+`clientResource` 和 SID-only Get-IP。它不会创建、更新或覆盖任何会话文件。服务首次启动后发现外部
+会话刚被再次更新，固定 5400 秒不足以跨过历史边界，因而在约 5 分钟内停止并按动态截止时间重启；
+最终结果对应**两次同类 `authConfig` 调用**，不是严格单调用。跨过旧会话预计失效点仍成功才支持 R1；
+失败必须同时检查「距候选调用的时间」，不能仅按会话文件总年龄否定候选。
+
+**本轮结果（2026-08-07 18:37）：失败，但不可判定 R1。** 外部会话保存于 14:22:03；第二次
+`authConfig` 在 14:40:24 返回 `LoggedIn`，随后的 `onlineInfo` 和 `clientResource` 都成功。最终检查在
+18:37:42（会话文件年龄 15339 秒）执行，第一个 `onlineInfo` 即返回
+`75500002 / The session is invalid`，因此没有继续到最终 `clientResource` 和 Get-IP；服务按预期以
+状态 1 退出，凭证文件 mtime 和指纹未变化。
+
+这次失败**不能证明 `authConfig` 不续期**：最终检查距候选调用约 3 小时 57 分，已经长于历史约
+3 小时 48 分 TTL。即使候选在 14:40 重置了一次同长度 TTL，也可能在约 18:28 再次过期，而本轮直到
+18:37 才检查。正确的下一臂应在会话年龄约 2 小时时调用候选、约 4 小时时验证：届时未续期模型已经
+过期，而重置 TTL 模型中的候选年龄只有约 2 小时，两者有足够判读间隔。现有 runner 的“启动即调用、
+等待到固定总年龄”时间模型不得直接复用。
+
+**下一臂（17 小时、无人干预）的固定时间线：** 服务只接受 mtime 不超过 15 分钟的外部会话；启动时
+为取得 CSRF 所需的 `authConfig` 只记为 candidate 0，不参与归因。之后所有检查点都严格执行“先用
+上一轮 configuration 验证，再调用下一轮 candidate”，禁止先续期再验证：
+
+| 会话启动后 | 操作 | 判读作用 |
+|---:|---|---|
+| 2:00 | candidate 1：`authConfig` + 即时 `onlineInfo` | 第一条可归因候选 |
+| 4:00 | 验证 candidate 1；通过后 candidate 2 | 未续期模型应已过期；重置模型仅经过约 2 小时 |
+| 7:15 | 验证 candidate 2；通过后 candidate 3 | 第一次接近 TTL 的重复续期 |
+| 10:30 | 验证 candidate 3；通过后 candidate 4 | 第二次重复续期 |
+| 13:45 | 验证 candidate 4；通过后 candidate 5 | 第三次重复续期 |
+| 17:00 | 验证 candidate 5；最终 Get-IP | 第四次重复续期与数据面 SID 证明 |
+
+每个验证点依次执行 `onlineInfo` 和 `clientResource`；非 session-invalid 的传输错误最多重试三次、间隔
+30 秒，明确 session-invalid 立即失败。最终 Get-IP 同样最多尝试三次。服务通过 `systemd-inhibit` 阻止
+系统睡眠，避免 monotonic timer 暂停而真实 SID 继续老化；会话文件始终只读。总预算 61200 秒（17 小时）
+加少量网络请求时间，低于 20 小时限制。若 4 小时检查即失败，可以直接否定本部署当前配置下的 R1；
+若 17 小时全部通过，则同时证明续期存在且至少可重复四轮。
+
+**17 小时臂实际结果（2026-08-09）：在 candidate 1 处提前结束。** 外部会话文件保存于 11:52:33，
+服务在 11:53:45 启动（会话文件年龄 72 秒）；candidate 0、即时 `onlineInfo` 和 1,324,933 字节
+`clientResource` 均成功。13:54:10 到达计划中的 2 小时候，candidate 1 的 `authConfig` 请求本身返回，
+但紧接的 `onlineInfo` 立即得到 `75500002 / The session is invalid`。服务在 elapsed=7225 秒、
+会话文件年龄 7297 秒时以状态 1 退出，后续 4/7.25/10.5/13.75/17 小时检查均未执行；凭证文件未改变。
+
+这说明本次样本的可用窗口只有约 2 小时，明显短于此前约 3.7 小时样本，而且再次确认
+`authConfig` 即使在已过期状态下能返回结构，也**不能复活**会话。但 candidate 1 到达时会话已经失效，
+所以本轮仍未测试到“过期前调用能否续期”。下一臂必须把第一条可归因候选提前到 1 小时，并在会话
+总年龄约 2 小时 15 分先验证：未续期模型应已过期，而重置 2 小时 TTL 的模型中候选仅老化约 1 小时
+15 分。后续重复周期也应缩到不超过 1 小时 30 分，不能再沿用 3 小时 15 分间隔。
+
+**R2 runner（2026-08-10）：** `scripts/e11-r2-bootstrap.sh` 用全新 `0700` Chrome profile 完成唯一一次
+人工登录并写出只读基线 `S0.json`。随后 `hermes-e11-r2.service` 在 S0 年龄 1 小时时发起静默 CAS，
+先将候选写到 `S1.json.tmp`；控制面、Get-IP 和单次 flow auth 全部通过后才原子提交为 `S1.json`。
+runner 不合并两份 cookie jar、不覆盖 S0，并通过 `systemd-inhibit` 保持墙钟与 monotonic 时间线一致。
+外部 IDS 页面稳定停留 10 秒即归类为 `interaction_required`；未识别的 aTrust 交互页仍由 5 分钟总超时兜底。
+
+#### R2 首轮结果：T+1h 的磁盘 profile 不足（2026-08-10）
+
+T0 人工 bootstrap 于 10:45 完成。S0 基线的 `authConfig`、`onlineInfo`、1.32 MB `clientResource`、
+Get-IP 和单次 L3 flow auth 全部通过；VIP 为 `10.210.29.217`，connect token 为 32 字节。T+1h
+runner 正常创建新 CAS challenge，但浏览器随后停在 `https://ids.xidian.edu.cn/authserver/login`；稳定
+10 秒后按设计以 `interaction_required`（退出码 2）停止。没有生成 `S1.json.tmp` 或 `S1.json`，S0
+也没有被覆盖。事后在 S0 年龄约 3 小时 29 分时只读检查，`authConfig=LoggedOut`，`onlineInfo` 返回
+`75500002 / The session is invalid`。
+
+**可判定边界：** 本轮只否定「关闭 bootstrap Chrome，T+1h 仅复用同一磁盘 user-data-dir」这条路径，
+不能据此宣布 R3。关闭浏览器后，profile 内没有继续保留 aTrust SID；IDS 只剩长期的 MFA browser
+fingerprint、locale，以及一枚从 T0 起约 10 分钟过期的不透明 cookie。也就是说 profile 持久化本身
+工作正常，但它没有保留一个能跨到 T+1h 的登录会话。尚未测试的是：
+
+1. 同一个 Chrome/WebDriver 进程一直存活时，session cookie 能否支持静默换票；
+2. 那枚约 10 分钟 cookie 尚未过期时，新 CAS challenge 能否刷新它或取得新 SID；
+3. 官方客户端是否根本不走我们当前选择的 CAS URL，而是通过 portal 的本地 IPC 和另一条换票接口。
+
+因此当前产品结论不是「只能运行约 3 小时且绝无续期机制」，而是「普通 API 活动不续期，T+1h
+重启浏览器的 CAS 路径也不续期；官方客户端使用的续期/接管原语仍未定位」。
+
+#### 路线 A：捕获 portal 唤醒官方客户端的本地 IPC
+
+bootstrap trace 已经给出第一条直接证据。portal 在登录完成后分四轮向六个本地 HTTPS endpoint 发送
+`POST /v1/detect`，本机未运行官方客户端，所以全部 connection refused：
+
+| host | ports |
+|---|---|
+| `127.0.0.1` | `54630`, `54641`, `54652` |
+| `localhost.sangfor.com.cn`（当前解析到 loopback） | `54631`, `54642`, `54653` |
+
+同一轮加载了 `detect_client.*.js`、`client.*.js`、`utils_ipc.*.js`、`download_client_pc.*.js`、
+`shortcut_api.js` 和 `shortcut_main.js`。对 portal JS 的静态检查进一步给出以下**推断路径**，但本轮
+因 `/v1/detect` 未成功，尚未在 wire 上观察到后四步：
+
+```text
+portal -> POST https://<loopback>/v1/detect                 # 已观察
+       -> /v1/service/init|status                           # JS 中存在
+       -> gateway /passport/v1/public/ticketExchange        # JS 中存在
+       -> POST /v1/service/start                             # 可能携带会话材料
+       -> WSS /v1/service/events                            # JS 中存在
+```
+
+这比“猜一个自定义 URL scheme”更具体：当前没有发现桌面端 custom scheme，现有证据支持浏览器直接访问
+本地 HTTPS/WSS agent。下一实验实现一个只绑定 loopback 的分阶段 listener，每一阶段单独运行：
+
+1. **TCP-only：** 六端口 accept 后立即关闭，只记录端口、次数、时序和 TLS ClientHello 的 SNI/ALPN；
+2. **TLS + 失败响应：** 使用仅供实验 profile 信任的临时 CA，固定返回 404/失败 JSON，只记录 method、
+   去 query 的 path、长度和 digest；
+3. **单端口 detect-success：** 每次只让一个 endpoint 返回从 JS 推导的最小成功结构，观察下一请求究竟是
+   `init`、`status`、`start` 还是 WSS；
+4. **WSS 能力：** 只完成 upgrade，记录 opcode/长度，不解释 payload；
+5. **受控完整序列：** 只有前四步明确后才允许推进到 `service/start`。该请求可能含实时 ticket、SID 或
+   设备材料，只能在内存中提取 JSON key/type，禁止落原始 body。
+
+listener 必须拒绝非 loopback peer，不记录 Cookie、Authorization、query value、header value、POST 原文
+或 WebSocket payload。没有官方客户端对照并不妨碍前两步；从 detect-success 开始属于主动模拟，必须把
+「portal 实际发出」与「listener 伪造响应诱导出的后续行为」分别标记。
+
+#### 路线 B：T+5m 短窗口换票
+
+约 10 分钟的 IDS cookie 给出了可证伪窗口。第一臂不再关闭浏览器：T0 人工完成 CAS/MFA 后保持同一
+Chrome 与 WebDriver session，在 T+5m 请求一个由当时 `authConfig(needTicket=true)` 新生成的 challenge；
+全程不点击、不输入。现有 bootstrap/runner 是两个进程且会关闭 Chrome，不能直接复用，需先增加一个
+单进程状态机。
+
+判据保持与 R2 一致：新 challenge 自动回 portal 后，候选只写 `S1.tmp`；`onlineInfo`、
+`clientResource`、Get-IP 和单次 flow auth 全通过才提交 S1。记录 IDS 短 cookie 的到期时间是否被刷新、
+SID 是否变化，以及 S0 是否立即失效。若 T+5m 已停在 IDS/MFA，说明即使同进程短窗口也不能静默 CAS，
+R3 得到强支持。
+
+第二臂必须换一个登录日，只测试「T0 关闭 Chrome、T+5m 重开同一 profile」，用来区分 session cookie
+与约 10 分钟持久 cookie 的作用。两臂不能在同一次登录中先后执行，否则第一条新 challenge 会改变
+第二臂的状态。第一次成功只证明单次换票；随后再单独设计每 5 分钟连续两轮 S0 -> S1 -> S2，判断
+短 cookie 是否会被每轮刷新。若短窗口 CAS 仍失败，路线 A 的 `/ticketExchange + service/start` 将成为
+更可能的官方续期入口，也能回答“当前换票 URL 是否选错”。
+
+**第一臂实现（2026-08-10）：** `atrust-probe e11-r2-short-window` 在一个进程和一个 WebDriver session
+内执行两次 challenge。第一次允许人工完成 IDS/MFA，观察到 portal + SID 后自动收割 S0，但不关闭
+Chrome；从 S0 验证完成时起等待 300 秒。第二次使用一个全新的 `ReqwestTransport`（空 HTTP cookie jar）
+调用当时的 `authConfig(needTicket=true)`，确保 challenge 不是从 S0 控制面 jar 复用出来；随后让同一个
+Chrome 导航到新 URL，进入该阶段后禁止任何点击或输入。
+
+`scripts/e11-r2-5m-same-browser.sh` 负责完整判据：检测 S0 文件出现后，在浏览器仍保持期间串行验证
+`onlineInfo`、`clientResource`、Get-IP 和一次 flow auth；第二次浏览器收割只写 `S1.json.tmp`，同样
+全部验证后才改名为 `S1.json`。之后立即检查 S0，若仍有效则从 T0+2h 起每 5 分钟检查，直到 S0
+session-invalid 后再次完整验证 S1。服务单元为 `scripts/hermes-e11-r2-5m.service`，通过
+`systemd-inhibit` 同时保持浏览器进程和实验时间线。
+
+操作纪律与上一轮不同：人工完成首次登录并进入 portal 后，**不要关闭 Chrome，不要点击 portal，
+也不要手动触发第二次登录**。runner 会自动完成后续动作。独立运行目录为 `~/.hermes/e11-r2-5m/`；
+为避免跨登录日混合状态，目录已存在时脚本会 fail-closed，绝不覆盖旧 S0、S1、profile 或 trace。
+
+**第一臂首次启动结果：探针过早收割，不是 WebDriver 端口故障。** ChromeDriver 在指定的 `9518`
+正常创建 session，人工 CAS 已经过 IDS callback 到达第一次 `portal/shortcut.html`，并观察到 10 个 gateway
+cookie；但 `complete_cas_after_interaction` 把「第一次 portal + SID」错误当成最终完成，`portal_hits=0`
+即返回。紧接的 `onlineInfo` 得到 `75500002`，所以没有写出 S0，runner 以
+`bootstrap_or_S0_creation_failed` 停止。这次没有进入 T+5m，不能作为短窗口换票结果。由于下一实验改走
+纯 HTTP，该 WebDriver 状态机缺陷暂不继续修复。
+
+#### 路线 C：只依赖初次 gateway 凭证的无头双向换票
+
+portal JS 暴露了两个方向相反的接口：
+
+```text
+已登录 gateway session
+  -> POST /passport/v1/public/ticketExchange      body={}
+  <- data.sidTicket
+
+本地客户端提供的 sidTicket
+  -> POST /passport/v1/public/sessionIdExchange   body={sidTicket}
+  <- gateway session cookies（假设，待 live 验证）
+```
+
+静态契约确认 `ticketExchange` 不接收 local detect 结果或 portal ticket；它只依赖现有 gateway cookie、
+`authConfig` 提供的 CSRF，以及公共 query/header。官方流程把返回的 `sidTicket` 立即交给本地
+`/v1/service/start`；反方向的 `sessionIdExchange` 通常接收本地 `/v1/service/init` 返回的 ticket。因此把
+两个 gateway API 直接串联**不是已知官方流程**，而是一个成本低、可明确证伪的无头候选：若同一
+`sidTicket` 可直接换回新 gateway session，就找到了不需要浏览器和本地 agent 的续签原语；若第二步拒绝，
+最可能说明 ticket 必须先经官方客户端消费或转换，不能据此否定路线 A。
+
+`atrust-probe e11-headless-ticket-exchange` 和 `scripts/e11-headless-ticket-renewal.sh` 实现该候选：
+
+1. 外部先生成 mtime 不超过 15 分钟的 `~/.hermes/xidian-session.json`；实验自身不启动 Chrome、
+   ChromeDriver、WebDriver，也不读取 browser profile/trace；
+2. runner 把源文件冻结为独立只读 S0，并完成控制面、Get-IP 和 flow auth 基线；
+3. S0 年龄 5 分钟时，用 S0 jar 调一次 `ticketExchange`。`sidTicket` 只保存在进程内存，日志只记录存在性
+   和长度，不落盘、不打印值或 digest；
+4. 立即创建全新空 cookie jar，先取 CSRF，再用内存 ticket 调一次 `sessionIdExchange`；
+5. 新 jar 的 `authConfig`、`onlineInfo`、`clientResource` 全通过才写 `S1.json.tmp`，数据面通过后才提交
+   S1；之后仍要求 S0 失效而 S1 有效，才能最终 PASS。
+
+判读分三层：`ticketExchange` 本身失败，说明保存的 gateway session 不能独立调用该原语；ticket 已取得但
+`sessionIdExchange` 拒绝，说明直接闭环不成立、很可能缺本地客户端转换；S1 立即成立但不能跨 S0 到期点，
+只说明一次 exchange 可登录，不证明续期。只有跨旧到期点的完整 S1 才支持产品实现。
+
+**首次无头结果与恢复监测（2026-08-11）：** S0 年龄 5 分钟时 `ticketExchange` 成功返回 73 字节
+`sidTicket`，同一 ticket 被全新空 jar 的 `sessionIdExchange` 接受。S1 的 `onlineInfo`、
+`clientResource`、Get-IP 和 flow auth 全部通过并原子保存；SID 未变化，cookie 集合从 10 项变为 7 项。
+意外关机发生在等待 S0 到期阶段，当时只确认 S0 在 522 秒仍有效。重启后 S0/S1 年龄约 1h40m/1h34m
+时均通过 `onlineInfo`，说明 S1 可跨进程持久恢复，但尚未证明 TTL 被延长。
+
+`scripts/e11-headless-resume-monitor.sh` 从现有文件恢复，不重新登录或换票。为捕获 S1 相对 S0 只有约
+5m49s 的区分窗口，它每 60 秒只检查 S0；S0 session-invalid 后才立即完整验证 S1，避免每轮双倍请求。
+原文件指纹必须保持不变，最长观察到 S0 年龄 4h15m。
+
+**最终结果：无头恢复成立，但没有续期（2026-08-11）。** 重启后第一次检查时，S0/S1 分别在约
+1h40m/1h34m 仍通过；约 14 分钟后 S1 已返回 `75500002`，紧接着 S0 也返回同一码。已知 S0 与 S1
+的 SID 完全相同，而 S1 只晚创建约 5m49s；没有观察到「S0 失效、S1 仍有效」的窗口。当前证据支持：
+
+1. `ticketExchange` 的 73 字节 ticket 可以被空 jar 的 `sessionIdExchange` 直接接受，无需浏览器或本地 agent；
+2. 它能在另一进程/另一 cookie jar 中重建控制面和数据面均可用的会话；
+3. 重建得到的仍是同一个后端 SID 和同一个绝对到期点，**不重置 TTL，不构成续签**。
+
+因此该闭环可用于进程间会话接管或官方客户端启动，但不能解决长期无人值守。下一候选必须能产生新 SID、
+刷新后端绝对期限，或让本地 agent 持有一个独立于 gateway SID 生命周期的数据面凭证。
+
+**预计成本：** 一次 R2 主实验最长约 4 小时 15 分，其中只有 T0 需要人工；确认可重复性至少需要两个登录日。
+R1 每个候选也必须独立占用一次登录，优先级低于 R2，不应为了穷举接口延迟主实验。
+
 ---
 
 ## 变更记录
 
+- **2026-08-07（E11 设计）：** 基于 [B7](#b7) 的 SID 绝对 TTL 结果，新增无人值守续期实验。
+  主路径是在一次人工 MFA 后复用持久 browser profile，发起新 CAS challenge 并尝试静默换取新 SID；
+  先验证服务端原语和跨旧到期点，再考虑 `AtrustClient` 的运行时材料热替换。
+- **2026-08-10（E11 R2 首轮）：** T+1h 复用关闭后的 Chrome profile 会停在 IDS 登录页，未生成 S1；
+  该结果只否定重启浏览器路径，不足以证明 R3。新增两条并行路线：捕获 portal 对六个 loopback HTTPS
+  endpoint 的官方客户端 IPC，以及在同一浏览器进程内执行 T+5m 短窗口 CAS 换票。
 - **2026-07-31** 建档。收纳 A1–A7、B1–B5、C1–C4、D1–D3，实验 E1–E5。
   D1/D2 为当日新实测结果，推翻了架构文档中「外网 `:441` 不可达」的旧记录。
   同日为 [A1](#a1) 增加 `connect_token_len` / `data_resp layout` 两处埋点，

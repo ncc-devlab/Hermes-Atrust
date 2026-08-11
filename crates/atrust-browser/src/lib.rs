@@ -25,6 +25,7 @@ use url::Url;
 const WEBDRIVER_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_WEBDRIVER_RESPONSE: usize = 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+const AUTOMATIC_INTERACTION_GRACE: Duration = Duration::from_secs(10);
 const TRACE_VERSION: u32 = 1;
 
 #[derive(Debug, Error)]
@@ -53,6 +54,8 @@ pub enum BrowserError {
     InvalidBidiResponse,
     #[error("timed out waiting for aTrust multi-step login completion")]
     CallbackTimeout,
+    #[error("automatic CAS renewal requires interaction at {authority}{path}")]
+    InteractionRequired { authority: String, path: String },
     #[error("browser returned invalid gateway cookies")]
     InvalidCookies,
     #[error("browser closed before any gateway cookies were observed")]
@@ -253,6 +256,47 @@ impl WebDriverBrowser {
         timeout: Duration,
         trace_path: Option<&Path>,
     ) -> Result<BrowserLoginResult, BrowserError> {
+        self.complete_cas_with_mode(challenge, timeout, trace_path, false, false)
+            .await
+    }
+
+    /// Waits for an operator to complete CAS/MFA, then harvests without closing Chrome.
+    ///
+    /// This is the T0 half of an experiment that must retain browser session cookies
+    /// for a later unattended challenge in the same WebDriver session.
+    pub async fn complete_cas_after_interaction(
+        &self,
+        challenge: CasChallenge,
+        timeout: Duration,
+        trace_path: Option<&Path>,
+    ) -> Result<BrowserLoginResult, BrowserError> {
+        self.complete_cas_with_mode(challenge, timeout, trace_path, true, false)
+            .await
+    }
+
+    /// Runs CAS login and harvests as soon as the gateway completion page has a SID.
+    ///
+    /// This supports unattended SSO renewal after an initial interactive login. It
+    /// never clicks or fills a page: if the identity provider asks for interaction,
+    /// the caller's timeout remains the only completion path.
+    pub async fn complete_cas_automatically(
+        &self,
+        challenge: CasChallenge,
+        timeout: Duration,
+        trace_path: Option<&Path>,
+    ) -> Result<BrowserLoginResult, BrowserError> {
+        self.complete_cas_with_mode(challenge, timeout, trace_path, true, true)
+            .await
+    }
+
+    async fn complete_cas_with_mode(
+        &self,
+        challenge: CasChallenge,
+        timeout: Duration,
+        trace_path: Option<&Path>,
+        automatic_completion: bool,
+        reject_interaction: bool,
+    ) -> Result<BrowserLoginResult, BrowserError> {
         let deadline = Instant::now() + timeout;
         let mut trace = trace_path.map(TraceWriter::open).transpose()?;
         trace_record(
@@ -319,11 +363,25 @@ impl WebDriverBrowser {
         let mut latest_cookies: Vec<GatewayCookie> = Vec::new();
         let mut latest_path: Option<String> = None;
         let mut sid_seen = false;
+        let mut completion_seen = false;
+        let mut external_page: Option<(String, String, Instant)> = None;
 
-        info!(
-            event = "atrust_browser.waiting_manual_close",
-            note = "finish IDS + aTrust MFA fully, then close this browser window to harvest"
-        );
+        if reject_interaction {
+            info!(
+                event = "atrust_browser.waiting_automatic_completion",
+                note = "waiting for the gateway completion page and SID; no page interaction is automated"
+            );
+        } else if automatic_completion {
+            info!(
+                event = "atrust_browser.waiting_interactive_completion",
+                note = "complete IDS and MFA; the browser will remain open after SID harvest"
+            );
+        } else {
+            info!(
+                event = "atrust_browser.waiting_manual_close",
+                note = "finish IDS + aTrust MFA fully, then close this browser window to harvest"
+            );
+        }
 
         loop {
             while let Ok(Some(message)) =
@@ -361,6 +419,7 @@ impl WebDriverBrowser {
                     continue;
                 }
                 if challenge.is_completion_target(&parsed) {
+                    completion_seen = true;
                     portal_hits = portal_hits.saturating_add(1);
                     info!(
                         event = "atrust_browser.portal_navigation",
@@ -388,6 +447,37 @@ impl WebDriverBrowser {
             match self.current_url().await {
                 Ok(url) => {
                     let path = safe_path(&url);
+                    completion_seen |= challenge.is_completion_target(&url);
+                    if reject_interaction && url.authority() != gateway_authority {
+                        let authority = url.authority().to_owned();
+                        match external_page.as_mut() {
+                            Some((seen_authority, seen_path, since))
+                                if *seen_authority == authority && *seen_path == path =>
+                            {
+                                if since.elapsed() >= AUTOMATIC_INTERACTION_GRACE {
+                                    info!(
+                                        event = "atrust_browser.interaction_required",
+                                        authority, path
+                                    );
+                                    trace_record(
+                                        &mut trace,
+                                        "browser_session_interaction_required",
+                                        json!({
+                                            "authority": &authority,
+                                            "path": &path,
+                                        }),
+                                    )?;
+                                    return Err(BrowserError::InteractionRequired {
+                                        authority,
+                                        path,
+                                    });
+                                }
+                            }
+                            _ => external_page = Some((authority, path.clone(), Instant::now())),
+                        }
+                    } else {
+                        external_page = None;
+                    }
                     if path != last_path {
                         info!(event = "atrust_browser.url_change", path = %path);
                         last_path = path.clone();
@@ -454,6 +544,34 @@ impl WebDriverBrowser {
                         .iter()
                         .any(|cookie| cookie.name.eq_ignore_ascii_case("sid"));
                     latest_cookies = cookies;
+                    if automatic_completion && completion_seen && sid_seen {
+                        info!(
+                            event = "atrust_browser.automatic_completion",
+                            portal_hits,
+                            gateway_cookie_count = latest_cookies.len()
+                        );
+                        trace_record(
+                            &mut trace,
+                            "browser_session_automatic_completion",
+                            json!({
+                                "portal_hits": portal_hits,
+                                "gateway_cookie_count": latest_cookies.len(),
+                                "sid_seen": true,
+                                "final_path": latest_path,
+                            }),
+                        )?;
+                        let exchange = last_portal.as_ref().and_then(|url| {
+                            parse_portal_ticket(url, &gateway_authority)
+                                .ok()
+                                .map(|portal_ticket| CasExchange { portal_ticket })
+                        });
+                        return Ok(BrowserLoginResult {
+                            exchange,
+                            gateway_cookies: latest_cookies,
+                            final_path: latest_path,
+                            portal_hits,
+                        });
+                    }
                 }
                 Err(_) => {
                     info!(
@@ -813,11 +931,16 @@ fn chrome_capabilities() -> Value {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let profile = format!(
-        "/tmp/hermes-chrome-profile-{}-{}",
-        std::process::id(),
-        stamp
-    );
+    let profile = std::env::var("HERMES_CHROME_USER_DATA_DIR")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "/tmp/hermes-chrome-profile-{}-{}",
+                std::process::id(),
+                stamp
+            )
+        });
     let mut options = json!({
         "args": [
             format!("--user-data-dir={profile}"),

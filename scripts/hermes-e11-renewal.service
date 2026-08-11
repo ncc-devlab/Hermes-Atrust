@@ -1,0 +1,20 @@
+[Unit]
+Description=Hermes E11 existing-session authConfig renewal experiment
+Documentation=file:/home/nancunchild/projects/Hermes/docs/open-questions.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/nancunchild/projects/Hermes
+ExecStart=/usr/bin/systemd-inhibit --what=sleep --mode=block --who=Hermes-E11 --why=Keep_E11_timeline_monotonic /home/nancunchild/projects/Hermes/scripts/e11-unattended-renewal.sh
+Restart=no
+TimeoutStartSec=infinity
+KillMode=mixed
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hermes-e11
+
+[Install]
+WantedBy=default.target

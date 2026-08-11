@@ -4,3 +4,5 @@
 *.pem
 *.p12
 client_data.json
+graphify-out/
+
