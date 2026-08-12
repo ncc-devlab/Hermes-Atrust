@@ -1578,6 +1578,42 @@ portal JS 暴露了两个方向相反的接口：
 因此该闭环可用于进程间会话接管或官方客户端启动，但不能解决长期无人值守。下一候选必须能产生新 SID、
 刷新后端绝对期限，或让本地 agent 持有一个独立于 gateway SID 生命周期的数据面凭证。
 
+#### zju-connect v1.3.0 及后续协议分支复查（2026-08-12）
+
+复查范围为 `v1.2.2` (`42bfc25`) 到 `origin/main` (`361e42c`)，并包含尚未合入 main 的
+`origin/agent/fix-protocol` (`2a42f58`)。这批提交新增或修正了 TOTP/RADIUS/access-check、enhanced auth、
+设备绑定、L3 重连与退避、10 秒 heartbeat、异步 VIP 更新和 flow auth 瞬态重试，但**没有出现 aTrust
+SID refresh/renew 接口，也没有实现 portal 的 loopback agent IPC**。
+
+与 E11 直接相关的结论如下：
+
+1. zju-connect 仍然只在完整认证链结束后从 HTTP cookie jar 取得 `sid`；已有会话的
+   `authConfig.isLogin == 1` 分支直接返回导入的旧 cookie，没有重新导出 jar。因此它可能漏记响应中的
+   `Set-Cookie` 轮换，不能据此否定轮换；Hermes 的 R1 runner 已在每次候选后通过
+   `session_cookie_value()` 读取实时 jar 并比较 SID，不存在这个观测盲点；
+2. 新 heartbeat 仍只是 `0x15/0x95` 传输活性检测，ACK 只清除本地 missed counter；重连、Get-IP 和
+   flow auth 继续复用同一 SID，没有返回替代 SID。它们与 B7/E7 的 live 阴性续期结果一致；
+3. 新增 TOTP、RADIUS 和 enhanced/device-binding 支持，使“执行完整认证图以取得新 SID”比以前更可行，
+   但西电当前观察到的是 CAS/IDS/SMS，尚无可保存的 TOTP secret；这条路线只有在确认西电认证图能被
+   非交互因子满足后，才能成为无人值守方案；
+4. EasyConnect 的 `/por/update_session.csp` 确实每 60 秒刷新 TWFID 会话，但它属于另一套协议，不能移植
+   为 aTrust SID 续签证据；
+5. 最新十个 `agent/fix-protocol` 提交集中在隧道 framing、重连、heartbeat、conntrack 和 VIP 更新，
+   对 E11 没有新的续签原语。
+
+因此下一阶段顺序调整为：
+
+1. **路线 A1：loopback IPC 最小状态机。** 按 `/v1/detect -> service/init|status -> ticketExchange ->
+   service/start -> service/events` 分阶段推进，只记录路径、字段名/类型、长度和摘要，确认
+   `service/start` 是单纯接管同一 SID，还是由 agent 转换出独立凭证；
+2. **路线 A2：官方客户端被动对照。** 若可安装官方 Linux 客户端，先追踪六个 loopback 端口、进程和
+   外联请求，再模拟响应；没有对照时不猜测 `service/start` 成功结构；
+3. **路线 D：完整无头重认证可行性盘点。** 只读取一次西电 `authConfig` 的认证服务图，判断是否存在
+   password+TOTP、已有 device binding 或其它非交互链；若仍强制 IDS/SMS，则停止实现该路线；
+4. **低优先级 R1 补充。** 如有新的人工登录样本，可在确认仍有效的 T+30m 或 T+1h 调一次
+   `authConfig`，完整捕获 `Set-Cookie` 元数据并比较实时 jar，再跨该样本原到期点验证。现有源码没有
+   提高它成功的先验，不应让它阻塞路线 A。
+
 **预计成本：** 一次 R2 主实验最长约 4 小时 15 分，其中只有 T0 需要人工；确认可重复性至少需要两个登录日。
 R1 每个候选也必须独立占用一次登录，优先级低于 R2，不应为了穷举接口延迟主实验。
 
