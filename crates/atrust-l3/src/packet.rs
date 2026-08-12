@@ -48,18 +48,28 @@ impl Ipv4Flow {
 
     /// Builds the conntrack key (`atype = 4`).
     ///
-    /// The protocol number is deliberately absent: Go's key omits it, and
-    /// whether the server requires it is still unconfirmed (architecture doc
-    /// open item 5). Two flows differing only in protocol therefore collide;
-    /// that is Go-compatible, not an oversight.
     #[must_use]
     pub fn flow_key(&self) -> FlowKey {
         FlowKey::new(
             FLOW_KEY_ATYPE_IPV4,
+            self.protocol.as_u8(),
             &self.src_addr.to_string(),
             self.src_port,
             &self.dst_addr.to_string(),
             self.dst_port,
+        )
+    }
+
+    /// Builds the outbound key corresponding to an inbound packet.
+    #[must_use]
+    pub fn reverse_flow_key(&self) -> FlowKey {
+        FlowKey::new(
+            FLOW_KEY_ATYPE_IPV4,
+            self.protocol.as_u8(),
+            &self.dst_addr.to_string(),
+            self.dst_port,
+            &self.src_addr.to_string(),
+            self.src_port,
         )
     }
 }
@@ -248,6 +258,22 @@ mod tests {
         let five = flow.to_five_tuple();
         assert_eq!(five.atype, L3AuthFiveTuple::ATYPE_IPV4);
         assert_eq!(five.dest_addr, "10.0.0.1");
-        assert_eq!(flow.flow_key().as_str(), "4:10.8.0.7:40000-10.0.0.1:443");
+        assert_eq!(flow.flow_key().as_str(), "4:6:10.8.0.7:40000-10.0.0.1:443");
+    }
+
+    #[test]
+    fn tcp_and_udp_with_the_same_endpoints_have_distinct_keys() {
+        let tcp = parse_ipv4_flow(&ipv4_packet(6, &tcp_payload(53000, 53), 0)).unwrap();
+        let udp = parse_ipv4_flow(&ipv4_packet(17, &tcp_payload(53000, 53), 0)).unwrap();
+        assert_ne!(tcp.flow_key(), udp.flow_key());
+    }
+
+    #[test]
+    fn reverse_key_maps_downstream_packet_to_outbound_flow() {
+        let flow = parse_ipv4_flow(&ipv4_packet(6, &tcp_payload(443, 40000), 0)).unwrap();
+        assert_eq!(
+            flow.reverse_flow_key().as_str(),
+            "4:6:10.0.0.1:40000-10.8.0.7:443"
+        );
     }
 }

@@ -6,12 +6,11 @@
 //! shared with zju-connect `readDataRespPayload`:
 //!
 //! - Let `n = u16::from_be_bytes(body[0..2])`.
-//! - If `0 < n <= MAX_LENGTH_PREFIXED_DATA_RESP` (4096): **length-prefixed** —
-//!   the following `n` bytes are one raw IP packet.
+//! - If `0 < n <= MAX_LENGTH_PREFIXED_DATA_RESP` (4096): **length-prefixed**.
+//! - Larger values are also length-prefixed when the following bytes contain a
+//!   complete IPv4/IPv6 packet whose own length field equals `n`.
 //! - Otherwise: **token-framed** — same layout as the `0x14` request body
 //!   (`tokenLen`, token, reserved, packetCount, length-prefixed packets).
-//!
-//! This threshold is the wire discriminant, not a content scan of IP packets.
 //!
 //! # Auth / heartbeat
 //!
@@ -48,7 +47,7 @@ pub const L3_HEARTBEAT_RESP_HEADER: [u8; 2] = [L3_VERSION, l3_cmd::HEARTBEAT_RES
 /// Which body layout follows `05 94`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DataRespLayout {
-    /// `u16-be(n)` then `n` bytes of one IP packet, with `0 < n <= 4096`.
+    /// `u16-be(n)` then `n` bytes of one IP packet.
     LengthPrefixed { packet_len: u16 },
     /// Body starts with `tokenLen` (same structure as `0x14` payload after version/cmd).
     TokenFramed,
@@ -70,6 +69,45 @@ pub fn classify_data_resp_prefix(prefix: [u8; 2]) -> DataRespLayout {
         DataRespLayout::LengthPrefixed { packet_len: n }
     } else {
         DataRespLayout::TokenFramed
+    }
+}
+
+enum LargePacketCheck {
+    NeedMore(usize),
+    Valid,
+    NotIp,
+}
+
+fn large_length_prefixed_packet(body: &[u8], packet_len: usize) -> LargePacketCheck {
+    let Some(version) = body.get(2).map(|byte| byte >> 4) else {
+        return LargePacketCheck::NeedMore(3);
+    };
+    match version {
+        4 if packet_len >= 20 => {
+            if body.len() < 6 {
+                return LargePacketCheck::NeedMore(6);
+            }
+            let ihl = usize::from(body[2] & 0x0f) * 4;
+            if ihl >= 20
+                && ihl <= packet_len
+                && usize::from(u16::from_be_bytes([body[4], body[5]])) == packet_len
+            {
+                LargePacketCheck::Valid
+            } else {
+                LargePacketCheck::NotIp
+            }
+        }
+        6 if packet_len >= 40 => {
+            if body.len() < 8 {
+                return LargePacketCheck::NeedMore(8);
+            }
+            if usize::from(u16::from_be_bytes([body[6], body[7]])) + 40 == packet_len {
+                LargePacketCheck::Valid
+            } else {
+                LargePacketCheck::NotIp
+            }
+        }
+        _ => LargePacketCheck::NotIp,
     }
 }
 
@@ -137,12 +175,12 @@ pub fn encode_l3_data_req(token: &[u8], packets: &[&[u8]]) -> Result<Vec<u8>, L3
 
 /// Encodes one length-prefixed `0x94` response (Hermes reference server / Go `"len"` mode).
 ///
-/// Wire: `05 94 <u16-be n> <n bytes IP packet>`, requiring `0 < n <= 4096`.
+/// Wire: `05 94 <u16-be n> <n bytes IP packet>`.
 pub fn encode_l3_data_resp_length_prefixed(packet: &[u8]) -> Result<Vec<u8>, L3FrameError> {
     if packet.is_empty() {
         return Err(L3FrameError::EmptyLengthPrefixedPacket);
     }
-    if packet.len() > MAX_LENGTH_PREFIXED_DATA_RESP as usize {
+    if packet.len() > u16::MAX as usize {
         return Err(L3FrameError::PacketTooLarge {
             length: packet.len(),
         });
@@ -243,7 +281,26 @@ pub fn decode_l3_data_resp_body(body: &[u8]) -> Result<(DataRespPackets<'_>, usi
             got: body.len(),
         });
     }
-    match classify_data_resp_prefix([body[0], body[1]]) {
+    let prefix = [body[0], body[1]];
+    let packet_len = u16::from_be_bytes(prefix) as usize;
+    let layout = match classify_data_resp_prefix(prefix) {
+        DataRespLayout::TokenFramed if packet_len > MAX_LENGTH_PREFIXED_DATA_RESP as usize => {
+            match large_length_prefixed_packet(body, packet_len) {
+                LargePacketCheck::NeedMore(needed) => {
+                    return Err(L3FrameError::Truncated {
+                        needed,
+                        got: body.len(),
+                    });
+                }
+                LargePacketCheck::Valid => DataRespLayout::LengthPrefixed {
+                    packet_len: packet_len as u16,
+                },
+                LargePacketCheck::NotIp => DataRespLayout::TokenFramed,
+            }
+        }
+        layout => layout,
+    };
+    match layout {
         DataRespLayout::LengthPrefixed { packet_len } => {
             let n = packet_len as usize;
             let need = 2 + n;
@@ -350,6 +407,39 @@ mod tests {
     }
 
     #[test]
+    fn decodes_large_length_prefixed_ipv4_packet() {
+        let mut packet = vec![0u8; 5000];
+        packet[0] = 0x45;
+        let packet_len = packet.len() as u16;
+        packet[2..4].copy_from_slice(&packet_len.to_be_bytes());
+        let frame = encode_l3_data_resp_length_prefixed(&packet).unwrap();
+        let (decoded, consumed) = decode_l3_data_resp_frame(&frame).unwrap();
+        assert_eq!(decoded, DataRespPackets::LengthPrefixed(packet.as_slice()));
+        assert_eq!(consumed, frame.len());
+
+        for partial in 8..frame.len() {
+            assert_eq!(
+                decode_l3_data_resp_body(&frame[2..partial]),
+                Err(L3FrameError::Truncated {
+                    needed: 2 + packet.len(),
+                    got: partial - 2,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn large_non_ip_prefix_remains_token_framed() {
+        let mut body = vec![0u8; 5002];
+        body[..2].copy_from_slice(&5000u16.to_be_bytes());
+        body[2] = 0x30;
+        assert!(matches!(
+            large_length_prefixed_packet(&body, 5000),
+            LargePacketCheck::NotIp
+        ));
+    }
+
+    #[test]
     fn token_framed_resp_parses_like_data_req_body() {
         // tokenLen=0, reserved, count=1, one 2-byte packet
         let body = [0u8, 0x00, 0x00, 1, 0x00, 0x02, 0xde, 0xad];
@@ -409,7 +499,7 @@ mod tests {
 
     #[test]
     fn rejects_oversized_length_prefixed_encode() {
-        let huge = vec![0u8; 4097];
+        let huge = vec![0u8; u16::MAX as usize + 1];
         assert!(matches!(
             encode_l3_data_resp_length_prefixed(&huge),
             Err(L3FrameError::PacketTooLarge { .. })

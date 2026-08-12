@@ -36,16 +36,29 @@ pub const L3_CONNTRACK_CAPACITY: usize = 8192;
 
 /// Stable key for one L3 flow (Go `connTrackKey`).
 ///
-/// Format: `{atype}:{src}:{srcPort}-{dst}:{dstPort}`. Protocol is not included
-/// until live capture confirms server requirements.
+/// Format: `{atype}:{protocol}:{src}:{srcPort}-{dst}:{dstPort}`.
+///
+/// Protocol is part of the local identity even though it is already present in
+/// the signed auth tuple. Omitting it aliases TCP and UDP flows that happen to
+/// use the same addresses and ports, causing one flow to reuse the other's
+/// connect token.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct FlowKey(String);
 
 impl FlowKey {
-    /// Builds the Go-compatible flow key string.
+    /// Builds the protocol-inclusive flow key string.
     #[must_use]
-    pub fn new(atype: u8, src: &str, src_port: u16, dst: &str, dst_port: u16) -> Self {
-        Self(format!("{atype}:{src}:{src_port}-{dst}:{dst_port}"))
+    pub fn new(
+        atype: u8,
+        protocol: u8,
+        src: &str,
+        src_port: u16,
+        dst: &str,
+        dst_port: u16,
+    ) -> Self {
+        Self(format!(
+            "{atype}:{protocol}:{src}:{src_port}-{dst}:{dst_port}"
+        ))
     }
 
     #[must_use]
@@ -298,6 +311,19 @@ impl ConntrackTable {
         self.by_key.get_mut(key)
     }
 
+    /// Refreshes an existing flow without creating state for unsolicited input.
+    pub fn touch(&mut self, key: &FlowKey) -> bool {
+        self.touch_at(key, Instant::now())
+    }
+
+    fn touch_at(&mut self, key: &FlowKey, now: Instant) -> bool {
+        let Some(entry) = self.by_key.get_mut(key) else {
+            return false;
+        };
+        entry.last_used = now;
+        true
+    }
+
     #[must_use]
     pub fn get_by_auth_id(&self, auth_id: u64) -> Option<&ConntrackEntry> {
         let key = self.by_id.get(&auth_id)?;
@@ -392,8 +418,8 @@ mod tests {
     #[test]
     fn get_or_create_assigns_monotonic_auth_ids() {
         let mut table = ConntrackTable::new();
-        let k1 = FlowKey::new(4, "10.0.0.1", 1, "10.0.0.2", 80);
-        let k2 = FlowKey::new(4, "10.0.0.1", 2, "10.0.0.2", 80);
+        let k1 = FlowKey::new(4, 6, "10.0.0.1", 1, "10.0.0.2", 80);
+        let k2 = FlowKey::new(4, 6, "10.0.0.1", 2, "10.0.0.2", 80);
         let a1 = table.get_or_create(k1.clone(), "app", "g").auth_id;
         let a2 = table.get_or_create(k2, "app", "g").auth_id;
         assert_eq!(a1, 1);
@@ -404,7 +430,7 @@ mod tests {
     #[test]
     fn try_start_auth_only_once() {
         let mut table = ConntrackTable::new();
-        let key = FlowKey::new(4, "1.1.1.1", 9, "2.2.2.2", 443);
+        let key = FlowKey::new(4, 6, "1.1.1.1", 9, "2.2.2.2", 443);
         let entry = table.get_or_create(key, "a", "g");
         assert!(entry.try_start_auth());
         assert!(!entry.try_start_auth());
@@ -413,7 +439,7 @@ mod tests {
     #[test]
     fn mark_auth_ready_and_failed() {
         let mut table = ConntrackTable::new();
-        let key = FlowKey::new(4, "1.1.1.1", 1, "2.2.2.2", 80);
+        let key = FlowKey::new(4, 6, "1.1.1.1", 1, "2.2.2.2", 80);
         let id = table.get_or_create(key.clone(), "a", "g").auth_id;
         table.mark_auth(id, 0, "", "tok-1").unwrap();
         assert_eq!(
@@ -423,7 +449,7 @@ mod tests {
             })
         );
 
-        let key2 = FlowKey::new(4, "1.1.1.1", 2, "2.2.2.2", 80);
+        let key2 = FlowKey::new(4, 6, "1.1.1.1", 2, "2.2.2.2", 80);
         let id2 = table.get_or_create(key2.clone(), "a", "g").auth_id;
         table.mark_auth(id2, 1, "denied", "ignored").unwrap();
         assert!(matches!(
@@ -437,7 +463,7 @@ mod tests {
     }
 
     fn flow(port: u16) -> FlowKey {
-        FlowKey::new(4, "10.0.0.1", port, "10.9.0.1", 80)
+        FlowKey::new(4, 6, "10.0.0.1", port, "10.9.0.1", 80)
     }
 
     /// The leak this replaces: before idle expiry, every successful flow stayed
@@ -548,7 +574,7 @@ mod tests {
     #[test]
     fn evict_frees_the_flow_and_retires_the_auth_id() {
         let mut table = ConntrackTable::new();
-        let key = FlowKey::new(4, "10.8.0.1", 5, "10.0.0.2", 80);
+        let key = FlowKey::new(4, 6, "10.8.0.1", 5, "10.0.0.2", 80);
         let id = table.get_or_create(key.clone(), "app", "g").auth_id;
 
         assert!(table.evict(&key).is_some());
@@ -569,7 +595,7 @@ mod tests {
     #[test]
     fn evict_by_auth_id_matches_evict_by_key() {
         let mut table = ConntrackTable::new();
-        let key = FlowKey::new(4, "10.8.0.1", 6, "10.0.0.2", 443);
+        let key = FlowKey::new(4, 6, "10.8.0.1", 6, "10.0.0.2", 443);
         let id = table.get_or_create(key.clone(), "app", "g").auth_id;
         assert!(table.evict_by_auth_id(id).is_some());
         assert!(table.get_by_key(&key).is_none());
@@ -579,12 +605,26 @@ mod tests {
     #[test]
     fn empty_token_is_failure() {
         let mut table = ConntrackTable::new();
-        let key = FlowKey::new(4, "a", 1, "b", 2);
+        let key = FlowKey::new(4, 6, "a", 1, "b", 2);
         let id = table.get_or_create(key, "a", "g").auth_id;
         table.mark_auth(id, 0, "ok", "").unwrap();
         assert!(matches!(
             table.get_by_auth_id(id).unwrap().outcome(),
             Some(AuthOutcome::Failed { message }) if message.contains("missing connect token")
         ));
+    }
+
+    #[test]
+    fn touch_refreshes_only_an_existing_flow() {
+        let now = Instant::now();
+        let mut table = ConntrackTable::with_limits(Duration::from_secs(10), 2);
+        let existing = FlowKey::new(4, 6, "a", 1, "b", 2);
+        let unknown = FlowKey::new(4, 17, "a", 1, "b", 2);
+        table.get_or_create_at(existing.clone(), "a", "g", now);
+
+        assert!(table.touch_at(&existing, now + Duration::from_secs(9)));
+        assert!(!table.touch_at(&unknown, now + Duration::from_secs(9)));
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.prune_at(now + Duration::from_secs(11)).expired, 0);
     }
 }

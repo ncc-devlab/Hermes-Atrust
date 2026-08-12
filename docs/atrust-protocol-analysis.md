@@ -146,7 +146,8 @@ aTrust 的密码登录同样会使用服务端提供的 RSA/反重放参数，�
 已逐行核对且**一致**的部分：`connTrackKey` 格式 `{atype}:{src}:{sport}-{dst}:{dport}`、
 鉴权 JSON 字段顺序与 `atype=0x0800`/`protocol=IANA号`、HMAC-SHA256 大写 hex 签名覆盖
 `xRequestSig=""` 的字节串、`0x13`/`0x14` 编码、`0x93`/`0x96` 的 status-在-长度-之前布局、
-`0x94` 的 `0 < n ≤ 4096` 双格式判别、25s 心跳、8s 鉴权超时、CAS 式单次发起鉴权。
+`0x94` 的双格式判别、25s 心跳、8s 鉴权超时、CAS 式单次发起鉴权。首字段
+`0 < n ≤ 4096` 直接按长度前缀处理；更大的值只有在 IPv4/IPv6 头内长度与 `n` 一致时才走该分支。
 
 ### 3.2 L3 隧道总连接认证
 
@@ -237,6 +238,7 @@ xRequestSig = UPPERCASE(hex(digest))
 （与 zju-connect `readDataRespPayload` / Hermes `atrust-protocol::l3_frame` 一致）：
 
 - `0 < n ≤ 4096`：**长度前缀** — 随后 `n` 字节为一整包原始 IP；
+- `n > 4096` 且后续 IPv4/IPv6 头声明同一长度：仍为**长度前缀**；
 - 否则：**token 帧** — 与 `0x14` 相同的 `tokenLen | token | reserved | count | 包…`。
 
 该阈值为 wire 判别字段，不是对 IP 内容的扫描。服务端返回的 IP 包进入

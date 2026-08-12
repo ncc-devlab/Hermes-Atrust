@@ -45,7 +45,7 @@ use crate::conntrack::{
     AuthOutcome, ConntrackTable, FlowKey, L3_AUTH_TIMEOUT, L3_CONNTRACK_CAPACITY,
 };
 use crate::get_ip::{GetIpv4Error, GetIpv4Response, request_ipv4};
-use crate::packet::Ipv4Flow;
+use crate::packet::{Ipv4Flow, parse_ipv4_flow};
 
 /// Heartbeat cadence for one L3 connection (Go: every 25 seconds).
 pub const L3_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
@@ -112,6 +112,8 @@ pub struct L3CloseInfo {
 
 /// Second-VIP response command (`05 96 <status> <u16 len> <json>`).
 const L3_SECOND_VIP_RESP: u8 = 0x96;
+/// Asynchronous VIP update (`05 97 <status> <u16 len> <json>`).
+const L3_VIP_UPDATE_RESP: u8 = 0x97;
 
 /// Cap on unparsed inbound bytes. A peer that never completes a frame cannot
 /// make the reader buffer without bound.
@@ -815,6 +817,10 @@ enum Inbound<'a> {
         status: u8,
         json: &'a [u8],
     },
+    VipUpdate {
+        status: u8,
+        json: &'a [u8],
+    },
     /// Nested `53 00` protocol message.
     Protocol {
         body: &'a [u8],
@@ -832,7 +838,7 @@ enum Inbound<'a> {
 /// Framing follows zju-connect `readFrame`, which is the client proven against
 /// the real gateway:
 ///
-/// - `05 93` / `05 96` carry a status byte *before* the length;
+/// - `05 93` / `05 96` / `05 97` carry a status byte *before* the length;
 /// - `05 94` is the dual-format data body;
 /// - every other `05 <cmd>` uses the generic `<u16 len> <payload>` layout;
 /// - `53 00 <u16 len> <payload>` protocol messages can appear mid-session and
@@ -893,6 +899,8 @@ fn next_frame(buf: &[u8]) -> Result<Option<(Inbound<'_>, usize)>, L3SessionError
             .map(|(status, json, total)| (Inbound::Auth { status, json }, total))),
         L3_SECOND_VIP_RESP => Ok(status_and_json(buf)
             .map(|(status, json, total)| (Inbound::SecondVip { status, json }, total))),
+        L3_VIP_UPDATE_RESP => Ok(status_and_json(buf)
+            .map(|(status, json, total)| (Inbound::VipUpdate { status, json }, total))),
         l3_cmd::HEARTBEAT_RESP => Ok(length_prefixed(buf).map(|total| (Inbound::Heartbeat, total))),
         l3_cmd::DATA_RESP => match decode_l3_data_resp_body(&buf[2..]) {
             Ok((packets, body_len)) => Ok(Some((Inbound::Data(packets), 2 + body_len))),
@@ -1012,6 +1020,17 @@ fn deliver(
     }
 }
 
+fn touch_inbound_flow(shared: &SessionShared, packet: &[u8]) {
+    let Ok(flow) = parse_ipv4_flow(packet) else {
+        return;
+    };
+    shared
+        .conntrack
+        .lock()
+        .expect("conntrack mutex")
+        .touch(&flow.reverse_flow_key());
+}
+
 /// What the read loop must do after a frame is decoded.
 ///
 /// Packets are handed back rather than sent inline so the borrow on the read
@@ -1081,6 +1100,7 @@ fn dispatch(
         // choice is recorded on every frame rather than inferred after a failure.
         Inbound::Data(packets) => match packets {
             DataRespPackets::LengthPrefixed(packet) => {
+                touch_inbound_flow(shared, packet);
                 debug!(
                     event = "atrust_l3.session.data_resp",
                     layout = "length_prefixed",
@@ -1091,6 +1111,9 @@ fn dispatch(
                 Dispatch::Send(packet.to_vec())
             }
             DataRespPackets::TokenFramed(packets) => {
+                for packet in &packets {
+                    touch_inbound_flow(shared, packet);
+                }
                 let bytes = packets.iter().map(|packet| packet.len()).sum::<usize>();
                 debug!(
                     event = "atrust_l3.session.data_resp",
@@ -1117,6 +1140,15 @@ fn dispatch(
                 event = "atrust_l3.session.second_vip_resp",
                 status,
                 body = %String::from_utf8_lossy(json)
+            );
+            Dispatch::Continue
+        }
+        Inbound::VipUpdate { status, json } => {
+            info!(
+                event = "atrust_l3.session.vip_update",
+                status,
+                body_len = json.len(),
+                note = "VIP update decoded; runtime address replacement is not yet enabled"
             );
             Dispatch::Continue
         }
@@ -1236,6 +1268,28 @@ mod tests {
         assert_eq!(
             second,
             Inbound::Data(DataRespPackets::LengthPrefixed(&[1, 2, 3]))
+        );
+    }
+
+    #[test]
+    fn next_frame_keeps_alignment_after_async_vip_update() {
+        let json = br#"{"ip":"10.0.0.2"}"#;
+        let mut buf = vec![L3_VERSION, L3_VIP_UPDATE_RESP, 0x00];
+        buf.extend_from_slice(&(json.len() as u16).to_be_bytes());
+        buf.extend_from_slice(json);
+        buf.extend_from_slice(&[L3_VERSION, l3_cmd::HEARTBEAT_RESP, 0x00, 0x00]);
+
+        let (first, consumed) = next_frame(&buf).unwrap().unwrap();
+        assert_eq!(
+            first,
+            Inbound::VipUpdate {
+                status: 0,
+                json: json.as_slice()
+            }
+        );
+        assert_eq!(
+            next_frame(&buf[consumed..]).unwrap().unwrap().0,
+            Inbound::Heartbeat
         );
     }
 

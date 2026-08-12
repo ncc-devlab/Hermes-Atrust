@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn wire_status_failure_still_reports_the_flow() {
         let mut table = ConntrackTable::new();
-        let key = FlowKey::new(4, "10.8.0.1", 1, "10.0.0.9", 443);
+        let key = FlowKey::new(4, 6, "10.8.0.1", 1, "10.0.0.9", 443);
         let id = table.get_or_create(key.clone(), "app", "g").auth_id;
         let json = format!(r#"{{"code":0,"data":{{"conntrackHash":{id}}}}}"#);
 
@@ -174,7 +174,7 @@ mod tests {
     #[test]
     fn apply_response_marks_ready() {
         let mut table = ConntrackTable::new();
-        let key = FlowKey::new(4, "10.8.0.1", 1, "10.0.0.9", 443);
+        let key = FlowKey::new(4, 6, "10.8.0.1", 1, "10.0.0.9", 443);
         let id = table.get_or_create(key.clone(), "app", "g").auth_id;
         let json = format!(
             r#"{{"code":0,"message":"ok","data":{{"conntrackHash":{id},"connectToken":"c-token"}}}}"#
