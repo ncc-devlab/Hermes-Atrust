@@ -10,12 +10,12 @@ use std::time::{Duration, SystemTime};
 use atrust_auth::{
     AuthClient, AuthConfigOptions, AuthConfiguration, AuthError, FlowProtocol, LoginMethod,
     PasswordCredentials, SessionMaterial, SessionProgress, StoredSession, UnadvertisedNode,
-    extract_sid_from_cookies, select_node, select_node_with,
+    extract_sid_from_cookies, generate_provisional_sign_key, select_node, select_node_with,
 };
 use atrust_browser::{BrowserKind, BrowserLoginResult, WebDriverBrowser, append_trace_event};
 use clap::{Parser, Subcommand, ValueEnum};
 use hermes_logging::{LogFormat, LoggerConfig};
-use hermes_model::{DeviceId, GatewayEndpoint, SecretString, SessionId};
+use hermes_model::{ConnectionId, DeviceId, GatewayEndpoint, SecretString, SessionId, SignKey};
 use hermes_transport::{
     HttpTransport, NodeTlsProbeOutcome, ReqwestTransport, ReqwestTransportConfig, TargetTlsProfile,
     TlsPolicy, connect_tls_over_with_profile, probe_node_tls,
@@ -167,6 +167,69 @@ enum Command {
     SessionCheck {
         #[arg(long)]
         session_file: PathBuf,
+    },
+    /// Test the smallest cookie subset that restores control-plane and Get-IP access.
+    ///
+    /// Each arm uses a fresh empty cookie jar. Credential values are never printed
+    /// or written; this command does not modify the source session file.
+    SidCoverage {
+        /// Fresh session captured by `cas-login`; used read-only as the credential source.
+        #[arg(long)]
+        session_file: PathBuf,
+        /// Optional advertised data node `host:port`. Without it, probe and select
+        /// the fastest endpoint from that arm's clientResource response.
+        #[arg(long)]
+        node: Option<String>,
+        /// Disable certificate verification for the data node only. Gateway TLS
+        /// remains controlled by the top-level policy and should stay strict.
+        #[arg(long)]
+        insecure_node_tls: bool,
+        #[arg(long, default_value_t = 20)]
+        get_ip_timeout_seconds: u64,
+    },
+    /// Run the interleaved minimal-material experiment in one process.
+    ///
+    /// The fixed order is B0, K1, B0-check, C1, B0-check, D1, B0-check,
+    /// F1, B0-final. Every arm starts from an empty cookie jar containing only
+    /// the stored SID and its matching signature, and owns at most one L3 session.
+    MinimalMaterialCoverage {
+        /// Fresh session captured by `cas-login`; used read-only.
+        #[arg(long)]
+        session_file: PathBuf,
+        /// Authorized IPv4 destination for the packet round trip.
+        #[arg(long)]
+        l3_target: String,
+        /// Packet used for every arm. Use UDP only with an echo target.
+        #[arg(long, value_enum, default_value_t = L3Probe::IcmpEcho)]
+        l3_probe: L3Probe,
+        /// UDP application payload bytes, valid only with `--l3-probe udp`.
+        #[arg(long, value_parser = clap::value_parser!(u16).range(0..=65507))]
+        payload_bytes: Option<u16>,
+        /// Source port for synthetic TCP/UDP packets.
+        #[arg(long, default_value_t = 40000)]
+        src_port: u16,
+        /// Authorized HTTPS destination reached through the TCP tunnel.
+        #[arg(long)]
+        https_target: String,
+        /// Pin an advertised data node. Without this, each arm probes advertised nodes.
+        #[arg(long)]
+        node: Option<String>,
+        /// Disable certificate verification for the data node only.
+        #[arg(long)]
+        insecure_node_tls: bool,
+        /// Disable certificate verification for target TLS inside the tunnel only.
+        #[arg(long)]
+        insecure_target_tls: bool,
+        #[arg(long, value_enum, default_value_t)]
+        target_tls_profile: TargetTlsProfileArg,
+        #[arg(long, default_value_t = 20)]
+        connect_timeout_seconds: u64,
+        #[arg(long, default_value_t = 20)]
+        handshake_timeout_seconds: u64,
+        #[arg(long, default_value_t = 10)]
+        reply_timeout_seconds: u64,
+        #[arg(long, default_value_t = 30)]
+        application_timeout_seconds: u64,
     },
     /// Compare two stored sessions without exposing credential values.
     SessionCompare {
@@ -421,6 +484,13 @@ enum Command {
         /// Valid only with `--probe udp`.
         #[arg(long, value_parser = clap::value_parser!(u16).range(0..=65507))]
         payload_bytes: Option<u16>,
+        /// Send a DNS A query instead of the deterministic UDP echo payload.
+        /// Mutually exclusive with `--payload-bytes`; valid only with `--probe udp`.
+        #[arg(long, conflicts_with = "payload_bytes")]
+        dns_name: Option<String>,
+        /// Use DNS QTYPE ANY with `--dns-name` instead of QTYPE A.
+        #[arg(long, requires = "dns_name")]
+        dns_any: bool,
         /// Skip the packet round trip and stop after authorization.
         #[arg(long)]
         auth_only: bool,
@@ -482,6 +552,90 @@ enum L3Probe {
     /// UDP datagram with a deterministic payload. E6 requires an authorized
     /// echo service so the returned bytes can be checked exactly.
     Udp,
+}
+
+fn dns_query_payload(
+    name: &str,
+    id: u16,
+    query_type: u16,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    if name.is_empty() || name.len() > 253 || name.ends_with('.') {
+        return Err("DNS name must be a non-empty absolute name without a trailing dot".into());
+    }
+    let mut payload = Vec::with_capacity(name.len() + 18);
+    payload.extend_from_slice(&id.to_be_bytes());
+    payload.extend_from_slice(&0x0100u16.to_be_bytes()); // RD
+    payload.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+    payload.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+    for label in name.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err("DNS name contains an invalid label".into());
+        }
+        payload.push(label.len() as u8);
+        payload.extend_from_slice(label.as_bytes());
+    }
+    payload.push(0);
+    payload.extend_from_slice(&query_type.to_be_bytes());
+    payload.extend_from_slice(&1u16.to_be_bytes()); // IN
+    Ok(payload)
+}
+
+fn validate_dns_response(
+    packet: &[u8],
+    target_ip: std::net::Ipv4Addr,
+    target_port: u16,
+    vip: std::net::Ipv4Addr,
+    src_port: u16,
+    query: &[u8],
+) -> Result<DnsResponseMetadata, Box<dyn std::error::Error>> {
+    let flow = atrust_client::parse_ipv4_flow(packet)?;
+    if flow.src_addr != target_ip || flow.dst_addr != vip {
+        return Err("DNS reply addresses do not reverse the submitted flow".into());
+    }
+    if flow.src_port != target_port || flow.dst_port != src_port {
+        return Err("DNS reply ports do not reverse the submitted flow".into());
+    }
+    let ihl = usize::from(packet[0] & 0x0f) * 4;
+    let udp = packet.get(ihl..).ok_or("DNS reply is missing UDP data")?;
+    if udp.len() < 8 || usize::from(u16::from_be_bytes([udp[4], udp[5]])) != udp.len() {
+        return Err("DNS reply has an invalid UDP length".into());
+    }
+    let body = &udp[8..];
+    if body.len() < 12 || body[0..2] != query[0..2] {
+        return Err("DNS reply has a missing or mismatched transaction ID".into());
+    }
+    let flags = u16::from_be_bytes([body[2], body[3]]);
+    if flags & 0x8000 == 0 {
+        return Err("DNS reply does not have the response bit set".into());
+    }
+    if u16::from_be_bytes([body[4], body[5]]) != 1 {
+        return Err("DNS reply does not contain exactly one question".into());
+    }
+    if body[12..].is_empty() {
+        return Err("DNS reply has no question section".into());
+    }
+    Ok(DnsResponseMetadata {
+        dns_bytes: body.len(),
+        truncated: flags & 0x0200 != 0,
+        authoritative: flags & 0x0400 != 0,
+        recursion_available: flags & 0x0080 != 0,
+        rcode: (flags & 0x000f) as u8,
+        answers: u16::from_be_bytes([body[6], body[7]]),
+        authorities: u16::from_be_bytes([body[8], body[9]]),
+        additionals: u16::from_be_bytes([body[10], body[11]]),
+    })
+}
+
+#[derive(Debug)]
+struct DnsResponseMetadata {
+    dns_bytes: usize,
+    truncated: bool,
+    authoritative: bool,
+    recursion_available: bool,
+    rcode: u8,
+    answers: u16,
+    authorities: u16,
+    additionals: u16,
 }
 
 #[tokio::main]
@@ -1086,6 +1240,87 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::SessionCheck { session_file } => {
             let _ = restore_session(&client, transport.as_ref(), &endpoint, &session_file).await?;
             info!(event = "probe.session_check.result", passed = true);
+        }
+        Command::SidCoverage {
+            session_file,
+            node,
+            insecure_node_tls,
+            get_ip_timeout_seconds,
+        } => {
+            run_sid_coverage(
+                &endpoint,
+                &session_file,
+                SidCoverageConfig {
+                    node: node.as_deref(),
+                    gateway_tls_policy: tls_policy,
+                    node_tls_policy: if insecure_node_tls {
+                        TlsPolicy::DangerousAcceptInvalidCertificates
+                    } else {
+                        TlsPolicy::Verify
+                    },
+                    http_timeout,
+                    max_response_body,
+                    get_ip_timeout: Duration::from_secs(get_ip_timeout_seconds.max(1)),
+                },
+            )
+            .await?;
+        }
+        Command::MinimalMaterialCoverage {
+            session_file,
+            l3_target,
+            l3_probe,
+            payload_bytes,
+            src_port,
+            https_target,
+            node,
+            insecure_node_tls,
+            insecure_target_tls,
+            target_tls_profile,
+            connect_timeout_seconds,
+            handshake_timeout_seconds,
+            reply_timeout_seconds,
+            application_timeout_seconds,
+        } => {
+            let payload_bytes = match (l3_probe, payload_bytes) {
+                (L3Probe::Udp, Some(bytes)) => usize::from(bytes),
+                (L3Probe::Udp, None) => 32,
+                (_, Some(_)) => {
+                    return Err("--payload-bytes is valid only with --l3-probe udp".into());
+                }
+                (_, None) => 0,
+            };
+            run_minimal_material_coverage(
+                &endpoint,
+                &session_file,
+                MinimalMaterialCoverageConfig {
+                    l3_target: &l3_target,
+                    l3_probe,
+                    payload_bytes,
+                    src_port,
+                    https_target: &https_target,
+                    node: node.as_deref(),
+                    gateway_tls_policy: tls_policy,
+                    node_tls_policy: if insecure_node_tls {
+                        TlsPolicy::DangerousAcceptInvalidCertificates
+                    } else {
+                        TlsPolicy::Verify
+                    },
+                    target_tls_policy: if insecure_target_tls {
+                        TlsPolicy::DangerousAcceptInvalidCertificates
+                    } else {
+                        TlsPolicy::Verify
+                    },
+                    target_tls_profile: target_tls_profile.into(),
+                    verify_target_hostname: !insecure_target_tls,
+                    http_timeout,
+                    max_response_body,
+                    connect_timeout: Duration::from_secs(connect_timeout_seconds.max(1)),
+                    handshake_timeout: Duration::from_secs(handshake_timeout_seconds.max(1)),
+                    reply_timeout: Duration::from_secs(reply_timeout_seconds.max(1)),
+                    application_timeout: Duration::from_secs(application_timeout_seconds.max(1)),
+                },
+            )
+            .await?;
         }
         Command::SessionCompare {
             baseline,
@@ -1781,6 +2016,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             src_port,
             probe,
             payload_bytes,
+            dns_name,
+            dns_any,
             auth_only,
             connect_timeout_seconds,
             reply_timeout_seconds,
@@ -1806,6 +2043,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 (_, None) => 0,
             };
+            if dns_name.is_some() && !matches!(probe, L3Probe::Udp) {
+                return Err("--dns-name is valid only with --probe udp".into());
+            }
             let e8 = concurrent_flows > 1 || callers_per_flow > 1;
             if (hold_seconds > 0 || e8) && !auth_only {
                 return Err("E7/E8 modes require --auth-only".into());
@@ -1976,7 +2216,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         run_l3_probe(
                             &runtime, probe, target_ip, target_port, src_port, payload_bytes,
-                            auth_only, reply_timeout_seconds, node_port,
+                            dns_name.as_deref(), dns_any, auth_only, reply_timeout_seconds, false, node_port,
                             cli.browser_trace_file.as_deref(),
                         ).await
                     }
@@ -2649,8 +2889,11 @@ async fn run_l3_probe(
     target_port: u16,
     src_port: u16,
     payload_bytes: usize,
+    dns_name: Option<&str>,
+    dns_any: bool,
     auth_only: bool,
     reply_timeout_seconds: u64,
+    require_reply: bool,
     node_port: u16,
     trace_file: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -2674,7 +2917,13 @@ async fn run_l3_probe(
     let packet = match probe {
         L3Probe::IcmpEcho => build_icmp_echo(vip, target_ip),
         L3Probe::TcpSyn => build_tcp_syn(vip, src_port, target_ip, target_port),
-        L3Probe::Udp => build_udp_probe(vip, src_port, target_ip, target_port, payload_bytes),
+        L3Probe::Udp => {
+            let payload = match dns_name {
+                Some(name) => dns_query_payload(name, src_port, if dns_any { 255 } else { 1 })?,
+                None => udp_probe_payload(payload_bytes),
+            };
+            build_udp_packet(vip, src_port, target_ip, target_port, &payload)
+        }
     };
 
     let sent = if auth_only {
@@ -2732,15 +2981,43 @@ async fn run_l3_probe(
     {
         Ok(Some(reply)) => {
             if matches!(probe, L3Probe::Udp) {
-                validate_udp_echo(
-                    &reply,
-                    target_ip,
-                    target_port,
-                    vip,
-                    src_port,
-                    &udp_probe_payload(payload_bytes),
-                )
-                .map_err(|error| format!("UDP echo validation failed: {error}"))?;
+                if let Some(name) = dns_name {
+                    let query = dns_query_payload(name, src_port, if dns_any { 255 } else { 1 })?;
+                    let metadata = validate_dns_response(
+                        &reply,
+                        target_ip,
+                        target_port,
+                        vip,
+                        src_port,
+                        &query,
+                    )
+                    .map_err(|error| format!("DNS response validation failed: {error}"))?;
+                    info!(
+                        event = "probe.l3_session.dns_response",
+                        dns_name = name,
+                        dns_bytes = metadata.dns_bytes,
+                        rcode = metadata.rcode,
+                        truncated = metadata.truncated,
+                        authoritative = metadata.authoritative,
+                        recursion_available = metadata.recursion_available,
+                        answers = metadata.answers,
+                        authorities = metadata.authorities,
+                        additionals = metadata.additionals
+                    );
+                } else {
+                    validate_udp_echo(
+                        &reply,
+                        target_ip,
+                        target_port,
+                        vip,
+                        src_port,
+                        &udp_probe_payload(payload_bytes),
+                    )
+                    .map_err(|error| format!("UDP echo validation failed: {error}"))?;
+                }
+            }
+            if require_reply {
+                validate_l3_probe_reply(probe, &reply, target_ip, target_port, vip, src_port)?;
             }
             let parsed = atrust_client::parse_ipv4_flow(&reply).ok();
             info!(
@@ -2754,16 +3031,62 @@ async fn run_l3_probe(
             );
         }
         Ok(None) if matches!(probe, L3Probe::Udp) => {
-            return Err("L3 session closed before the UDP echo reply".into());
+            return Err(if dns_name.is_some() {
+                "L3 session closed before the DNS reply".into()
+            } else {
+                "L3 session closed before the UDP echo reply".into()
+            });
+        }
+        Ok(None) if require_reply => {
+            return Err("L3 session closed before the required packet reply".into());
         }
         Ok(None) => warn!(event = "probe.l3_session.closed_before_reply"),
         Err(_) if matches!(probe, L3Probe::Udp) => {
-            return Err(format!("UDP echo timed out after {reply_timeout_seconds}s").into());
+            return Err(if dns_name.is_some() {
+                format!("DNS query timed out after {reply_timeout_seconds}s").into()
+            } else {
+                format!("UDP echo timed out after {reply_timeout_seconds}s").into()
+            });
+        }
+        Err(_) if require_reply => {
+            return Err(format!(
+                "required L3 packet reply timed out after {reply_timeout_seconds}s"
+            )
+            .into());
         }
         Err(_) => warn!(
             event = "probe.l3_session.reply_timeout",
             seconds = reply_timeout_seconds
         ),
+    }
+    Ok(())
+}
+
+fn validate_l3_probe_reply(
+    probe: L3Probe,
+    reply: &[u8],
+    target_ip: std::net::Ipv4Addr,
+    target_port: u16,
+    vip: std::net::Ipv4Addr,
+    src_port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let flow = atrust_client::parse_ipv4_flow(reply)?;
+    if flow.src_addr != target_ip || flow.dst_addr != vip {
+        return Err("L3 reply addresses do not reverse the submitted flow".into());
+    }
+    match probe {
+        L3Probe::IcmpEcho => {
+            let ihl = usize::from(reply[0] & 0x0f) * 4;
+            if reply.get(ihl).copied() != Some(0) {
+                return Err("ICMP response is not an echo reply".into());
+            }
+        }
+        L3Probe::TcpSyn => {
+            if flow.src_port != target_port || flow.dst_port != src_port {
+                return Err("TCP response ports do not reverse the submitted flow".into());
+            }
+        }
+        L3Probe::Udp => {}
     }
     Ok(())
 }
@@ -3018,14 +3341,29 @@ fn build_udp_probe(
     payload_bytes: usize,
 ) -> Vec<u8> {
     debug_assert!(payload_bytes <= 65_507);
-    let payload = udp_probe_payload(payload_bytes);
+    build_udp_packet(
+        src,
+        src_port,
+        dst,
+        dst_port,
+        &udp_probe_payload(payload_bytes),
+    )
+}
+
+fn build_udp_packet(
+    src: std::net::Ipv4Addr,
+    src_port: u16,
+    dst: std::net::Ipv4Addr,
+    dst_port: u16,
+    payload: &[u8],
+) -> Vec<u8> {
     let udp_len = u16::try_from(8 + payload.len()).expect("validated UDP payload length");
     let mut udp = Vec::with_capacity(usize::from(udp_len));
     udp.extend_from_slice(&src_port.to_be_bytes());
     udp.extend_from_slice(&dst_port.to_be_bytes());
     udp.extend_from_slice(&udp_len.to_be_bytes());
     udp.extend_from_slice(&[0, 0]);
-    udp.extend_from_slice(&payload);
+    udp.extend_from_slice(payload);
 
     let mut pseudo = Vec::with_capacity(12 + udp.len());
     pseudo.extend_from_slice(&src.octets());
@@ -3451,6 +3789,598 @@ async fn restore_session(
         cookies: transport.session_cookies(&origin),
         login_method: stored.login_method,
     })
+}
+
+#[derive(Clone, Copy)]
+enum SidCoverageArm {
+    SidOnly,
+    SidWithSignature,
+    SidFamily,
+    FullCookies,
+}
+
+impl SidCoverageArm {
+    const ALL: [Self; 4] = [
+        Self::SidOnly,
+        Self::SidWithSignature,
+        Self::SidFamily,
+        Self::FullCookies,
+    ];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::SidOnly => "sid_only",
+            Self::SidWithSignature => "sid_with_signature",
+            Self::SidFamily => "sid_family",
+            Self::FullCookies => "full_cookies",
+        }
+    }
+
+    fn includes(self, name: &str, selected_sid: &str) -> bool {
+        match self {
+            Self::SidOnly => name == selected_sid,
+            Self::SidWithSignature => name == selected_sid || name == format!("{selected_sid}.sig"),
+            Self::SidFamily => matches!(name, "sid" | "sid.sig" | "sid-legacy" | "sid-legacy.sig"),
+            Self::FullCookies => true,
+        }
+    }
+}
+
+struct SidCoverageConfig<'a> {
+    node: Option<&'a str>,
+    gateway_tls_policy: TlsPolicy,
+    node_tls_policy: TlsPolicy,
+    http_timeout: Duration,
+    max_response_body: usize,
+    get_ip_timeout: Duration,
+}
+
+async fn run_sid_coverage(
+    endpoint: &GatewayEndpoint,
+    session_file: &Path,
+    config: SidCoverageConfig<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stored = StoredSession::load(session_file)?;
+    stored.ensure_gateway(endpoint)?;
+    let material = stored.to_material()?;
+    let selected_sid = material.sid_cookie_name.as_str();
+    let all_cookies = stored.gateway_cookies();
+    let origin = gateway_origin(endpoint)?;
+
+    info!(
+        event = "probe.sid_coverage.begin",
+        arms = SidCoverageArm::ALL.len(),
+        source_cookie_count = all_cookies.len(),
+        sid_cookie_name = selected_sid,
+        note = "each arm starts with an independent empty cookie jar"
+    );
+
+    for arm in SidCoverageArm::ALL {
+        let cookies = all_cookies
+            .iter()
+            .filter(|cookie| arm.includes(&cookie.name, selected_sid))
+            .cloned()
+            .collect::<Vec<_>>();
+        let transport = Arc::new(ReqwestTransport::new(&ReqwestTransportConfig {
+            tls_policy: config.gateway_tls_policy,
+            timeout: config.http_timeout,
+            max_response_body: config.max_response_body,
+        })?);
+        transport.import_gateway_cookies(&origin, &cookies)?;
+        let client = AuthClient::new(endpoint.clone(), transport);
+        let arm_name = arm.name();
+
+        let configuration = match client
+            .auth_config(AuthConfigOptions {
+                modified: true,
+                need_ticket: false,
+            })
+            .await
+        {
+            Ok(configuration) => configuration,
+            Err(error) => {
+                warn!(event = "probe.sid_coverage.result", arm = arm_name, cookie_count = cookies.len(), stage = "auth_config", passed = false, error = %error);
+                continue;
+            }
+        };
+        info!(
+            event = "probe.sid_coverage.stage",
+            arm = arm_name,
+            stage = "auth_config",
+            passed = true
+        );
+        let username = match client.online_info(&configuration).await {
+            Ok(username) => username,
+            Err(error) => {
+                warn!(event = "probe.sid_coverage.result", arm = arm_name, cookie_count = cookies.len(), stage = "online_info", passed = false, error = %error);
+                continue;
+            }
+        };
+        info!(
+            event = "probe.sid_coverage.stage",
+            arm = arm_name,
+            stage = "online_info",
+            passed = true
+        );
+        let resources = match client.client_resource(&configuration).await {
+            Ok(resources) => resources,
+            Err(error) => {
+                warn!(event = "probe.sid_coverage.result", arm = arm_name, cookie_count = cookies.len(), stage = "client_resource", passed = false, error = %error);
+                continue;
+            }
+        };
+        info!(
+            event = "probe.sid_coverage.stage",
+            arm = arm_name,
+            stage = "client_resource",
+            passed = true
+        );
+        let (node_host, node_port) = match select_data_node(
+            &resources,
+            endpoint,
+            None,
+            NodeChoice {
+                node: config.node,
+                allow_unadvertised: false,
+                skip_probe: false,
+                tls_policy: config.node_tls_policy,
+                connect_timeout: config.get_ip_timeout,
+                trace_file: None,
+            },
+        )
+        .await
+        {
+            Ok(node) => node,
+            Err(error) => {
+                warn!(event = "probe.sid_coverage.result", arm = arm_name, cookie_count = cookies.len(), stage = "node_selection", passed = false, error = %error);
+                continue;
+            }
+        };
+        let get_ip = atrust_l3::get_ipv4(atrust_l3::GetIpv4Request {
+            node_host: &node_host,
+            node_port,
+            tls_policy: config.node_tls_policy,
+            sid: &material.sid,
+            timeout: config.get_ip_timeout,
+        })
+        .await;
+        match get_ip {
+            Ok(response) => info!(
+                event = "probe.sid_coverage.result",
+                arm = arm_name,
+                cookie_count = cookies.len(),
+                stage = "complete",
+                passed = true,
+                username_present = !username.is_empty(),
+                ip_resources = resources.ip_resources.len(),
+                domain_resources = resources.domain_resources.len(),
+                node_groups = resources.node_groups.len(),
+                vip_present = !response.address.is_unspecified()
+            ),
+            Err(error) => {
+                warn!(event = "probe.sid_coverage.result", arm = arm_name, cookie_count = cookies.len(), stage = "get_ip", passed = false, error = %error)
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MinimalMaterialArm {
+    B0,
+    K1,
+    B0Check,
+    C1,
+    D1,
+    F1,
+    B0Final,
+}
+
+impl MinimalMaterialArm {
+    const SEQUENCE: [Self; 9] = [
+        Self::B0,
+        Self::K1,
+        Self::B0Check,
+        Self::C1,
+        Self::B0Check,
+        Self::D1,
+        Self::B0Check,
+        Self::F1,
+        Self::B0Final,
+    ];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::B0 => "B0",
+            Self::K1 => "K1",
+            Self::B0Check => "B0-check",
+            Self::C1 => "C1",
+            Self::D1 => "D1",
+            Self::F1 => "F1",
+            Self::B0Final => "B0-final",
+        }
+    }
+
+    const fn is_baseline(self) -> bool {
+        matches!(self, Self::B0 | Self::B0Check | Self::B0Final)
+    }
+}
+
+struct MinimalMaterialCoverageConfig<'a> {
+    l3_target: &'a str,
+    l3_probe: L3Probe,
+    payload_bytes: usize,
+    src_port: u16,
+    https_target: &'a str,
+    node: Option<&'a str>,
+    gateway_tls_policy: TlsPolicy,
+    node_tls_policy: TlsPolicy,
+    target_tls_policy: TlsPolicy,
+    target_tls_profile: TargetTlsProfile,
+    verify_target_hostname: bool,
+    http_timeout: Duration,
+    max_response_body: usize,
+    connect_timeout: Duration,
+    handshake_timeout: Duration,
+    reply_timeout: Duration,
+    application_timeout: Duration,
+}
+
+async fn run_minimal_material_coverage(
+    endpoint: &GatewayEndpoint,
+    session_file: &Path,
+    config: MinimalMaterialCoverageConfig<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stored = StoredSession::load(session_file)?;
+    stored.ensure_gateway(endpoint)?;
+    let all_cookies = stored.gateway_cookies();
+    let sid_name = stored.sid_cookie_name.as_str();
+    let sid_cookies = all_cookies
+        .into_iter()
+        .filter(|cookie| {
+            cookie.name.eq_ignore_ascii_case(sid_name)
+                || cookie.name.eq_ignore_ascii_case(&format!("{sid_name}.sig"))
+        })
+        .collect::<Vec<_>>();
+    if sid_cookies.len() != 2
+        || !sid_cookies
+            .iter()
+            .any(|cookie| cookie.name.eq_ignore_ascii_case(sid_name))
+        || !sid_cookies
+            .iter()
+            .any(|cookie| cookie.name.eq_ignore_ascii_case(&format!("{sid_name}.sig")))
+    {
+        return Err(format!(
+            "minimal-material coverage requires exactly {sid_name} and {sid_name}.sig"
+        )
+        .into());
+    }
+
+    let (l3_host, l3_port) = parse_host_port(config.l3_target)?;
+    let l3_ip: std::net::Ipv4Addr = l3_host
+        .parse()
+        .map_err(|_| format!("--l3-target must be an IPv4 literal, got {l3_host}"))?;
+    let (https_host, https_port) = parse_host_port(config.https_target)?;
+    let l3_protocol = match config.l3_probe {
+        L3Probe::IcmpEcho => FlowProtocol::Icmp,
+        L3Probe::TcpSyn => FlowProtocol::Tcp,
+        L3Probe::Udp => FlowProtocol::Udp,
+    };
+    let origin = gateway_origin(endpoint)?;
+    let mut candidate_passes = 0usize;
+    let mut baseline_failed = false;
+
+    info!(
+        event = "probe.minimal_material_coverage.begin",
+        arms = MinimalMaterialArm::SEQUENCE.len(),
+        candidate_arms = 4,
+        cookie_count_per_arm = sid_cookies.len(),
+        note = "one arm at a time; every arm runs the complete control-plane, L3, TCP, and HTTPS proof"
+    );
+    eprintln!(
+        "minimal-material coverage: starting {} arms (B0/K1/B0-check/C1/B0-check/D1/B0-check/F1/B0-final)",
+        MinimalMaterialArm::SEQUENCE.len()
+    );
+
+    for (sequence, arm) in MinimalMaterialArm::SEQUENCE.into_iter().enumerate() {
+        let arm_name = arm.name();
+        info!(
+            event = "probe.minimal_material_coverage.arm_begin",
+            sequence = sequence + 1,
+            arm = arm_name,
+            baseline = arm.is_baseline()
+        );
+        eprintln!(
+            "[{}/{}] {arm_name}: starting",
+            sequence + 1,
+            MinimalMaterialArm::SEQUENCE.len()
+        );
+        let result = run_minimal_material_arm(
+            endpoint,
+            &origin,
+            &stored,
+            &sid_cookies,
+            arm,
+            &l3_host,
+            l3_ip,
+            l3_port,
+            l3_protocol,
+            &https_host,
+            https_port,
+            &config,
+        )
+        .await;
+        match result {
+            Ok(()) => {
+                if !arm.is_baseline() {
+                    candidate_passes += 1;
+                }
+                info!(
+                    event = "probe.minimal_material_coverage.arm_result",
+                    sequence = sequence + 1,
+                    arm = arm_name,
+                    baseline = arm.is_baseline(),
+                    passed = true
+                );
+                eprintln!(
+                    "[{}/{}] {arm_name}: PASS",
+                    sequence + 1,
+                    MinimalMaterialArm::SEQUENCE.len()
+                );
+            }
+            Err(error) => {
+                if error.to_string() == "minimal-material coverage interrupted" {
+                    eprintln!(
+                        "[{}/{}] {arm_name}: INTERRUPTED",
+                        sequence + 1,
+                        MinimalMaterialArm::SEQUENCE.len()
+                    );
+                    return Err(error);
+                }
+                baseline_failed |= arm.is_baseline();
+                warn!(
+                    event = "probe.minimal_material_coverage.arm_result",
+                    sequence = sequence + 1,
+                    arm = arm_name,
+                    baseline = arm.is_baseline(),
+                    passed = false,
+                    error = %error
+                );
+                eprintln!(
+                    "[{}/{}] {arm_name}: FAIL ({error})",
+                    sequence + 1,
+                    MinimalMaterialArm::SEQUENCE.len()
+                );
+            }
+        }
+    }
+
+    let passed = !baseline_failed;
+    info!(
+        event = "probe.minimal_material_coverage.result",
+        passed,
+        baseline_passed = !baseline_failed,
+        candidate_passes,
+        candidate_arms = 4
+    );
+    eprintln!(
+        "minimal-material coverage: {} (baselines={}, candidates={candidate_passes}/4)",
+        if passed { "COMPLETE" } else { "INVALID" },
+        if baseline_failed { "failed" } else { "passed" }
+    );
+    if baseline_failed {
+        return Err(
+            "one or more interleaved B0 baselines failed; candidate results are not attributable"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_minimal_material_arm(
+    endpoint: &GatewayEndpoint,
+    origin: &Url,
+    stored: &StoredSession,
+    sid_cookies: &[hermes_transport::GatewayCookie],
+    arm: MinimalMaterialArm,
+    l3_host: &str,
+    l3_ip: std::net::Ipv4Addr,
+    l3_port: u16,
+    l3_protocol: FlowProtocol,
+    https_host: &str,
+    https_port: u16,
+    config: &MinimalMaterialCoverageConfig<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let transport = Arc::new(ReqwestTransport::new(&ReqwestTransportConfig {
+        tls_policy: config.gateway_tls_policy,
+        timeout: config.http_timeout,
+        max_response_body: config.max_response_body,
+    })?);
+    transport.import_gateway_cookies(origin, sid_cookies)?;
+    let client = Arc::new(AuthClient::new(endpoint.clone(), transport));
+    let configuration = client
+        .auth_config(AuthConfigOptions {
+            modified: true,
+            need_ticket: false,
+        })
+        .await?;
+    report_minimal_material_stage(arm, "auth_config");
+    let username = client.online_info(&configuration).await?;
+    report_minimal_material_stage(arm, "online_info");
+    let resources = client.client_resource(&configuration).await?;
+    report_minimal_material_stage(arm, "client_resource");
+
+    let routing = resources.routing_index();
+    let l3_route = routing
+        .match_destination(l3_host, l3_port, l3_protocol)
+        .ok_or_else(|| {
+            format!(
+                "resource table does not authorize {} target {l3_host}:{l3_port}",
+                l3_protocol.as_str()
+            )
+        })?;
+    let tcp_route = routing
+        .match_destination(https_host, https_port, FlowProtocol::Tcp)
+        .ok_or_else(|| {
+            format!("resource table does not authorize TCP target {https_host}:{https_port}")
+        })?;
+    if l3_route.node_group_id() != tcp_route.node_group_id() {
+        return Err(
+            "L3 and HTTPS targets must resolve to the same node group for this controlled chain"
+                .into(),
+        );
+    }
+    let node_group_id = l3_route.node_group_id().to_owned();
+    let nodes = select_data_nodes(
+        &resources,
+        endpoint,
+        Some(&node_group_id),
+        NodeChoice {
+            node: config.node,
+            allow_unadvertised: false,
+            skip_probe: false,
+            tls_policy: config.node_tls_policy,
+            connect_timeout: config.connect_timeout,
+            trace_file: None,
+        },
+    )
+    .await?;
+    let node_port = nodes.first().expect("selection always returns a node").port;
+    let endpoint_override = nodes
+        .into_iter()
+        .map(|node| atrust_client::L3NodeEndpoint::new(node.host, node.port))
+        .collect::<Vec<_>>();
+    report_minimal_material_stage(arm, "node_selection");
+
+    let material = minimal_material_for_arm(stored, arm, username)?;
+    let runtime = atrust_client::AtrustClient::start(
+        Arc::clone(&client),
+        configuration,
+        material,
+        atrust_client::AtrustClientConfig::new(endpoint.clone(), config.node_tls_policy)
+            .with_connect_timeout(config.connect_timeout)
+            .with_tcp_handshake_timeout(config.handshake_timeout)
+            .with_node_group_endpoint_override(node_group_id, Some(endpoint_override)),
+    )
+    .await?;
+
+    let outcome: Result<(), Box<dyn std::error::Error>> = tokio::select! {
+        result = async {
+            run_l3_probe(
+                &runtime,
+                config.l3_probe,
+                l3_ip,
+                l3_port,
+                config.src_port,
+                config.payload_bytes,
+                None,
+                false,
+                false,
+                config.reply_timeout.as_secs(),
+                true,
+                node_port,
+                None,
+            )
+            .await?;
+            report_minimal_material_stage(arm, "l3_round_trip");
+
+            let dialed = runtime.dial_tcp(https_host, https_port).await?;
+            report_minimal_material_stage(arm, "tcp_tunnel");
+            let stats = tokio::time::timeout(
+                config.application_timeout,
+                probe_https_stream(
+                    dialed.tunnel,
+                    https_host,
+                    https_port,
+                    config.target_tls_policy,
+                    config.target_tls_profile,
+                    config.verify_target_hostname,
+                    config.max_response_body,
+                ),
+            )
+            .await
+            .map_err(|_| application_timeout_error())??;
+            log_http_probe("https", &stats);
+            report_minimal_material_stage(arm, "https_round_trip");
+            Ok(())
+        } => result,
+        signal = tokio::signal::ctrl_c() => {
+            signal?;
+            Err("minimal-material coverage interrupted".into())
+        }
+    };
+
+    runtime.shutdown().await;
+    outcome
+}
+
+fn report_minimal_material_stage(arm: MinimalMaterialArm, stage: &'static str) {
+    info!(
+        event = "probe.minimal_material_coverage.stage",
+        arm = arm.name(),
+        stage,
+        passed = true
+    );
+    eprintln!("  {}: {stage} ok", arm.name());
+}
+
+fn minimal_material_for_arm(
+    stored: &StoredSession,
+    arm: MinimalMaterialArm,
+    username: String,
+) -> Result<SessionMaterial, Box<dyn std::error::Error>> {
+    let original_device = DeviceId::new(stored.device_id.clone())?;
+    let original_connection = ConnectionId::new(stored.connection_id.clone())?;
+    let original_sign_key = || SignKey::from_hex(&stored.sign_key_hex);
+    let fresh_device = || DeviceId::new(random_hex(32));
+
+    let (device_id, connection_id, sign_key, provisional) = match arm {
+        MinimalMaterialArm::B0 | MinimalMaterialArm::B0Check | MinimalMaterialArm::B0Final => (
+            original_device,
+            original_connection,
+            original_sign_key()?,
+            stored.sign_key_provisional,
+        ),
+        MinimalMaterialArm::K1 => (
+            original_device,
+            original_connection,
+            generate_provisional_sign_key()?,
+            true,
+        ),
+        MinimalMaterialArm::C1 => (
+            original_device.clone(),
+            ConnectionId::from_device(&original_device)?,
+            original_sign_key()?,
+            stored.sign_key_provisional,
+        ),
+        MinimalMaterialArm::D1 => {
+            let device = fresh_device()?;
+            let connection = ConnectionId::from_device(&device)?;
+            (
+                device,
+                connection,
+                original_sign_key()?,
+                stored.sign_key_provisional,
+            )
+        }
+        MinimalMaterialArm::F1 => {
+            let device = fresh_device()?;
+            let connection = ConnectionId::from_device(&device)?;
+            (device, connection, generate_provisional_sign_key()?, true)
+        }
+    };
+    Ok(SessionMaterial::from_parts(
+        SessionId::new(stored.sid.clone())?,
+        device_id,
+        connection_id,
+        sign_key,
+        Some(username),
+        provisional,
+        stored.sid_cookie_name.clone(),
+        true,
+    ))
 }
 
 async fn run_e11_auth_config_candidate(
@@ -4009,6 +4939,28 @@ mod tests {
     }
 
     #[test]
+    fn dns_query_payload_encodes_a_question() {
+        let payload = dns_query_payload("www.xidian.edu.cn", 0x1234, 1).unwrap();
+        assert_eq!(&payload[..2], &[0x12, 0x34]);
+        assert_eq!(u16::from_be_bytes([payload[2], payload[3]]), 0x0100);
+        assert_eq!(u16::from_be_bytes([payload[4], payload[5]]), 1);
+        assert!(payload.windows(b"www".len()).any(|part| part == b"www"));
+        assert_eq!(&payload[payload.len() - 4..], &[0, 1, 0, 1]);
+    }
+
+    #[test]
+    fn strict_l3_reply_validation_rejects_unrelated_packets() {
+        let vip = "10.210.29.48".parse().unwrap();
+        let target = "202.117.112.71".parse().unwrap();
+        let mut echo_reply = build_icmp_echo(target, vip);
+        echo_reply[20] = 0;
+        validate_l3_probe_reply(L3Probe::IcmpEcho, &echo_reply, target, 0, vip, 0).unwrap();
+
+        let unrelated = build_icmp_echo("192.0.2.9".parse().unwrap(), vip);
+        assert!(validate_l3_probe_reply(L3Probe::IcmpEcho, &unrelated, target, 0, vip, 0).is_err());
+    }
+
+    #[test]
     fn udp_probe_supports_ipv4_maximum_payload() {
         let packet = build_udp_probe(
             "192.0.2.1".parse().unwrap(),
@@ -4049,6 +5001,78 @@ mod tests {
             "65508",
         ]);
         assert!(oversized.is_err());
+
+        let dns = Cli::try_parse_from([
+            "atrust-probe",
+            "--host",
+            "gateway.test",
+            "l3-session",
+            "--target",
+            "192.0.2.1:53",
+            "--probe",
+            "udp",
+            "--dns-name",
+            "www.xidian.edu.cn",
+        ]);
+        assert!(dns.is_ok());
+    }
+
+    #[test]
+    fn minimal_material_sequence_has_interleaved_baselines() {
+        assert_eq!(
+            MinimalMaterialArm::SEQUENCE.map(MinimalMaterialArm::name),
+            [
+                "B0", "K1", "B0-check", "C1", "B0-check", "D1", "B0-check", "F1", "B0-final",
+            ]
+        );
+    }
+
+    #[test]
+    fn minimal_material_arms_change_only_the_intended_fields() {
+        let stored = StoredSession {
+            version: atrust_auth::SESSION_STORE_VERSION,
+            saved_unix_ms: 0,
+            gateway_host: "gateway.test".to_owned(),
+            gateway_port: 443,
+            login_method: LoginMethod::Cas,
+            login_domain: None,
+            cookies: Vec::new(),
+            sid: "sid-value".to_owned(),
+            sid_cookie_name: "sid".to_owned(),
+            sid_sig_present: true,
+            device_id: "device-value".to_owned(),
+            connection_id: "connection-value".to_owned(),
+            sign_key_hex: "11".repeat(32),
+            sign_key_provisional: false,
+            username: Some("stored-user".to_owned()),
+        };
+
+        let b0 =
+            minimal_material_for_arm(&stored, MinimalMaterialArm::B0, "user".to_owned()).unwrap();
+        let k1 =
+            minimal_material_for_arm(&stored, MinimalMaterialArm::K1, "user".to_owned()).unwrap();
+        let c1 =
+            minimal_material_for_arm(&stored, MinimalMaterialArm::C1, "user".to_owned()).unwrap();
+        let d1 =
+            minimal_material_for_arm(&stored, MinimalMaterialArm::D1, "user".to_owned()).unwrap();
+        let f1 =
+            minimal_material_for_arm(&stored, MinimalMaterialArm::F1, "user".to_owned()).unwrap();
+
+        assert_eq!(b0.device_id.as_str(), stored.device_id);
+        assert_eq!(b0.connection_id.as_str(), stored.connection_id);
+        assert_eq!(b0.sign_key.to_hex_lower(), stored.sign_key_hex);
+        assert_eq!(k1.device_id.as_str(), stored.device_id);
+        assert_eq!(k1.connection_id.as_str(), stored.connection_id);
+        assert_ne!(k1.sign_key.to_hex_lower(), stored.sign_key_hex);
+        assert_eq!(c1.device_id.as_str(), stored.device_id);
+        assert_ne!(c1.connection_id.as_str(), stored.connection_id);
+        assert_eq!(c1.sign_key.to_hex_lower(), stored.sign_key_hex);
+        assert_ne!(d1.device_id.as_str(), stored.device_id);
+        assert_ne!(d1.connection_id.as_str(), stored.connection_id);
+        assert_eq!(d1.sign_key.to_hex_lower(), stored.sign_key_hex);
+        assert_ne!(f1.device_id.as_str(), stored.device_id);
+        assert_ne!(f1.connection_id.as_str(), stored.connection_id);
+        assert_ne!(f1.sign_key.to_hex_lower(), stored.sign_key_hex);
     }
 
     #[test]
