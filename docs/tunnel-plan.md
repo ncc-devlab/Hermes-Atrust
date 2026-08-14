@@ -1,7 +1,7 @@
 # aTrust 隧道建立规划
 
 本文描述在控制面（会话 + `clientResource` + 节点解析）就绪后，如何分阶段建立
-数据面。**当前代码禁止在未确认会话材料前拨号。**
+数据面。西电 2026-08-13 live 已确认最小会话材料边界，受控探针现可执行完整拨号。
 
 ## 前置条件（已有 / 待补）
 
@@ -11,14 +11,15 @@
 | `onlineInfo` | **已实测** | ~27ms，`username_present=true` |
 | `clientResource` | **已实测** | 200，~1.3MB / 12.5s；1361 IP / 523 域名 |
 | 节点地址解析 | **已实测** | 1 major 组、2 endpoints、0 sdpc placeholder |
-| 节点可达性探测 | 代码有 TLS 冒烟；**西电未 live** | TCP connect / 时延选优（对照 Go `getBestNodes`） |
-| SID | **已导出并实测** | Cookie `sid` + `sid.sig`；是否即 init SID 仍待对照 |
-| DeviceID | 已生成 | 客户端随机；持久化与 `reportEnv` 对齐仍待做 |
-| ConnectionID | 已生成 | `UPPER(MD5(deviceId)) + "-" + unix_micros` |
-| SignKey | **临时客户端随机** | `SignKey` 32 字节随机，`sign_key_provisional=true`；服务端注册未确认 |
+| 节点可达性探测 | **西电已 live** | TCP + TLS 探测后按时延选优（对照 Go `getBestNodes`） |
+| SID | **已导出并实测** | 完整恢复需要 Cookie `sid + sid.sig`；裸 SID 仅够 Get-IP |
+| DeviceID | **可现场生成，西电已实测** | F1 使用全新客户端随机值完成 L3 + TCP/HTTPS |
+| ConnectionID | **可现场生成，西电已实测** | `UPPER(MD5(deviceId)) + "-" + unix_micros`；F1 通过 |
+| SignKey | **可现场生成，西电已实测** | 32 字节随机 provisional key；F1 完整通过 |
 | Username | 可选 | `onlineInfo` 可提供；进签名 JSON |
 
-未解决「SID / SignKey 来源」前，**不得**把 TCP/L3 当作稳定 API 向上封装。
+当前西电最小外部凭据边界为 `sid + sid.sig`；其余运行时材料可现场生成。该结论不自动外推到
+其他 aTrust 部署，生产 API 仍应保留服务端拒绝和重新认证路径。
 
 ## 阶段划分
 
@@ -32,9 +33,9 @@
    - Cookie 路径 SID 导出（`extract_sid_from_cookies` / `sid` > `sid-legacy` + `*.sig` 存在性）；
    - `SessionMaterial { sid, device_id, connection_id, sign_key, username, … }`；
    - 导入 Cookie 值可按名回读（仅 jar 内，不进日志）。
-5. **仍待：**
-   - 确认 Cookie SID 是否即隧道 init JSON 的 SID（抓包对照）；
-   - SignKey 服务端注册/绑定。
+5. **已完成（西电 2026-08-13）：** `minimal-material-coverage` 的 F1 仅导入
+   `sid + sid.sig`，现场生成 DeviceID / ConnectionID / provisional SignKey，并完成严格 L3
+   回包与 TCP/HTTPS 应用往返。当前部署不要求沿用登录时捕获的这三项材料。
 6. **已完成（2026-07-30）：** 跨进程会话持久化 `--session-file`（`atrust_auth::StoredSession`，
    `0600`）。`cas-login` / `password` 写入，`tcp-dial` / `node-probe` / `client-resource` 读取，
    DeviceID / ConnectionID / SignKey 原样恢复而非重新随机。
@@ -221,8 +222,10 @@ atrust-probe         人工诊断子命令：auth / cas-login / client-resource 
 
 ## 风险与未确认关卡
 
-1. **SID 获取路径**：Cookie-only 登录后 SID 是否在 Cookie 值、onlineInfo 扩展字段或其它 controller API。
-2. **SignKey**：纯客户端随机 vs 服务端下发/注册。
+1. **跨部署材料策略**：西电已确认 `sid + sid.sig` 为最小外部边界；其他版本是否绑定运行时
+   DeviceID / ConnectionID / SignKey 仍需各自验证。
+2. **跨 SID 连续性**：现场生成的运行时材料无需随当前 SID 持久化，但这不解决 SID 续期，也
+   不证明材料应跨新 SID 复用。
 3. **URL 形式**：TCP JSON 中 `tcp://` vs `tcp:`（架构文档列为关卡）。
 4. **私有节点证书**：默认 Verify；失败时诊断，不默认 insecure。
 5. **签名字段顺序**：任何 map 序列化都会破坏 HMAC。
@@ -258,4 +261,10 @@ atrust-probe         人工诊断子命令：auth / cas-login / client-resource 
     **解析对齐（2026-07-30）：** Xidian live 返回前导 `05 d0` method ack 时不再
     `UnexpectedHeader`；循环接受 `05 d0` / `53 00` / `05 00`。失败写 trace
     `get_ip_failed`。数据节点自签 `CN=sdp` 需 `--insecure-tls` 或 pin。
-    Xidian Get-IP live 成功（`probe.get_ip.succeeded`）仍待人工复跑确认。
+    Xidian Get-IP live 已成功；后续 SID coverage 又确认裸 SID 足以执行 Get-IP，而完整控制面需
+    `sid + sid.sig`。
+11. 连续最小材料覆盖实验。
+    **已完成（2026-08-13）：** B0/K1/B0-check/C1/B0-check/D1/B0-check/F1/B0-final 全部通过；
+    F1 证明仅保留 `sid + sid.sig`、同时现场生成 DeviceID / ConnectionID / SignKey，仍可完成
+    L3 严格回包、TCP tunnel 和 HTTPS GET。完整证据与结论边界见
+    [`open-questions.md`](open-questions.md)。

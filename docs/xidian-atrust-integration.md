@@ -385,8 +385,10 @@ Hermes 使用同一 `atrust-browser` 会话列出资源和节点，并以 zju-co
 L3 SID 认证、单流授权、心跳与关闭，最后才是 TUN/DNS/路由。
 
 每一阶段必须有本地 mock/golden test，并将真实失败区分为 DNS、TCP、TLS、SID、设备绑定、
-签名、策略和目标错误。DeviceID、ConnectionID、SignKey 只在服务端证据要求时逐项纳入，
-不预先假定它们与浏览器会话的绑定方式。
+签名、策略和目标错误。西电当前最小外部凭据契约固定为 `sid + sid.sig`；DeviceID、
+ConnectionID 和 SignKey 已由 2026-08-13 F1 实验证明可现场生成。未来发现任何额外必需字段时，
+必须新增以这两个 Cookie 为 B0 的单变量、基线夹层实验，并只升级对应 deployment profile，
+不得从完整 Cookie 成功或单次失败直接推断字段必需。
 
 ## 测试门禁
 

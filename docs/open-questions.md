@@ -27,6 +27,151 @@ L2 单独出现时等同于「未验证」：该服务端与 Hermes 客户端互
 
 ## A. L3 帧层
 
+### A0 — 异步 `0x97` VIP 更新 <a id="a0"></a>
+
+**依据：L1**（zju-connect `2a42f58`）
+
+Hermes 现按 `05 97 <status:u8> <u16-be len> <json>` 解帧。`status == 0` 时递归遍历
+JSON 字符串并采用第一个合法 IPv4，这与参考实现不依赖字段名的 `extractVIPs` 行为一致。
+有效更新会原子替换 session 的 effective VIP、清空该连接全部 conntrack 和 auth waiters、
+更新 manager 的权威查询结果，并发布 `L3VipChanged`。原始 Get-IP 响应保持不变，作为建连
+证据。旧源地址的后续授权和发送会 fail closed。
+
+该链路完全位于 L3 reader/session/manager/event 层，不依赖 TUN。未来 TUN 消费者必须订阅
+`L3VipChanged`，并在恢复流量前同步更换接口地址和相关路由。尚缺 L0 的真实 `0x97` payload
+样本，因此递归提取规则仍是 L1 兼容实现，而非网关抓包确认。
+
+### A0.1 — SID 最小凭据覆盖实验
+
+**当前结论：** SID-only Get-IP 已有 L0 证据；完整控制面需要 `sid + sid.sig`。2026-08-13
+连续最小材料实验进一步证明，在西电当前部署和该 SID 生命周期内，DeviceID、ConnectionID 与
+SignKey 均可由客户端现场生成，仍能完成完整 L3 与 TCP/HTTPS 数据面。
+
+`atrust-probe sid-coverage` 从一个新鲜、只读的 Hermes session 文件取得秘密值，但每个实验
+臂都创建独立空 Cookie jar，防止完整 Cookie 基线污染较小子集。固定顺序为：
+
+1. `sid_only`；
+2. `sid_with_signature`；
+3. `sid_family`（`sid` 和 `sid-legacy` 及其签名）；
+4. `full_cookies` 基线。
+
+每臂依次验证 `authConfig -> onlineInfo -> clientResource -> SID-only Get-IP`，任一步失败就停止
+该臂并记录 stage。日志只包含 arm、Cookie 数量、资源数量和成功布尔值，不包含 Cookie、SID、
+VIP 或 ticket。实验不会修改源 session；默认从该臂的资源表选择节点，也可显式约束到一个
+已发布节点。
+西电节点使用自签名证书时只加子命令级 `--insecure-node-tls`；不要使用顶层
+`--insecure-tls`，后者还会放松携带 Cookie 的网关控制面验证。
+
+**首轮 live（L0，2026-08-13 06:53–06:56 UTC）：部分有效。** `sid_only` 的
+`authConfig` 通过、`onlineInfo` 返回 `75500002`；`sid_with_signature`、`sid_family` 和
+`full_cookies` 均通过 `onlineInfo` 与 1,324,956 字节 `clientResource`。因此西电控制面的
+当前最小已知集合已经收敛到 **`sid + sid.sig`**，裸 SID 不够。四臂 Get-IP 均超时，原因是
+命令传入的 `gsoft.xidian.edu.cn:443` 是业务目标而非 `clientResource` 发布的 aTrust 数据
+节点，故不能用于比较凭据覆盖面。
+
+首轮还暴露一个实验工具问题：`--insecure-node-tls` 被错误复用于每臂 HTTP transport，日志
+出现四次 `transport.insecure_tls_enabled`。现已拆成严格的 gateway TLS 与独立 node TLS；
+`--node` 改为可选，默认从每臂成功取得的 `clientResource` 中并发探测和选择数据节点。
+
+**修复后复验（L0，2026-08-13 07:10–07:13 UTC）：通过并闭合当前问题。** 严格 gateway
+TLS 下结果如下：
+
+| Cookie 臂 | authConfig | onlineInfo | clientResource | 节点选择 + Get-IP |
+|---|---:|---:|---:|---:|
+| `sid` | 通过 | `75500002` | 未执行 | 未执行 |
+| `sid + sid.sig` | 通过 | 通过 | 通过 | 通过 |
+| SID family（4 个） | 通过 | 通过 | 通过 | 通过 |
+| 完整 Cookie（10 个） | 通过 | 通过 | 通过 | 通过 |
+
+三个成功臂均取得相同规模资源（IP 1361、domain 523、node group 1），均从两个发布节点中
+选择可达的 `61.150.43.94:441`，并获得有效 IPv4 VIP；不可达的私网节点
+`10.255.57.11:441` 在 20 秒探测预算后超时。结果证明：
+
+1. 西电当前部署恢复 **control plane + policy + node discovery + Get-IP** 的最小已知外部凭据是
+   **`sid` 与匹配的 `sid.sig` 两个 Cookie**；
+2. `sid-legacy`、`sid-legacy.sig`、`straceid`、语言 Cookie 和 `sdp_limit_auth_tag` 对上述路径
+   均非必要；
+3. 裸 SID 只够数据节点 Get-IP 请求本身，不能通过网关 `onlineInfo`，所以不能独立恢复完整
+   Hermes runtime；
+4. 此轮当时尚未证明可以丢弃持久化的 DeviceID/ConnectionID/SignKey；该问题现已由下述连续
+   最小材料实验闭合。
+
+这个 Cookie 覆盖实验只判定外部 Cookie 输入的最小控制面覆盖；下述连续实验把结论提升到了
+完整数据面。
+
+#### 连续最小材料实验
+
+`atrust-probe minimal-material-coverage` 将下一关固定为一次进程内、基线夹层实验：
+
+`B0 -> K1 -> B0-check -> C1 -> B0-check -> D1 -> B0-check -> F1 -> B0-final`
+
+材料含义如下：
+
+| 臂 | DeviceID | ConnectionID | SignKey |
+|---|---|---|---|
+| `B0` / check / final | 原值 | 原值 | 原值 |
+| `K1` | 原值 | 原值 | 新生成 |
+| `C1` | 原值 | 从原 DeviceID 重新生成 | 原值 |
+| `D1` | 新生成 | 从新 DeviceID 派生 | 原值 |
+| `F1` | 新生成 | 从新 DeviceID 派生 | 新生成 |
+
+每臂从新的空 Cookie jar 开始，只导入 `sid + sid.sig`，然后运行完全相同的
+`authConfig -> onlineInfo -> clientResource -> node selection -> Get-IP -> L3 flow auth -> packet
+round-trip -> TCP tunnel -> target TLS -> HTTPS GET`。任一候选臂失败不会截断链；紧随其后的
+`B0-check` 必须仍通过，才能把失败归因于被替换的材料。任一 B0 臂失败会令整次实验退出失败，
+并将候选结果标记为不可归因。
+
+实验还强制 L3 与 HTTPS 目标匹配同一个 node group；每臂只启动一个 runtime，完成后先关闭
+全部 L3/TCP 连接，再进入下一臂。L3 回复是硬判据：ICMP/TCP 不再像普通 `l3-session` 一样把
+超时仅记为 warning。源 session 只读，日志不记录 Cookie、SID、VIP、SignKey 或应用响应体。
+逐臂开始、成功 stage、失败原因和最终汇总会直接写到 stderr，不受默认 `warn` 日志过滤器
+影响；`HERMES_LOG=info` 仍可用于查看更完整的结构化协议诊断。
+
+**西电 live 结果（L0，2026-08-13）：9/9 全部通过。** 使用：
+
+- 网关：`atrust.xidian.edu.cn`；
+- 唯一导入的外部凭据：源 session 中匹配的 `sid + sid.sig`；
+- L3 目标：`202.117.112.70`，ICMP echo（CLI 中的 `:443` 对 ICMP 资源匹配不参与端口判定）；
+- TCP/HTTPS 目标：`gsoft.xidian.edu.cn:443`；
+- node TLS：仅数据节点启用 `--insecure-node-tls`，网关和目标 TLS 未放松。
+
+固定链 `B0 -> K1 -> B0-check -> C1 -> B0-check -> D1 -> B0-check -> F1 -> B0-final`
+中，每一臂都依次通过：
+
+`authConfig -> onlineInfo -> clientResource -> node selection -> L3 round-trip -> TCP tunnel -> HTTPS round-trip`
+
+四个候选臂和五个基线臂均为 PASS，最终汇总为
+`COMPLETE (baselines=passed, candidates=4/4)`。这给出以下结论：
+
+1. **SignKey 不需要从旧进程持久化。** `K1` 仅替换 SignKey 后仍完整通过，说明当前西电服务端
+   接受客户端新生成的 provisional SignKey，并用它完成 L3/TCP 请求签名。
+2. **ConnectionID 不需要从旧进程持久化。** `C1` 保留原 DeviceID 和 SignKey、仅重新生成
+   ConnectionID 后仍完整通过。
+3. **DeviceID 不绑定该 SID。** `D1` 使用新 DeviceID、由它派生新 ConnectionID，并保留原
+   SignKey，仍完整通过。
+4. **三项可同时现场生成。** 最强候选 `F1` 使用新 DeviceID、派生的新 ConnectionID 和新
+   provisional SignKey，仍取得严格 L3 回包、完成 TCP tunnel，并通过目标 TLS 与 HTTPS GET。
+5. **结果可归因。** 每个候选后紧随的独立 `B0-check` 以及最终 `B0-final` 均完整通过，排除了
+   实验期间 SID 失效、基线数据面退化或候选臂破坏服务端会话状态这几种主要混淆因素。
+6. 因而西电当前已实测的最小外部恢复边界是 **`sid + sid.sig`**。Username 可由
+   `onlineInfo` 取得；DeviceID、ConnectionID 和 SignKey 可在进程启动时生成，不属于必须从
+   登录过程持久化的外部秘密。
+
+结论边界：这是当前西电部署、该资源策略和一次有效 SID 生命周期内的 L0 证据，不推出其他
+aTrust 版本或部署必然采用相同绑定策略，也不证明新生成材料在跨 SID 续期时具有任何连续性。
+
+**当前工程契约。** 在出现相反 L0 证据前，Hermes 将 `sid + sid.sig` 明确作为西电部署恢复
+control plane、policy、L3 和 TCP/HTTPS 所需的**全部最小外部凭据**。会话导入边界不再预留
+DeviceID、ConnectionID、SignKey 或其他 Cookie 为“可能必需字段”；这些运行时材料现场生成。
+如果未来某个部署或客户端版本显示还需要新字段，必须另立独立、可归因的覆盖实验：以当前
+`sid + sid.sig` 为 B0，单变量加入候选字段，并穿插 B0-check。只有该实验通过后才能升级对应
+deployment profile 的凭据 schema；不得依据逆向文档、单次失败或完整 Cookie 基线直接扩张
+全局最小凭据集合。旧 profile 和既有 L0 结论必须保留，不做无条件全局替换。
+
+外部 macOS/Android 二进制逆向材料与由此产生的确定性、主动和被动实验矩阵见
+[`external-binary-notes-assessment.md`](external-binary-notes-assessment.md)。其中严格区分静态路径
+存在（P）、Hermes mock 行为（M）与真实线路可达（L）；等待特定包的实验未触发时不作阴性结论。
+
 ### A1 — `0x94` 下行双格式的切分依据 <a id="a1"></a>
 
 **依据：L1**（zju-connect `l3tunnelconn.go::readDataRespPayload`，Hermes
@@ -1159,6 +1304,19 @@ A 与 B **只差 keepalive 一个变量**（同目标、同 appId、同节点、
   (60 s, ~3600 s] 之间的什么位置未测；
 - B 全程 `session.data_resp` 计数为 **0**——keepalive 是 TCP SYN，目标没有回包。
   因此本实验只证明**出向 `0x14` 足以重置计时器**，入向数据是否也能、或是否必需，无依据。
+
+**1800 秒中点结果（L0，2026-08-14）：下界收窄到 1800 秒。** 使用已知会应答的
+`202.117.112.70:443`，同一 session 保持 5400 秒，第一次非 heartbeat 活动在 elapsed=1800 秒；
+此前 heartbeat 全部 ACK、session 未关闭。1800/3600 秒的两个 40-byte TCP SYN 均收到
+length-prefixed 40-byte `0x94`，5400 秒时 heartbeat 216/216、drop 0、auth timeout 0，最终新 flow
+授权成功，首尾控制面与 TCP HTTPS B0 也都通过。因此真实数据空闲阈值范围从 `(60 s, ~3600 s]`
+收窄为 **`(1800 s, ~3600 s]`**。
+
+探针最终 `passed=false` 是本地判据不适配长间隔，不是线路失败：conntrack idle TTL 为 300 秒，
+所以两次 1800 秒 keepalive 前都重新发送了 `0x13`，最终为 4 request/4 outcome，而 E7 旧判据要求
+恰好 2 次。第一次 1800 秒前没有额外 auth/data，所以下界结论不受该混杂影响；但 1800 秒后的续存
+不能只归因于 `0x14`。下一次中点可选 2700 秒，并仍只使用“第一次候选 write 前是否已关闭”作为
+阈值判据，不能复用短间隔的固定 auth 次数判据。
 
 **阈值扫描尝试失败（2026-08-06 下午）：整批作废，原因是 [B8](#b8)，不是阈值。**
 六路并发臂（60 / 0 / 300 / 900 / 1800 秒间隔）里五条在建立后一分钟内全部死亡，与间隔无关。
