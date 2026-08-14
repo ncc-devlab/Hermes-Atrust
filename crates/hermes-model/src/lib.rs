@@ -6,4 +6,4 @@ mod secret;
 
 pub use endpoint::{EndpointError, GatewayEndpoint, TargetAddress};
 pub use identifier::{ConnectionId, DeviceId, IdentifierError, SessionId};
-pub use secret::{SecretError, SecretString, SignKey};
+pub use secret::{SecretBytes, SecretError, SecretString, SignKey};

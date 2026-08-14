@@ -9,6 +9,26 @@ use thiserror::Error;
 
 use crate::conntrack::{AuthOutcome, ConntrackError, ConntrackTable};
 
+/// Classification of the outer status on an auth response. This deliberately
+/// has no knowledge of JSON or conntrack state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthWireDisposition {
+    Settled,
+    RetryImmediate,
+    RetryDelayed { status: u8 },
+    Terminal { status: u8 },
+}
+
+#[must_use]
+pub const fn classify_auth_wire_status(status: u8) -> AuthWireDisposition {
+    match status {
+        0 => AuthWireDisposition::Settled,
+        0x84 => AuthWireDisposition::RetryImmediate,
+        0x85..=0x87 => AuthWireDisposition::RetryDelayed { status },
+        status => AuthWireDisposition::Terminal { status },
+    }
+}
+
 /// Session material needed to sign an L3 flow auth request.
 #[derive(Clone, Debug)]
 pub struct L3AuthContext<'a> {
@@ -71,7 +91,10 @@ pub fn apply_auth_wire_status(
     status: u8,
     json: &[u8],
 ) -> Result<u64, FlowAuthError> {
-    if status == 0 {
+    if matches!(
+        classify_auth_wire_status(status),
+        AuthWireDisposition::Settled
+    ) {
         let resp = apply_auth_response_json(table, json)?;
         return Ok(resp.conntrack_hash);
     }
@@ -191,5 +214,18 @@ mod tests {
             ready_token(table.get_by_key(&key).unwrap().outcome().unwrap()).unwrap(),
             "c-token"
         );
+    }
+
+    #[test]
+    fn e12_m_auth_wire_disposition_exhaustively_classifies_statuses() {
+        for status in 0..=u8::MAX {
+            let expected = match status {
+                0 => AuthWireDisposition::Settled,
+                0x84 => AuthWireDisposition::RetryImmediate,
+                0x85..=0x87 => AuthWireDisposition::RetryDelayed { status },
+                _ => AuthWireDisposition::Terminal { status },
+            };
+            assert_eq!(classify_auth_wire_status(status), expected);
+        }
     }
 }

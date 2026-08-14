@@ -3,6 +3,33 @@ use std::fmt;
 use thiserror::Error;
 use zeroize::Zeroize;
 
+/// Opaque bytes that are redacted from debug output and zeroized on drop.
+pub struct SecretBytes(Vec<u8>);
+
+impl SecretBytes {
+    #[must_use]
+    pub fn new(value: Vec<u8>) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub fn expose(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for SecretBytes {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl fmt::Debug for SecretBytes {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SecretBytes([REDACTED])")
+    }
+}
+
 /// UTF-8 secret that is redacted from debug output and zeroized on drop.
 pub struct SecretString(String);
 
@@ -93,6 +120,13 @@ pub enum SecretError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_bytes_are_redacted() {
+        let bytes = SecretBytes::new(vec![1, 2, 3]);
+        assert_eq!(bytes.expose(), &[1, 2, 3]);
+        assert_eq!(format!("{bytes:?}"), "SecretBytes([REDACTED])");
+    }
 
     #[test]
     fn sign_key_decodes_hex_without_exposing_it_in_debug() {

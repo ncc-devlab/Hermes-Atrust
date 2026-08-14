@@ -321,6 +321,24 @@ mod tests {
     use hermes_model::SignKey;
     use tokio::io::duplex;
 
+    async fn write_partitioned<S>(stream: &mut S, bytes: &[u8], cuts: &[usize])
+    where
+        S: AsyncWrite + Unpin,
+    {
+        let mut start = 0;
+        for &cut in cuts {
+            let cut = cut.min(bytes.len());
+            if cut > start {
+                stream.write_all(&bytes[start..cut]).await.unwrap();
+                start = cut;
+            }
+        }
+        if start < bytes.len() {
+            stream.write_all(&bytes[start..]).await.unwrap();
+        }
+        stream.flush().await.unwrap();
+    }
+
     #[test]
     fn dest_ipv4_frame_matches_codec() {
         let target = TunnelTarget::Ipv4 {
@@ -474,5 +492,98 @@ mod tests {
         let echo = tunnel.read_app().await.unwrap().unwrap();
         assert_eq!(echo, b"ping");
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn v1_d_handshake_partitions_preserve_coalesced_app_frame() {
+        let mut logical = vec![0x05, 0x81, 0x53, 0x00, 0x00, 0x02, b'O', b'K', 0x05, 0x00];
+        logical.extend_from_slice(&atrust_protocol::encode_tcp_app_data(b"app").unwrap());
+        let every_byte = (1..logical.len()).collect::<Vec<_>>();
+        let mut plans = vec![
+            every_byte,
+            vec![2, 8, 10],
+            Vec::new(),
+            vec![1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 14, 17],
+        ];
+        plans.extend((1..logical.len()).map(|cut| vec![cut]));
+
+        for cuts in plans {
+            let (client, mut server) = duplex(256);
+            let response = logical.clone();
+            let peer = tokio::spawn(async move {
+                let mut request = [0_u8; 5];
+                server.read_exact(&mut request).await.unwrap();
+                assert_eq!(&request, b"inDst");
+                write_partitioned(&mut server, &response, &cuts).await;
+                let mut probe = [0_u8; 4];
+                server.read_exact(&mut probe).await.unwrap();
+                assert_eq!(probe, encode_tcp_probe());
+            });
+
+            let stream = timeout(
+                Duration::from_secs(2),
+                complete_handshake(client, b"in", b"Dst"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let mut tunnel = TcpTunnel::from_stream(stream);
+            assert_eq!(
+                timeout(Duration::from_secs(2), tunnel.read_app())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+                b"app"
+            );
+            peer.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn v1_d_handshake_truncation_is_eof_not_success() {
+        let address = [0x05, 0x81, 0x53, 0x00, 0x00, 0x02, b'O', b'K'];
+        for cut in 0..address.len() {
+            let (mut client, mut server) = duplex(64);
+            server.write_all(&address[..cut]).await.unwrap();
+            server.shutdown().await.unwrap();
+            assert!(matches!(
+                timeout(Duration::from_secs(2), wait_for_address_ok(&mut client))
+                    .await
+                    .unwrap(),
+                Err(DialTcpError::Io(ref error))
+                    if error.kind() == std::io::ErrorKind::UnexpectedEof
+            ));
+        }
+
+        for cut in 0..2 {
+            let (mut client, mut server) = duplex(64);
+            server.write_all(&[0x05, 0x00][..cut]).await.unwrap();
+            server.shutdown().await.unwrap();
+            assert!(matches!(
+                timeout(Duration::from_secs(2), wait_for_connect_status(&mut client))
+                    .await
+                    .unwrap(),
+                Err(DialTcpError::Io(ref error))
+                    if error.kind() == std::io::ErrorKind::UnexpectedEof
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn v1_d_handshake_rejections_are_locatable() {
+        let (mut client, mut server) = duplex(64);
+        server.write_all(&[0x05, 0x07]).await.unwrap();
+        assert!(matches!(
+            wait_for_connect_status(&mut client).await,
+            Err(DialTcpError::ConnectRejected { status: 0x07 })
+        ));
+
+        let (mut client, mut server) = duplex(64);
+        server.write_all(&[0x53, 0x01]).await.unwrap();
+        assert!(matches!(
+            wait_for_address_ok(&mut client).await,
+            Err(DialTcpError::UnexpectedStatusHeader { bytes }) if bytes == [0x53, 0x01]
+        ));
     }
 }

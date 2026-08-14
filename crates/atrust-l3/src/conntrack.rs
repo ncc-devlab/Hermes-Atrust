@@ -6,7 +6,27 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use hermes_model::SecretBytes;
 use thiserror::Error;
+use tokio::time::Instant as TokioInstant;
+
+/// Retained auth wire bytes are secret material. It is never useful to expose
+/// them through Debug, and it is cleared when the in-flight entry disappears.
+pub struct ReusableAuthFrame(SecretBytes);
+
+impl ReusableAuthFrame {
+    pub(crate) fn new(bytes: Vec<u8>) -> Self {
+        Self(SecretBytes::new(bytes))
+    }
+    pub(crate) fn clone_bytes(&self) -> Vec<u8> {
+        self.0.expose().to_vec()
+    }
+}
+impl std::fmt::Debug for ReusableAuthFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReusableAuthFrame([REDACTED])")
+    }
+}
 
 /// Default wait for a per-flow `0x93` response (Go `ensureAuth`).
 pub const L3_AUTH_TIMEOUT: Duration = Duration::from_secs(8);
@@ -101,6 +121,10 @@ pub struct ConntrackEntry {
     pub app_id: String,
     pub node_group_id: String,
     auth_started: bool,
+    retries: usize,
+    retry_scheduled: bool,
+    auth_deadline: Option<TokioInstant>,
+    reusable_frame: Option<ReusableAuthFrame>,
     outcome: Option<AuthOutcome>,
     /// Last time a packet touched this flow. Drives idle expiry.
     last_used: Instant,
@@ -140,13 +164,51 @@ impl ConntrackEntry {
             return false;
         }
         self.auth_started = true;
+        self.auth_deadline = Some(TokioInstant::now() + L3_AUTH_TIMEOUT);
         true
+    }
+
+    pub(crate) fn set_reusable_frame(&mut self, frame: Vec<u8>, deadline: TokioInstant) {
+        self.reusable_frame = Some(ReusableAuthFrame::new(frame));
+        self.auth_deadline = Some(deadline);
+    }
+    pub(crate) fn schedule_retry(&mut self, budget: usize) -> bool {
+        if self.outcome.is_some()
+            || self.retry_scheduled
+            || self.retries >= budget
+            || self.reusable_frame.is_none()
+        {
+            return false;
+        }
+        self.retries += 1;
+        self.retry_scheduled = true;
+        true
+    }
+    pub(crate) fn take_retry(&mut self) -> Option<Vec<u8>> {
+        if !self.retry_scheduled || self.outcome.is_some() {
+            return None;
+        }
+        self.retry_scheduled = false;
+        self.reusable_frame
+            .as_ref()
+            .map(ReusableAuthFrame::clone_bytes)
+    }
+    pub(crate) fn retry_exhausted(&self, budget: usize) -> bool {
+        self.retries >= budget
+    }
+    pub(crate) fn retry_scheduled(&self) -> bool {
+        self.retry_scheduled
+    }
+    pub(crate) fn auth_deadline(&self) -> Option<TokioInstant> {
+        self.auth_deadline
     }
 
     /// Completes auth (success or failure). Idempotent after first completion.
     pub fn complete(&mut self, outcome: AuthOutcome) {
         if self.outcome.is_none() {
             self.outcome = Some(outcome);
+            self.retry_scheduled = false;
+            self.reusable_frame = None;
         }
     }
 }
@@ -187,6 +249,23 @@ impl PruneOutcome {
 }
 
 impl ConntrackTable {
+    /// Invalidates every flow while preserving the monotonic auth-id sequence.
+    /// Late responses for retired ids cannot collide with post-transition flows.
+    pub fn clear(&mut self) -> usize {
+        let removed = self.by_key.len();
+        self.by_key.clear();
+        self.by_id.clear();
+        removed
+    }
+
+    #[must_use]
+    pub(crate) fn scheduled_retries(&self) -> usize {
+        self.by_key
+            .values()
+            .filter(|entry| entry.retry_scheduled)
+            .count()
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -294,6 +373,10 @@ impl ConntrackTable {
             app_id: app_id.into(),
             node_group_id: node_group_id.into(),
             auth_started: false,
+            retries: 0,
+            retry_scheduled: false,
+            auth_deadline: None,
+            reusable_frame: None,
             outcome: None,
             last_used: now,
         };

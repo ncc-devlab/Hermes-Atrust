@@ -92,9 +92,9 @@ pub enum HermesEvent {
         node_port: u16,
         vip: Ipv4Addr,
     },
-    /// **The event a TUN device must handle.** A reconnect assigned a different
-    /// virtual IP, so the interface address, every cached flow and any route
-    /// pinned to the old address are now wrong.
+    /// **The event a TUN device must handle.** A reconnect or an asynchronous
+    /// `0x97` command assigned a different virtual IP, so the interface address,
+    /// every cached flow and any route pinned to the old address are now wrong.
     L3VipChanged {
         node_group_id: String,
         previous: Ipv4Addr,

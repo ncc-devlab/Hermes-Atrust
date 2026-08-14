@@ -18,8 +18,8 @@ mod packet;
 mod session;
 
 pub use auth::{
-    FlowAuthError, L3AuthContext, apply_auth_response_json, apply_auth_wire_status,
-    build_flow_auth_frame, ready_token,
+    AuthWireDisposition, FlowAuthError, L3AuthContext, apply_auth_response_json,
+    apply_auth_wire_status, build_flow_auth_frame, classify_auth_wire_status, ready_token,
 };
 pub use conntrack::{
     AuthOutcome, ConntrackEntry, ConntrackError, ConntrackTable, FlowKey, L3_AUTH_TIMEOUT,
@@ -32,8 +32,8 @@ pub use manager::{
 };
 pub use packet::{FLOW_KEY_ATYPE_IPV4, Ipv4Flow, PacketError, parse_ipv4_flow};
 pub use session::{
-    FlowAuthStats, HeartbeatStats, L3_HEARTBEAT_INTERVAL, L3CloseInfo, L3CloseReason, L3Session,
-    L3SessionConfig, L3SessionError,
+    FlowAuthStats, HeartbeatStats, L3_HEARTBEAT_INTERVAL, L3AuthRetryConfig, L3CloseInfo,
+    L3CloseReason, L3Session, L3SessionConfig, L3SessionError,
 };
 
 /// Match zju-connect's retry boundary: five reconnects after a closed L3

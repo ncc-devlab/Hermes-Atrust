@@ -141,7 +141,12 @@ impl L3SessionManager {
 
     /// VIP of the last established connection, whether or not it is still live.
     pub async fn last_vip(&self) -> Option<Ipv4Addr> {
-        self.current.lock().await.last_vip
+        let state = self.current.lock().await;
+        state
+            .session
+            .as_ref()
+            .map(|session| session.vip())
+            .or(state.last_vip)
     }
 
     /// Returns the live session, establishing Get-IP lazily when absent/closed.
@@ -153,6 +158,7 @@ impl L3SessionManager {
             return Ok(Arc::clone(session));
         }
         if let Some(closed) = state.session.take() {
+            state.last_vip = Some(closed.vip());
             closed.close().await;
         }
         let endpoints = self
@@ -178,6 +184,7 @@ impl L3SessionManager {
                 sid: &self.config.sid,
                 connect_timeout: self.config.connect_timeout,
                 heartbeat_interval: self.config.heartbeat_interval,
+                node_group_id: Some(&self.config.node_group_id),
                 events: self.config.events.clone(),
             })
             .await;
@@ -366,7 +373,9 @@ impl L3SessionManager {
                 .as_ref()
                 .is_some_and(|session| Arc::ptr_eq(session, failed))
             {
-                state.session.take()
+                let removed = state.session.take();
+                state.last_vip = removed.as_ref().map(|session| session.vip());
+                removed
             } else {
                 None
             }

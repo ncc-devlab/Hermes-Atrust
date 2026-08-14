@@ -5,7 +5,7 @@
 //! - a **writer** task serialising every outbound frame onto the TLS stream;
 //! - a **reader** task splitting the inbound byte stream into frames and
 //!   dispatching `0x93` (auth), `0x94` (data), `0x95` (heartbeat ack) and
-//!   `0x96` (second VIP);
+//!   `0x96` (second VIP) and `0x97` (asynchronous VIP update);
 //! - a **heartbeat** task emitting `05 15 00 00` every 25 seconds.
 //!
 //! The session is established by the same SID-only exchange as a standalone
@@ -40,12 +40,15 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
-use crate::auth::{FlowAuthError, L3AuthContext, apply_auth_wire_status, build_flow_auth_frame};
+use crate::auth::{
+    AuthWireDisposition, FlowAuthError, L3AuthContext, apply_auth_wire_status,
+    build_flow_auth_frame, classify_auth_wire_status,
+};
 use crate::conntrack::{
     AuthOutcome, ConntrackTable, FlowKey, L3_AUTH_TIMEOUT, L3_CONNTRACK_CAPACITY,
 };
 use crate::get_ip::{GetIpv4Error, GetIpv4Response, request_ipv4};
-use crate::packet::{Ipv4Flow, parse_ipv4_flow};
+use crate::packet::{Ipv4Flow, PacketError, parse_ipv4_flow};
 
 /// Heartbeat cadence for one L3 connection (Go: every 25 seconds).
 pub const L3_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
@@ -58,6 +61,32 @@ pub struct FlowAuthStats {
     pub timeouts: u64,
     pub in_flight: u64,
     pub peak_in_flight: u64,
+    pub transient_statuses_received: u64,
+    pub wire_retries_scheduled: u64,
+    pub wire_retries_sent: u64,
+    pub wire_retries_exhausted: u64,
+    pub wire_retries_cancelled: u64,
+}
+
+/// Experimental auth retry policy. `L3Session::start` always uses the disabled
+/// policy; this is explicit so production callers cannot opt in accidentally.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct L3AuthRetryConfig {
+    pub enabled: bool,
+    pub max_wire_retries_per_flow: usize,
+    pub delayed_retry_delay: Duration,
+    pub overall_auth_deadline: Duration,
+}
+
+impl L3AuthRetryConfig {
+    pub const fn disabled() -> Self {
+        Self {
+            enabled: false,
+            max_wire_retries_per_flow: 0,
+            delayed_retry_delay: Duration::ZERO,
+            overall_auth_deadline: L3_AUTH_TIMEOUT,
+        }
+    }
 }
 
 /// Monotonic heartbeat counters and the most recent gateway acknowledgement.
@@ -133,12 +162,18 @@ const MIN_UNAMBIGUOUS_CONNECT_TOKEN: usize = 17;
 
 const READ_CHUNK: usize = 16 * 1024;
 const WRITE_QUEUE_DEPTH: usize = 64;
+const AUTH_RETRY_QUEUE_DEPTH: usize = 64;
 const PACKET_QUEUE_DEPTH: usize = 256;
 
 struct OutboundFrame {
     bytes: Vec<u8>,
     written: Option<oneshot::Sender<Result<(), ()>>>,
     heartbeat: bool,
+}
+
+struct RetryJob {
+    auth_id: u64,
+    delay: Duration,
 }
 
 /// Inputs for establishing one L3 session against a data-plane node.
@@ -155,6 +190,8 @@ pub struct L3SessionConfig<'a> {
     /// failure. Default to something comfortably above the measured connect.
     pub connect_timeout: Duration,
     pub heartbeat_interval: Duration,
+    /// Owning group, used to attribute asynchronous VIP changes.
+    pub node_group_id: Option<&'a str>,
     /// Observation channel for protocol findings seen on this connection.
     pub events: Option<Arc<EventBus>>,
 }
@@ -162,6 +199,10 @@ pub struct L3SessionConfig<'a> {
 /// State shared between the caller and the session tasks.
 #[derive(Debug)]
 struct SessionShared {
+    /// Effective source address. The initial Get-IP response remains immutable
+    /// for diagnostics while `0x97` can replace this value at runtime.
+    current_vip: Mutex<Ipv4Addr>,
+    node_group_id: Option<String>,
     conntrack: Mutex<ConntrackTable>,
     /// Callers awaiting a `0x93` for a given auth id. A flow can have more than
     /// one waiter when several packets race into the same unauthorized flow.
@@ -175,6 +216,13 @@ struct SessionShared {
     auth_timeouts: AtomicU64,
     auth_in_flight: AtomicU64,
     auth_peak_in_flight: AtomicU64,
+    auth_retry_config: L3AuthRetryConfig,
+    retry_tx: Mutex<Option<mpsc::Sender<RetryJob>>>,
+    transient_statuses_received: AtomicU64,
+    wire_retries_scheduled: AtomicU64,
+    wire_retries_sent: AtomicU64,
+    wire_retries_exhausted: AtomicU64,
+    wire_retries_cancelled: AtomicU64,
     heartbeat_requests_sent: AtomicU64,
     heartbeat_acks_received: AtomicU64,
     last_heartbeat_ack: Mutex<Option<(SystemTime, Instant)>>,
@@ -196,8 +244,15 @@ struct SessionShared {
 }
 
 impl SessionShared {
-    fn new(events: Option<Arc<EventBus>>) -> Self {
+    fn new(
+        initial_vip: Ipv4Addr,
+        node_group_id: Option<String>,
+        events: Option<Arc<EventBus>>,
+        auth_retry_config: L3AuthRetryConfig,
+    ) -> Self {
         Self {
+            current_vip: Mutex::new(initial_vip),
+            node_group_id,
             conntrack: Mutex::new(ConntrackTable::new()),
             waiters: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
@@ -208,6 +263,13 @@ impl SessionShared {
             auth_timeouts: AtomicU64::new(0),
             auth_in_flight: AtomicU64::new(0),
             auth_peak_in_flight: AtomicU64::new(0),
+            auth_retry_config,
+            retry_tx: Mutex::new(None),
+            transient_statuses_received: AtomicU64::new(0),
+            wire_retries_scheduled: AtomicU64::new(0),
+            wire_retries_sent: AtomicU64::new(0),
+            wire_retries_exhausted: AtomicU64::new(0),
+            wire_retries_cancelled: AtomicU64::new(0),
             heartbeat_requests_sent: AtomicU64::new(0),
             heartbeat_acks_received: AtomicU64::new(0),
             last_heartbeat_ack: Mutex::new(None),
@@ -217,6 +279,47 @@ impl SessionShared {
             seen_token_framed: AtomicBool::new(false),
             protocol_messages: Mutex::new(Vec::new()),
             protocol_messages_seen: AtomicU64::new(0),
+        }
+    }
+
+    fn apply_vip_update(&self, current: Ipv4Addr) {
+        let previous = {
+            let mut vip = self.current_vip.lock().expect("current VIP mutex");
+            if *vip == current {
+                return;
+            }
+            std::mem::replace(&mut *vip, current)
+        };
+
+        let (retired_flows, cancelled) = {
+            let mut table = self.conntrack.lock().expect("conntrack mutex");
+            let cancelled = table.scheduled_retries();
+            (table.clear(), cancelled)
+        };
+        self.wire_retries_cancelled
+            .fetch_add(cancelled as u64, Ordering::Relaxed);
+        let drained: Vec<_> = self
+            .waiters
+            .lock()
+            .expect("waiters mutex")
+            .drain()
+            .collect();
+        drop(drained);
+        self.auth_in_flight.store(0, Ordering::Relaxed);
+
+        warn!(
+            event = "atrust_l3.session.vip_changed",
+            node_group_id = self.node_group_id.as_deref().unwrap_or("unknown"),
+            %previous,
+            %current,
+            retired_flows
+        );
+        if let Some(node_group_id) = self.node_group_id.as_ref() {
+            self.events.emit(|| HermesEvent::L3VipChanged {
+                node_group_id: node_group_id.clone(),
+                previous,
+                current,
+            });
         }
     }
 
@@ -262,6 +365,10 @@ impl SessionShared {
         let in_flight = self.auth_in_flight.fetch_add(1, Ordering::Relaxed) + 1;
         self.auth_peak_in_flight
             .fetch_max(in_flight, Ordering::Relaxed);
+    }
+
+    fn record_retry_sent(&self) {
+        self.auth_requests_sent.fetch_add(1, Ordering::Relaxed);
     }
 
     fn settle_auth(&self, timed_out: bool) {
@@ -312,6 +419,14 @@ impl SessionShared {
             self.closed.store(true, Ordering::SeqCst);
         }
         let _ = self.stop_tx.send(true);
+        let cancelled = {
+            let mut table = self.conntrack.lock().expect("conntrack mutex");
+            let cancelled = table.scheduled_retries();
+            table.clear();
+            cancelled
+        };
+        self.wire_retries_cancelled
+            .fetch_add(cancelled as u64, Ordering::Relaxed);
         let drained: Vec<_> = self
             .waiters
             .lock()
@@ -372,6 +487,7 @@ impl L3Session {
             config.sid,
             config.heartbeat_interval,
             config.connect_timeout,
+            config.node_group_id.map(str::to_owned),
             config.events,
         )
         .await
@@ -382,11 +498,37 @@ impl L3Session {
     /// Exposed so the whole driver can be exercised against an in-memory duplex
     /// peer with no TLS and no gateway.
     pub async fn start<S>(
+        stream: S,
+        sid: &SessionId,
+        heartbeat_interval: Duration,
+        get_ip_timeout: Duration,
+        node_group_id: Option<String>,
+        events: Option<Arc<EventBus>>,
+    ) -> Result<Self, L3SessionError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::start_with_config(
+            stream,
+            sid,
+            heartbeat_interval,
+            get_ip_timeout,
+            node_group_id,
+            events,
+            L3AuthRetryConfig::disabled(),
+        )
+        .await
+    }
+
+    /// Starts a session with the explicitly experimental auth retry policy.
+    pub async fn start_with_config<S>(
         mut stream: S,
         sid: &SessionId,
         heartbeat_interval: Duration,
         get_ip_timeout: Duration,
+        node_group_id: Option<String>,
         events: Option<Arc<EventBus>>,
+        retry_config: L3AuthRetryConfig,
     ) -> Result<Self, L3SessionError>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -400,9 +542,16 @@ impl L3Session {
             status_bodies = get_ip.status_bodies.len()
         );
 
-        let shared = Arc::new(SessionShared::new(events));
+        let shared = Arc::new(SessionShared::new(
+            get_ip.address,
+            node_group_id,
+            events,
+            retry_config,
+        ));
         let (read_half, mut write_half) = tokio::io::split(stream);
         let (write_tx, mut write_rx) = mpsc::channel::<OutboundFrame>(WRITE_QUEUE_DEPTH);
+        let (retry_tx, mut retry_rx) = mpsc::channel::<RetryJob>(AUTH_RETRY_QUEUE_DEPTH);
+        *shared.retry_tx.lock().expect("retry mutex") = Some(retry_tx);
         let (packets_tx, packets_rx) = mpsc::channel::<Vec<u8>>(PACKET_QUEUE_DEPTH);
 
         let writer_shared = Arc::clone(&shared);
@@ -496,19 +645,93 @@ impl L3Session {
             debug!(event = "atrust_l3.session.heartbeat_stopped");
         });
 
+        let retry_shared = Arc::clone(&shared);
+        let retry_write = write_tx.clone();
+        let mut retry_stop = shared.stop_signal();
+        let retry_scheduler = tokio::spawn(async move {
+            while let Some(job) = tokio::select! {
+                biased;
+                _ = retry_stop.changed() => None,
+                job = retry_rx.recv() => job,
+            } {
+                let sleep = tokio::time::sleep(job.delay);
+                tokio::pin!(sleep);
+                tokio::select! {
+                    biased;
+                    _ = retry_stop.changed() => break,
+                    _ = &mut sleep => {}
+                }
+                let frame = {
+                    let mut table = retry_shared.conntrack.lock().expect("conntrack mutex");
+                    let Some(entry) = table.get_by_auth_id_mut(job.auth_id) else {
+                        retry_shared
+                            .wire_retries_cancelled
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    };
+                    if entry
+                        .auth_deadline()
+                        .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+                    {
+                        entry.complete(AuthOutcome::Failed {
+                            message: "auth deadline exceeded".to_owned(),
+                        });
+                        retry_shared
+                            .wire_retries_exhausted
+                            .fetch_add(1, Ordering::Relaxed);
+                        None
+                    } else {
+                        entry.take_retry()
+                    }
+                };
+                let Some(bytes) = frame else {
+                    if let Some(outcome) = retry_shared
+                        .conntrack
+                        .lock()
+                        .expect("conntrack mutex")
+                        .get_by_auth_id(job.auth_id)
+                        .and_then(|e| e.outcome())
+                        .cloned()
+                    {
+                        retry_shared.settle_auth(false);
+                        retry_shared.notify(job.auth_id, &outcome);
+                    }
+                    continue;
+                };
+                let (written, done) = oneshot::channel();
+                if retry_write
+                    .send(OutboundFrame {
+                        bytes,
+                        written: Some(written),
+                        heartbeat: false,
+                    })
+                    .await
+                    .is_err()
+                    || !matches!(done.await, Ok(Ok(())))
+                {
+                    retry_shared.shutdown(L3CloseReason::WriteError, "auth retry write failed");
+                    break;
+                }
+                retry_shared
+                    .wire_retries_sent
+                    .fetch_add(1, Ordering::Relaxed);
+                retry_shared.record_retry_sent();
+            }
+        });
+
         Ok(Self {
             get_ip,
             shared,
             write_tx,
             packets: AsyncMutex::new(packets_rx),
-            tasks: Mutex::new(vec![writer, reader, heartbeat]),
+            tasks: Mutex::new(vec![writer, reader, heartbeat, retry_scheduler]),
         })
     }
 
     /// Virtual IPv4 assigned by Get-IP.
     #[must_use]
     pub fn vip(&self) -> Ipv4Addr {
-        self.get_ip.address
+        *self.shared.current_vip.lock().expect("current VIP mutex")
     }
 
     /// The full Get-IP outcome, including the `53 00` status bodies.
@@ -550,6 +773,14 @@ impl L3Session {
             timeouts: self.shared.auth_timeouts.load(Ordering::Relaxed),
             in_flight: self.shared.auth_in_flight.load(Ordering::Relaxed),
             peak_in_flight: self.shared.auth_peak_in_flight.load(Ordering::Relaxed),
+            transient_statuses_received: self
+                .shared
+                .transient_statuses_received
+                .load(Ordering::Relaxed),
+            wire_retries_scheduled: self.shared.wire_retries_scheduled.load(Ordering::Relaxed),
+            wire_retries_sent: self.shared.wire_retries_sent.load(Ordering::Relaxed),
+            wire_retries_exhausted: self.shared.wire_retries_exhausted.load(Ordering::Relaxed),
+            wire_retries_cancelled: self.shared.wire_retries_cancelled.load(Ordering::Relaxed),
         }
     }
 
@@ -614,6 +845,12 @@ impl L3Session {
     ) -> Result<String, L3SessionError> {
         if self.is_closed() {
             return Err(L3SessionError::Closed);
+        }
+        if flow.src_addr != self.vip() {
+            return Err(L3SessionError::VipChanged {
+                packet_source: flow.src_addr,
+                session_vip: self.vip(),
+            });
         }
         let key = flow.flow_key();
 
@@ -681,6 +918,20 @@ impl L3Session {
                     return Err(error.into());
                 }
             };
+            if let Some(entry) = self
+                .shared
+                .conntrack
+                .lock()
+                .expect("conntrack mutex")
+                .get_by_auth_id_mut(auth_id)
+                .filter(|entry| entry.auth_in_flight())
+            {
+                entry.set_reusable_frame(
+                    frame.clone(),
+                    tokio::time::Instant::now()
+                        + self.shared.auth_retry_config.overall_auth_deadline,
+                );
+            }
             debug!(
                 event = "atrust_l3.session.auth_sent",
                 auth_id,
@@ -694,12 +945,30 @@ impl L3Session {
             self.shared.record_auth_sent();
         }
 
-        match timeout(L3_AUTH_TIMEOUT, receiver).await {
-            Ok(Ok(AuthOutcome::Ready { connect_token })) => Ok(connect_token),
+        match timeout(
+            self.shared.auth_retry_config.overall_auth_deadline,
+            receiver,
+        )
+        .await
+        {
+            Ok(Ok(AuthOutcome::Ready { connect_token })) => {
+                if flow.src_addr != self.vip() {
+                    Err(L3SessionError::VipChanged {
+                        packet_source: flow.src_addr,
+                        session_vip: self.vip(),
+                    })
+                } else {
+                    Ok(connect_token)
+                }
+            }
             Ok(Ok(AuthOutcome::Failed { message })) => {
                 Err(FlowAuthError::AuthFailed(message).into())
             }
             // The reader task dropped the sender without a verdict.
+            Ok(Err(_)) if flow.src_addr != self.vip() => Err(L3SessionError::VipChanged {
+                packet_source: flow.src_addr,
+                session_vip: self.vip(),
+            }),
             Ok(Err(_)) => Err(L3SessionError::Closed),
             Err(_) => {
                 self.abandon_flow(&key, auth_id);
@@ -750,6 +1019,15 @@ impl L3Session {
     ) -> Result<(), L3SessionError> {
         if self.is_closed() {
             return Err(L3SessionError::Closed);
+        }
+        for packet in packets {
+            let flow = parse_ipv4_flow(packet)?;
+            if flow.src_addr != self.vip() {
+                return Err(L3SessionError::VipChanged {
+                    packet_source: flow.src_addr,
+                    session_vip: self.vip(),
+                });
+            }
         }
         let frame = encode_l3_data_req(connect_token.as_bytes(), packets)?;
         self.write_frame(frame).await
@@ -1031,6 +1309,19 @@ fn touch_inbound_flow(shared: &SessionShared, packet: &[u8]) {
         .touch(&flow.reverse_flow_key());
 }
 
+fn first_ipv4_in_json(json: &[u8]) -> Option<Ipv4Addr> {
+    fn visit(value: &serde_json::Value) -> Option<Ipv4Addr> {
+        match value {
+            serde_json::Value::String(value) => value.parse().ok(),
+            serde_json::Value::Array(values) => values.iter().find_map(visit),
+            serde_json::Value::Object(values) => values.values().find_map(visit),
+            _ => None,
+        }
+    }
+
+    serde_json::from_slice(json).ok().as_ref().and_then(visit)
+}
+
 /// What the read loop must do after a frame is decoded.
 ///
 /// Packets are handed back rather than sent inline so the borrow on the read
@@ -1048,6 +1339,94 @@ fn dispatch(
 ) -> Dispatch {
     match frame {
         Inbound::Auth { status, json } => {
+            let disposition = classify_auth_wire_status(status);
+            let transient = matches!(
+                disposition,
+                AuthWireDisposition::RetryImmediate | AuthWireDisposition::RetryDelayed { .. }
+            );
+            if transient {
+                shared
+                    .transient_statuses_received
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if transient && shared.auth_retry_config.enabled {
+                let hash = atrust_protocol::parse_l3_auth_response(json)
+                    .ok()
+                    .map(|response| response.conntrack_hash)
+                    .filter(|hash| *hash != 0);
+                let Some(auth_id) = hash else {
+                    warn!(event = "atrust_l3.session.auth_unattributable", status);
+                    return Dispatch::Continue;
+                };
+                let delay = match disposition {
+                    AuthWireDisposition::RetryImmediate => Duration::ZERO,
+                    AuthWireDisposition::RetryDelayed { .. } => {
+                        shared.auth_retry_config.delayed_retry_delay
+                    }
+                    _ => unreachable!(),
+                };
+                let scheduled = {
+                    let mut table = shared.conntrack.lock().expect("conntrack mutex");
+                    let Some(entry) = table.get_by_auth_id_mut(auth_id) else {
+                        return Dispatch::Continue;
+                    };
+                    if entry.outcome().is_some() || entry.retry_scheduled() {
+                        return Dispatch::Continue;
+                    } else if entry
+                        .retry_exhausted(shared.auth_retry_config.max_wire_retries_per_flow)
+                    {
+                        entry.complete(AuthOutcome::Failed {
+                            message: "auth retry budget exhausted".to_owned(),
+                        });
+                        shared
+                            .wire_retries_exhausted
+                            .fetch_add(1, Ordering::Relaxed);
+                        let outcome = entry.outcome().cloned();
+                        drop(table);
+                        if let Some(outcome) = outcome {
+                            shared.settle_auth(false);
+                            shared.notify(auth_id, &outcome);
+                        }
+                        return Dispatch::Continue;
+                    } else {
+                        entry.schedule_retry(shared.auth_retry_config.max_wire_retries_per_flow)
+                    }
+                };
+                if scheduled {
+                    let sent = shared
+                        .retry_tx
+                        .lock()
+                        .expect("retry mutex")
+                        .as_ref()
+                        .cloned();
+                    if sent
+                        .as_ref()
+                        .is_some_and(|tx| tx.try_send(RetryJob { auth_id, delay }).is_ok())
+                    {
+                        shared
+                            .wire_retries_scheduled
+                            .fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        shared
+                            .wire_retries_cancelled
+                            .fetch_add(1, Ordering::Relaxed);
+                        let outcome = {
+                            let mut table = shared.conntrack.lock().expect("conntrack mutex");
+                            table.get_by_auth_id_mut(auth_id).map(|entry| {
+                                entry.complete(AuthOutcome::Failed {
+                                    message: "auth retry scheduler unavailable".to_owned(),
+                                });
+                                entry.outcome().cloned().expect("just completed")
+                            })
+                        };
+                        if let Some(outcome) = outcome {
+                            shared.settle_auth(false);
+                            shared.notify(auth_id, &outcome);
+                        }
+                    }
+                }
+                return Dispatch::Continue;
+            }
             let mut table = shared.conntrack.lock().expect("conntrack mutex");
             match apply_auth_wire_status(&mut table, status, json) {
                 Ok(auth_id) => {
@@ -1144,12 +1523,21 @@ fn dispatch(
             Dispatch::Continue
         }
         Inbound::VipUpdate { status, json } => {
-            info!(
-                event = "atrust_l3.session.vip_update",
-                status,
-                body_len = json.len(),
-                note = "VIP update decoded; runtime address replacement is not yet enabled"
-            );
+            if status != 0 {
+                warn!(
+                    event = "atrust_l3.session.vip_update_rejected",
+                    status,
+                    body_len = json.len()
+                );
+            } else if let Some(vip) = first_ipv4_in_json(json) {
+                shared.apply_vip_update(vip);
+            } else {
+                warn!(
+                    event = "atrust_l3.session.vip_update_invalid",
+                    body_len = json.len(),
+                    note = "successful VIP update contained no IPv4 address"
+                );
+            }
             Dispatch::Continue
         }
         Inbound::Protocol { body } => {
@@ -1187,10 +1575,17 @@ pub enum L3SessionError {
     Frame(#[from] L3FrameError),
     #[error(transparent)]
     FlowAuth(#[from] FlowAuthError),
+    #[error(transparent)]
+    Packet(#[from] PacketError),
     #[error("L3 flow auth timed out after {} seconds: {flow}", L3_AUTH_TIMEOUT.as_secs())]
     AuthTimeout { flow: String },
     #[error("L3 session is closed")]
     Closed,
+    #[error("packet source {packet_source} no longer matches current L3 VIP {session_vip}")]
+    VipChanged {
+        packet_source: Ipv4Addr,
+        session_vip: Ipv4Addr,
+    },
     #[error("unexpected L3 version byte {byte:#04x}")]
     UnexpectedVersion { byte: u8 },
     #[error("L3 protocol message rejected with status {status:#04x}")]
@@ -1206,7 +1601,12 @@ mod tests {
     /// is exactly the production symptom it guards against.
     #[tokio::test]
     async fn a_full_packet_queue_drops_instead_of_stalling_the_reader() {
-        let shared = Arc::new(SessionShared::new(None));
+        let shared = Arc::new(SessionShared::new(
+            Ipv4Addr::UNSPECIFIED,
+            None,
+            None,
+            L3AuthRetryConfig::disabled(),
+        ));
         let (packets_tx, _packets_rx) = mpsc::channel::<Vec<u8>>(2);
 
         assert_eq!(deliver(&packets_tx, &shared, vec![1]), None);
@@ -1221,7 +1621,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_gone_consumer_still_ends_the_session() {
-        let shared = Arc::new(SessionShared::new(None));
+        let shared = Arc::new(SessionShared::new(
+            Ipv4Addr::UNSPECIFIED,
+            None,
+            None,
+            L3AuthRetryConfig::disabled(),
+        ));
         let (packets_tx, packets_rx) = mpsc::channel::<Vec<u8>>(2);
         drop(packets_rx);
 
@@ -1294,6 +1699,54 @@ mod tests {
     }
 
     #[test]
+    fn vip_update_extracts_nested_ipv4_and_ignores_ipv6() {
+        let json = br#"{"data":{"addresses":["2001:db8::1","10.0.0.2"]}}"#;
+        assert_eq!(first_ipv4_in_json(json), Some(Ipv4Addr::new(10, 0, 0, 2)));
+        assert_eq!(first_ipv4_in_json(br#"{"ip":"2001:db8::1"}"#), None);
+        assert_eq!(first_ipv4_in_json(b"not-json"), None);
+    }
+
+    #[tokio::test]
+    async fn vip_update_replaces_state_clears_flows_and_emits_event() {
+        let events = EventBus::new(8);
+        let mut subscriber = events.subscribe();
+        let shared = Arc::new(SessionShared::new(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Some("group-1".to_owned()),
+            Some(events),
+            L3AuthRetryConfig::disabled(),
+        ));
+        let flow = FlowKey::new(1, 6, "10.0.0.1", 1234, "192.0.2.1", 443);
+        shared
+            .conntrack
+            .lock()
+            .expect("conntrack mutex")
+            .get_or_create(flow, "app", "group-1");
+
+        shared.apply_vip_update(Ipv4Addr::new(10, 0, 0, 2));
+
+        assert_eq!(
+            *shared.current_vip.lock().expect("current VIP mutex"),
+            Ipv4Addr::new(10, 0, 0, 2)
+        );
+        assert_eq!(shared.conntrack.lock().expect("conntrack mutex").len(), 0);
+        let event = subscriber.recv().await;
+        let Some(hermes_events::EventDelivery::Event(event)) = event else {
+            panic!("expected VIP change event");
+        };
+        assert!(matches!(
+            event.as_ref(),
+            HermesEvent::L3VipChanged {
+                node_group_id,
+                previous,
+                current,
+            } if node_group_id == "group-1"
+                && *previous == Ipv4Addr::new(10, 0, 0, 1)
+                && *current == Ipv4Addr::new(10, 0, 0, 2)
+        ));
+    }
+
+    #[test]
     fn next_frame_rejects_a_foreign_version_byte() {
         assert!(matches!(
             next_frame(&[0x06, 0x94, 0x00, 0x01, 0xff]),
@@ -1355,5 +1808,99 @@ mod tests {
             decoded,
             Inbound::Data(DataRespPackets::TokenFramed(vec![&[0xab, 0xcd][..]]))
         );
+    }
+
+    fn v2_auth() -> Vec<u8> {
+        let json = br#"{}"#;
+        let mut frame = vec![L3_VERSION, l3_cmd::AUTH_RESP, 0];
+        frame.extend_from_slice(&(json.len() as u16).to_be_bytes());
+        frame.extend_from_slice(json);
+        frame
+    }
+
+    fn v2_status(cmd: u8, body: &[u8]) -> Vec<u8> {
+        let mut frame = vec![L3_VERSION, cmd, 0];
+        frame.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        frame.extend_from_slice(body);
+        frame
+    }
+
+    fn v2_generic(cmd: u8, body: &[u8]) -> Vec<u8> {
+        let mut frame = vec![L3_VERSION, cmd];
+        frame.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        frame.extend_from_slice(body);
+        frame
+    }
+
+    fn v2_data(packet: &[u8]) -> Vec<u8> {
+        let mut frame = vec![L3_VERSION, l3_cmd::DATA_RESP];
+        frame.extend_from_slice(&(packet.len() as u16).to_be_bytes());
+        frame.extend_from_slice(packet);
+        frame
+    }
+
+    #[test]
+    fn v2_prefixes_consumed_lengths_and_sentinels() {
+        let fixtures = [
+            v2_auth(),
+            v2_status(L3_SECOND_VIP_RESP, br#"{}"#),
+            v2_status(L3_VIP_UPDATE_RESP, br#"{"vip":"10.0.0.2"}"#),
+            vec![L3_VERSION, l3_cmd::HEARTBEAT_RESP, 0, 0],
+            v2_generic(0x42, b"abc"),
+            vec![0x53, 0, 0, 2, b'O', b'K'],
+            v2_data(&[1, 2, 3]),
+        ];
+        for fixture in fixtures {
+            for end in 0..fixture.len() {
+                assert_eq!(next_frame(&fixture[..end]).unwrap(), None, "prefix {end}");
+            }
+            let mut joined = fixture.clone();
+            joined.extend_from_slice(&[L3_VERSION, l3_cmd::HEARTBEAT_RESP, 0, 0]);
+            let (_, consumed) = next_frame(&joined).unwrap().unwrap();
+            assert_eq!(consumed, fixture.len());
+            assert_eq!(next_frame(&joined[consumed..]).unwrap().unwrap().1, 4);
+        }
+    }
+
+    #[test]
+    fn v2_pairwise_known_frames_preserve_dispatch_alignment() {
+        let frames = [
+            v2_auth(),
+            v2_status(L3_SECOND_VIP_RESP, b"{}"),
+            v2_status(L3_VIP_UPDATE_RESP, br#"{"vip":"10.0.0.2"}"#),
+            vec![L3_VERSION, l3_cmd::HEARTBEAT_RESP, 0, 0],
+            v2_generic(0x42, b"abc"),
+            vec![0x53, 0, 0, 2, b'O', b'K'],
+            v2_data(&[1, 2, 3]),
+        ];
+        for left in &frames {
+            for right in &frames {
+                let mut joined = left.clone();
+                joined.extend_from_slice(right);
+                let (_, first) = next_frame(&joined).unwrap().unwrap();
+                let (_, second) = next_frame(&joined[first..]).unwrap().unwrap();
+                assert_eq!(first, left.len());
+                assert_eq!(second, right.len());
+            }
+        }
+    }
+
+    #[test]
+    fn v2_ambiguous_and_malformed_frames_are_explicitly_not_accepted() {
+        assert!(matches!(
+            next_frame(&[0x06, 0x94, 0, 1, 0xff]),
+            Err(L3SessionError::UnexpectedVersion { .. })
+        ));
+        assert!(matches!(
+            next_frame(&[0x53, 7, 0, 0]),
+            Err(L3SessionError::ProtocolRejected { status: 7 })
+        ));
+        assert_eq!(
+            next_frame(&[L3_VERSION, 0x97, 0, 0, 4, b'{']).unwrap(),
+            None
+        );
+        assert_eq!(next_frame(&[L3_VERSION, 0x42, 0, 5, 1, 2]).unwrap(), None);
+        // A token length of 15 or a zero-leading length-16 token is ambiguous
+        // with the length-prefixed branch and must not be guessed here.
     }
 }

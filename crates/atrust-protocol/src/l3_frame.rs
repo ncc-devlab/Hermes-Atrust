@@ -505,4 +505,106 @@ mod tests {
             Err(L3FrameError::PacketTooLarge { .. })
         ));
     }
+
+    fn v2_ipv4_packet(len: usize) -> Vec<u8> {
+        let mut packet = vec![0u8; len];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+        packet
+    }
+
+    fn v2_length_frame(len: usize) -> Vec<u8> {
+        let packet = v2_ipv4_packet(len);
+        encode_l3_data_resp_length_prefixed(&packet).unwrap()
+    }
+
+    fn v2_token_frame(token_len: usize, first: u8, packets: &[&[u8]]) -> Vec<u8> {
+        let mut body = vec![token_len as u8];
+        body.extend(std::iter::repeat_n(b't', token_len));
+        if token_len != 0 {
+            body[1] = first;
+        }
+        body.extend_from_slice(&[0, 0, packets.len() as u8]);
+        for packet in packets {
+            body.extend_from_slice(&(packet.len() as u16).to_be_bytes());
+            body.extend_from_slice(packet);
+        }
+        let mut frame = vec![L3_VERSION, l3_cmd::DATA_RESP];
+        frame.extend_from_slice(&body);
+        frame
+    }
+
+    #[test]
+    fn v2_data_prefixes_have_exact_layout_and_consumed_lengths() {
+        for len in [20, 4096, 4097, 5000] {
+            let frame = v2_length_frame(len);
+            let (packets, consumed) = decode_l3_data_resp_frame(&frame).unwrap();
+            assert_eq!(consumed, frame.len(), "length {len}");
+            assert_eq!(packets, DataRespPackets::LengthPrefixed(&frame[4..]));
+        }
+
+        for (token_len, first) in [(17, b't'), (32, b't')] {
+            let frame = v2_token_frame(token_len, first, &[b"one", b"two"]);
+            let (packets, consumed) = decode_l3_data_resp_frame(&frame).unwrap();
+            assert_eq!(consumed, frame.len());
+            assert_eq!(packets, DataRespPackets::TokenFramed(vec![b"one", b"two"]));
+        }
+    }
+
+    #[test]
+    fn v2_data_strict_prefixes_need_more_without_consuming() {
+        let mut fixtures = vec![
+            v2_length_frame(20),
+            v2_length_frame(4096),
+            v2_length_frame(4097),
+        ];
+        fixtures.push(v2_token_frame(17, b't', &[b"x"]));
+        for frame in fixtures {
+            for end in 0..frame.len() {
+                assert!(
+                    decode_l3_data_resp_frame(&frame[..end]).is_err(),
+                    "prefix {end}"
+                );
+            }
+            let mut with_sentinel = frame.clone();
+            with_sentinel.extend_from_slice(&[L3_VERSION, l3_cmd::HEARTBEAT_RESP, 0, 0]);
+            let (_, consumed) = decode_l3_data_resp_frame(&with_sentinel).unwrap();
+            assert_eq!(consumed, frame.len());
+            assert_eq!(
+                &with_sentinel[consumed..],
+                &[L3_VERSION, l3_cmd::HEARTBEAT_RESP, 0, 0]
+            );
+        }
+    }
+
+    #[test]
+    fn v2_data_pairwise_concatenation_preserves_alignment() {
+        let frames = [
+            v2_length_frame(20),
+            v2_length_frame(4096),
+            v2_token_frame(17, b't', &[b"a"]),
+            v2_token_frame(32, b't', &[b"b", b"c"]),
+        ];
+        for left in &frames {
+            for right in &frames {
+                let mut joined = left.clone();
+                joined.extend_from_slice(right);
+                let (_, first) = decode_l3_data_resp_frame(&joined).unwrap();
+                let (_, second) = decode_l3_data_resp_frame(&joined[first..]).unwrap();
+                assert_eq!(first, left.len());
+                assert_eq!(second, right.len());
+            }
+        }
+    }
+
+    #[test]
+    fn v2_ambiguous_token_prefixes_fail_closed() {
+        for (token_len, first) in [(15, 1), (16, 0)] {
+            let frame = v2_token_frame(token_len, first, &[b"x"]);
+            assert!(matches!(
+                decode_l3_data_resp_frame(&frame),
+                Err(L3FrameError::Truncated { .. })
+            ));
+        }
+    }
 }

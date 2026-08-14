@@ -5,15 +5,17 @@
 //! `0x13`, length-prefixed `0x94` echoes for `0x14`, and `05 95 00 00` for
 //! heartbeats. No TLS and no gateway are involved.
 
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use atrust_l3::{
-    FlowAuthStats, Ipv4Flow, L3AuthContext, L3CloseReason, L3Session, L3SessionError,
-    parse_ipv4_flow,
+    FlowAuthStats, Ipv4Flow, L3AuthContext, L3AuthRetryConfig, L3CloseReason, L3Session,
+    L3SessionError, parse_ipv4_flow,
 };
 use atrust_protocol::ProcessIdentity;
+use hermes_events::{EventBus, EventDelivery, HermesEvent};
 use hermes_model::{ConnectionId, DeviceId, SessionId, SignKey};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream};
@@ -21,6 +23,65 @@ use tokio::task::JoinHandle;
 
 const GET_IP_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE_HEARTBEAT: Duration = Duration::from_secs(3600);
+
+#[derive(Clone, Debug)]
+enum PeerWritePlan {
+    Whole,
+    OneByte,
+    Cuts(Vec<usize>),
+    Coalesced,
+}
+
+async fn write_planned(server: &mut DuplexStream, bytes: &[u8], plan: &PeerWritePlan) {
+    match plan {
+        PeerWritePlan::Whole | PeerWritePlan::Coalesced => server.write_all(bytes).await.unwrap(),
+        PeerWritePlan::OneByte => {
+            for byte in bytes {
+                server.write_all(std::slice::from_ref(byte)).await.unwrap();
+            }
+        }
+        PeerWritePlan::Cuts(cuts) => {
+            let mut start = 0;
+            for &end in cuts {
+                if end > start && end < bytes.len() {
+                    server.write_all(&bytes[start..end]).await.unwrap();
+                    start = end;
+                }
+            }
+            server.write_all(&bytes[start..]).await.unwrap();
+        }
+    }
+}
+
+fn v2_data_response(packet: &[u8]) -> Vec<u8> {
+    let mut frame = vec![0x05, 0x94];
+    frame.extend_from_slice(&(packet.len() as u16).to_be_bytes());
+    frame.extend_from_slice(packet);
+    frame
+}
+
+async fn read_get_ip(server: &mut DuplexStream) {
+    let mut prefix = [0u8; 7];
+    server.read_exact(&mut prefix).await.unwrap();
+    let json_len = u16::from_be_bytes([prefix[5], prefix[6]]) as usize;
+    let mut request = vec![0; json_len + 10];
+    server.read_exact(&mut request).await.unwrap();
+}
+
+fn spawn_v2_plan_peer(
+    mut server: DuplexStream,
+    plan: PeerWritePlan,
+    frames: Vec<u8>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        read_get_ip(&mut server).await;
+        write_planned(&mut server, &[0x05, 0xd0], &plan).await;
+        write_planned(&mut server, &[0x53, 0, 0, 2, b'O', b'K'], &plan).await;
+        write_planned(&mut server, &[0x05, 0, 0, 1, 10, 8, 0, 7, 0, 0], &plan).await;
+        write_planned(&mut server, &frames, &plan).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    })
+}
 
 /// How the mock peer should answer a `0x13`.
 #[derive(Clone, Debug)]
@@ -42,6 +103,26 @@ enum AuthBehaviour {
     Ignore,
     /// Drop the connection instead of answering.
     Disconnect,
+    TransientThenGrant {
+        status: u8,
+        token: String,
+    },
+    TransientForever {
+        status: u8,
+    },
+    OuterStatus {
+        status: u8,
+    },
+    RawTransient {
+        status: u8,
+        body: Vec<u8>,
+    },
+    TransientThenVip {
+        status: u8,
+    },
+    LateThenGrant {
+        token: String,
+    },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -177,6 +258,71 @@ fn spawn_peer(
                             }
                             AuthBehaviour::Ignore => {}
                             AuthBehaviour::Disconnect => return,
+                            AuthBehaviour::TransientThenGrant { status, token } => {
+                                let body =
+                                    format!(r#"{{"code":0,"data":{{"conntrackHash":{hash}}}}}"#);
+                                if stats.auth_requests() == 1 {
+                                    server
+                                        .write_all(&encode_auth_resp(*status, body.as_bytes()))
+                                        .await
+                                        .expect("transient auth");
+                                } else {
+                                    let body = format!(
+                                        r#"{{"code":0,"message":"OK","data":{{"conntrackHash":{hash},"connectToken":"{token}"}}}}"#
+                                    );
+                                    server
+                                        .write_all(&encode_auth_resp(0, body.as_bytes()))
+                                        .await
+                                        .expect("auth grant");
+                                }
+                            }
+                            AuthBehaviour::TransientForever { status } => {
+                                let body =
+                                    format!(r#"{{"code":0,"data":{{"conntrackHash":{hash}}}}}"#);
+                                server
+                                    .write_all(&encode_auth_resp(*status, body.as_bytes()))
+                                    .await
+                                    .expect("transient auth");
+                            }
+                            AuthBehaviour::OuterStatus { status } => {
+                                let body =
+                                    format!(r#"{{"code":0,"data":{{"conntrackHash":{hash}}}}}"#);
+                                server
+                                    .write_all(&encode_auth_resp(*status, body.as_bytes()))
+                                    .await
+                                    .expect("terminal auth");
+                            }
+                            AuthBehaviour::RawTransient { status, body } => {
+                                server
+                                    .write_all(&encode_auth_resp(*status, body))
+                                    .await
+                                    .expect("raw transient auth");
+                            }
+                            AuthBehaviour::TransientThenVip { status } => {
+                                let body =
+                                    format!(r#"{{"code":0,"data":{{"conntrackHash":{hash}}}}}"#);
+                                server
+                                    .write_all(&encode_auth_resp(*status, body.as_bytes()))
+                                    .await
+                                    .expect("transient auth");
+                                let update = br#"{"vip":"10.8.0.9"}"#;
+                                let mut frame = vec![0x05, 0x97, 0];
+                                frame.extend_from_slice(&(update.len() as u16).to_be_bytes());
+                                frame.extend_from_slice(update);
+                                server.write_all(&frame).await.expect("VIP update");
+                            }
+                            AuthBehaviour::LateThenGrant { token } => {
+                                let body = format!(
+                                    r#"{{"code":0,"message":"OK","data":{{"conntrackHash":{hash},"connectToken":"{token}"}}}}"#
+                                );
+                                if stats.auth_requests() == 1 {
+                                    tokio::time::sleep(Duration::from_secs(9)).await;
+                                }
+                                server
+                                    .write_all(&encode_auth_resp(0, body.as_bytes()))
+                                    .await
+                                    .expect("late/granted auth");
+                            }
                         }
                     }
                     ClientFrame::Data { packets } => {
@@ -204,6 +350,32 @@ fn spawn_peer(
                 Ok(n) => pending.extend_from_slice(&chunk[..n]),
             }
         }
+    })
+}
+
+fn spawn_vip_update_peer(mut server: DuplexStream) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut prefix = [0u8; 7];
+        server.read_exact(&mut prefix).await.expect("Get-IP prefix");
+        let json_len = u16::from_be_bytes([prefix[5], prefix[6]]) as usize;
+        let mut rest = vec![0; json_len + 10];
+        server.read_exact(&mut rest).await.expect("Get-IP request");
+        server.write_all(&[0x05, 0xd0]).await.expect("method ack");
+        server
+            .write_all(&[0x53, 0x00, 0x00, 0x02, b'O', b'K'])
+            .await
+            .expect("status frame");
+        server
+            .write_all(&[0x05, 0x00, 0x00, 0x01, 10, 8, 0, 7, 0, 0])
+            .await
+            .expect("VIP frame");
+
+        let json = br#"{"data":{"ipv4":"10.8.0.9"}}"#;
+        let mut update = vec![0x05, 0x97, 0x00];
+        update.extend_from_slice(&(json.len() as u16).to_be_bytes());
+        update.extend_from_slice(json);
+        server.write_all(&update).await.expect("VIP update");
+        tokio::time::sleep(Duration::from_secs(1)).await;
     })
 }
 
@@ -297,10 +469,360 @@ async fn session_with(
     let (client, server) = tokio::io::duplex(64 * 1024);
     let stats = PeerStats::default();
     let peer = spawn_peer(server, behaviour, stats.clone());
-    let session = L3Session::start(client, &sid(), heartbeat, GET_IP_TIMEOUT, None)
+    let session = L3Session::start(client, &sid(), heartbeat, GET_IP_TIMEOUT, None, None)
         .await
         .expect("session establishes");
     (session, stats, peer)
+}
+
+async fn e12_session_with(
+    behaviour: AuthBehaviour,
+    delayed_retry_delay: Duration,
+) -> (L3Session, PeerStats, JoinHandle<()>) {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let stats = PeerStats::default();
+    let peer = spawn_peer(server, behaviour, stats.clone());
+    let session = L3Session::start_with_config(
+        client,
+        &sid(),
+        IDLE_HEARTBEAT,
+        GET_IP_TIMEOUT,
+        None,
+        None,
+        L3AuthRetryConfig {
+            enabled: true,
+            max_wire_retries_per_flow: 1,
+            delayed_retry_delay,
+            overall_auth_deadline: Duration::from_secs(8),
+        },
+    )
+    .await
+    .expect("session establishes");
+    (session, stats, peer)
+}
+
+async fn e12_authorize(session: &L3Session) -> Result<String, L3SessionError> {
+    let (device, connection, key, process) = auth_ids();
+    let session_id = sid();
+    let ctx = L3AuthContext {
+        sid: &session_id,
+        device_id: &device,
+        connection_id: &connection,
+        sign_key: &key,
+        process: &process,
+        lang: "en-US",
+    };
+    session
+        .authorize_flow(
+            &ctx,
+            "e12-m-app",
+            "e12-m-group",
+            &flow_of(&tcp_packet(41_000, 443, b"")),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn e12_m_default_start_keeps_transient_retry_disabled() {
+    let (session, stats, peer) = session_with(
+        AuthBehaviour::TransientForever { status: 0x84 },
+        IDLE_HEARTBEAT,
+    )
+    .await;
+    assert!(matches!(
+        e12_authorize(&session).await,
+        Err(L3SessionError::FlowAuth(_))
+    ));
+    assert_eq!(stats.auth_requests(), 1);
+    let flow_stats = session.flow_auth_stats();
+    assert_eq!(flow_stats.transient_statuses_received, 1);
+    assert_eq!(flow_stats.wire_retries_scheduled, 0);
+    session.close().await;
+    peer.abort();
+}
+
+#[tokio::test]
+async fn e12_m_s84_retries_immediately_and_settles() {
+    let (session, stats, peer) = e12_session_with(
+        AuthBehaviour::TransientThenGrant {
+            status: 0x84,
+            token: "fixture-token-with-at-least-32-bytes".to_owned(),
+        },
+        Duration::from_secs(1),
+    )
+    .await;
+    assert_eq!(
+        e12_authorize(&session).await.unwrap(),
+        "fixture-token-with-at-least-32-bytes"
+    );
+    assert_eq!(stats.auth_requests(), 2);
+    assert_eq!(session.flow_auth_stats().wire_retries_sent, 1);
+    session.close().await;
+    peer.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn e12_m_s85_s86_s87_wait_for_the_configured_delay() {
+    for status in 0x85..=0x87 {
+        let (session, stats, peer) = e12_session_with(
+            AuthBehaviour::TransientThenGrant {
+                status,
+                token: "fixture-token-with-at-least-32-bytes".to_owned(),
+            },
+            Duration::from_secs(1),
+        )
+        .await;
+        let session = Arc::new(session);
+        let task_session = Arc::clone(&session);
+        let task = tokio::spawn(async move { e12_authorize(&task_session).await });
+        while stats.auth_requests() == 0 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_millis(999)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(stats.auth_requests(), 1, "status {status:#04x}");
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(task.await.unwrap().is_ok());
+        assert_eq!(stats.auth_requests(), 2);
+        let flow_stats = session.flow_auth_stats();
+        assert_eq!(flow_stats.transient_statuses_received, 1);
+        assert_eq!(flow_stats.wire_retries_scheduled, 1);
+        assert_eq!(flow_stats.wire_retries_sent, 1);
+        session.close().await;
+        peer.abort();
+    }
+}
+
+#[tokio::test]
+async fn e12_m_immediate_budget_exhaustion_fails_after_two_requests() {
+    let (session, stats, peer) = e12_session_with(
+        AuthBehaviour::TransientForever { status: 0x84 },
+        Duration::from_secs(1),
+    )
+    .await;
+    assert!(matches!(
+        e12_authorize(&session).await,
+        Err(L3SessionError::FlowAuth(_))
+    ));
+    assert_eq!(stats.auth_requests(), 2);
+    let flow_stats = session.flow_auth_stats();
+    assert_eq!(flow_stats.wire_retries_exhausted, 1);
+    assert_eq!(flow_stats.wire_retries_sent, 1);
+    session.close().await;
+    peer.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn e12_m_close_cancels_a_delayed_retry() {
+    let (session, stats, peer) = e12_session_with(
+        AuthBehaviour::TransientForever { status: 0x85 },
+        Duration::from_secs(1),
+    )
+    .await;
+    let session = Arc::new(session);
+    let task_session = Arc::clone(&session);
+    let task = tokio::spawn(async move { e12_authorize(&task_session).await });
+    while stats.auth_requests() == 0 {
+        tokio::task::yield_now().await;
+    }
+    session.close().await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert_eq!(stats.auth_requests(), 1);
+    assert_eq!(session.flow_auth_stats().wire_retries_cancelled, 1);
+    assert!(matches!(task.await.unwrap(), Err(L3SessionError::Closed)));
+    peer.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn e12_m_delayed_budget_exhaustion_fails_after_two_requests() {
+    let (session, stats, peer) = e12_session_with(
+        AuthBehaviour::TransientForever { status: 0x85 },
+        Duration::from_secs(1),
+    )
+    .await;
+    let session = Arc::new(session);
+    let task_session = Arc::clone(&session);
+    let task = tokio::spawn(async move { e12_authorize(&task_session).await });
+    while stats.auth_requests() == 0 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(L3SessionError::FlowAuth(_))
+    ));
+    assert_eq!(stats.auth_requests(), 2);
+    assert_eq!(session.flow_auth_stats().wire_retries_exhausted, 1);
+    session.close().await;
+    peer.abort();
+}
+
+#[tokio::test]
+async fn e12_m_terminal_status_never_retries() {
+    let (session, stats, peer) = e12_session_with(
+        AuthBehaviour::OuterStatus { status: 0x82 },
+        Duration::from_secs(1),
+    )
+    .await;
+    assert!(matches!(
+        e12_authorize(&session).await,
+        Err(L3SessionError::FlowAuth(_))
+    ));
+    assert_eq!(stats.auth_requests(), 1);
+    assert_eq!(session.flow_auth_stats().wire_retries_scheduled, 0);
+    session.close().await;
+    peer.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn e12_m_malformed_missing_and_unknown_hashes_are_unattributable() {
+    let bodies = [
+        b"not-json".to_vec(),
+        br#"{"code":0,"data":{"conntrackHash":0}}"#.to_vec(),
+        br#"{"code":0,"data":{"conntrackHash":18446744073709551615}}"#.to_vec(),
+    ];
+    for body in bodies {
+        let (session, stats, peer) = e12_session_with(
+            AuthBehaviour::RawTransient { status: 0x84, body },
+            Duration::from_secs(1),
+        )
+        .await;
+        let session = Arc::new(session);
+        let task_session = Arc::clone(&session);
+        let task = tokio::spawn(async move { e12_authorize(&task_session).await });
+        while stats.auth_requests() == 0 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(8)).await;
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(L3SessionError::AuthTimeout { .. })
+        ));
+        assert_eq!(stats.auth_requests(), 1);
+        assert_eq!(session.flow_auth_stats().wire_retries_scheduled, 0);
+        session.close().await;
+        peer.abort();
+    }
+}
+
+#[tokio::test]
+async fn e12_m_32_concurrent_callers_share_each_wire_attempt() {
+    let (session, stats, peer) = e12_session_with(
+        AuthBehaviour::TransientThenGrant {
+            status: 0x84,
+            token: "fixture-token-with-at-least-32-bytes".to_owned(),
+        },
+        Duration::from_secs(1),
+    )
+    .await;
+    let session = Arc::new(session);
+    let barrier = Arc::new(tokio::sync::Barrier::new(33));
+    let mut tasks = Vec::new();
+    for _ in 0..32 {
+        let session = Arc::clone(&session);
+        let barrier = Arc::clone(&barrier);
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            e12_authorize(&session).await
+        }));
+    }
+    barrier.wait().await;
+    for task in tasks {
+        assert!(task.await.unwrap().is_ok());
+    }
+    assert_eq!(stats.auth_requests(), 2);
+    assert_eq!(session.flow_auth_stats().wire_retries_sent, 1);
+    session.close().await;
+    peer.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn e12_m_vip_change_cancels_a_delayed_retry() {
+    let (session, stats, peer) = e12_session_with(
+        AuthBehaviour::TransientThenVip { status: 0x85 },
+        Duration::from_secs(1),
+    )
+    .await;
+    let session = Arc::new(session);
+    let task_session = Arc::clone(&session);
+    let task = tokio::spawn(async move { e12_authorize(&task_session).await });
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(L3SessionError::VipChanged { .. })
+    ));
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert_eq!(stats.auth_requests(), 1);
+    assert_eq!(session.flow_auth_stats().wire_retries_cancelled, 1);
+    session.close().await;
+    peer.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn e12_m_late_response_does_not_settle_a_new_flow_attempt() {
+    let (session, stats, peer) = e12_session_with(
+        AuthBehaviour::LateThenGrant {
+            token: "fixture-token-with-at-least-32-bytes".to_owned(),
+        },
+        Duration::from_secs(1),
+    )
+    .await;
+    let session = Arc::new(session);
+    let first_session = Arc::clone(&session);
+    let first = tokio::spawn(async move { e12_authorize(&first_session).await });
+    while stats.auth_requests() == 0 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(Duration::from_secs(8)).await;
+    assert!(matches!(
+        first.await.unwrap(),
+        Err(L3SessionError::AuthTimeout { .. })
+    ));
+
+    let second_session = Arc::clone(&session);
+    let second = tokio::spawn(async move { e12_authorize(&second_session).await });
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(second.await.unwrap().is_ok());
+    assert_eq!(stats.auth_requests(), 2);
+    session.close().await;
+    peer.abort();
+}
+
+#[tokio::test]
+async fn async_vip_update_reaches_session_state_and_event_bus_without_tun() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let peer = spawn_vip_update_peer(server);
+    let events = EventBus::new(8);
+    let mut subscriber = events.subscribe();
+    let session = L3Session::start(
+        client,
+        &sid(),
+        IDLE_HEARTBEAT,
+        GET_IP_TIMEOUT,
+        Some("group-1".to_owned()),
+        Some(events),
+    )
+    .await
+    .expect("session establishes");
+
+    assert_eq!(session.get_ip().address, Ipv4Addr::new(10, 8, 0, 7));
+    let delivery = tokio::time::timeout(Duration::from_secs(1), subscriber.recv())
+        .await
+        .expect("VIP event arrives")
+        .expect("event stream remains open");
+    let EventDelivery::Event(event) = delivery else {
+        panic!("expected event delivery");
+    };
+    assert!(matches!(
+        event.as_ref(),
+        HermesEvent::L3VipChanged { node_group_id, previous, current }
+            if node_group_id == "group-1"
+                && *previous == Ipv4Addr::new(10, 8, 0, 7)
+                && *current == Ipv4Addr::new(10, 8, 0, 9)
+    ));
+    assert_eq!(session.vip(), Ipv4Addr::new(10, 8, 0, 9));
+
+    session.close().await;
+    peer.abort();
 }
 
 #[tokio::test]
@@ -438,6 +960,7 @@ async fn concurrent_callers_for_one_flow_send_a_single_auth() {
             timeouts: 0,
             in_flight: 0,
             peak_in_flight: 1,
+            ..FlowAuthStats::default()
         }
     );
 }
@@ -495,6 +1018,7 @@ async fn concurrent_distinct_flows_are_in_flight_and_each_deduplicated() {
             timeouts: 0,
             in_flight: 0,
             peak_in_flight: 2,
+            ..FlowAuthStats::default()
         }
     );
 }
@@ -681,7 +1205,7 @@ async fn token_framed_data_response_is_delivered() {
         tokio::time::sleep(Duration::from_secs(5)).await;
     });
 
-    let session = L3Session::start(client, &sid(), IDLE_HEARTBEAT, GET_IP_TIMEOUT, None)
+    let session = L3Session::start(client, &sid(), IDLE_HEARTBEAT, GET_IP_TIMEOUT, None, None)
         .await
         .expect("session establishes");
 
@@ -693,5 +1217,92 @@ async fn token_framed_data_response_is_delivered() {
         session.recv_packet().await.expect("second"),
         vec![0x01, 0x02, 0x03]
     );
+    peer.abort();
+}
+
+#[tokio::test]
+async fn v2_peer_write_plans_keep_data_heartbeat_and_packet_order_aligned() {
+    let packet_a = tcp_packet(40000, 443, b"a");
+    let packet_b = tcp_packet(40001, 443, b"b");
+    let mut frames = vec![0x05, 0x42, 0, 3, b'a', b'b', b'c'];
+    frames.extend_from_slice(&[0x53, 0, 0, 2, b'O', b'K']);
+    frames.extend_from_slice(&[0x05, 0x95, 0, 0]);
+    frames.extend_from_slice(&v2_data_response(&packet_a));
+    frames.extend_from_slice(&v2_data_response(&packet_b));
+
+    for plan in [
+        PeerWritePlan::Whole,
+        PeerWritePlan::OneByte,
+        PeerWritePlan::Cuts(vec![2, 7, 13]),
+        PeerWritePlan::Coalesced,
+    ] {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let peer = spawn_v2_plan_peer(server, plan, frames.clone());
+        let session = L3Session::start(client, &sid(), IDLE_HEARTBEAT, GET_IP_TIMEOUT, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), session.recv_packet())
+                .await
+                .unwrap()
+                .unwrap(),
+            packet_a
+        );
+        assert_eq!(session.recv_packet().await.unwrap(), packet_b);
+        let (protocols, bodies) = session.protocol_messages();
+        assert_eq!(protocols, 1);
+        assert_eq!(bodies, vec!["OK"]);
+        assert_eq!(session.heartbeat_stats().acknowledgements_received, 1);
+        session.close().await;
+        peer.abort();
+    }
+}
+
+#[tokio::test]
+async fn v2_vip_update_clears_flow_state_and_unknown_protocol_do_not_desync() {
+    let update = br#"{"vip":"10.0.0.2"}"#;
+    let mut frames = vec![0x05, 0x97, 0, 0, update.len() as u8];
+    frames.extend_from_slice(update);
+    frames.extend_from_slice(&[0x05, 0x95, 0, 0]);
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let peer = spawn_v2_plan_peer(server, PeerWritePlan::Coalesced, frames);
+    let session = L3Session::start(client, &sid(), IDLE_HEARTBEAT, GET_IP_TIMEOUT, None, None)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if session.vip() == Ipv4Addr::new(10, 0, 0, 2) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(session.conntrack_len(), 0);
+    assert_eq!(session.heartbeat_stats().acknowledgements_received, 1);
+    session.close().await;
+    peer.abort();
+}
+
+#[tokio::test]
+async fn v2_foreign_version_fails_closed_without_packets() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let peer = spawn_v2_plan_peer(server, PeerWritePlan::Whole, vec![0x06, 0x95, 0, 0]);
+    let session = L3Session::start(client, &sid(), IDLE_HEARTBEAT, GET_IP_TIMEOUT, None, None)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !session.is_closed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        session.close_info().unwrap().reason,
+        L3CloseReason::FramingError
+    );
+    assert!(session.recv_packet().await.is_none());
     peer.abort();
 }
