@@ -385,9 +385,7 @@ fn domain_entry_matches(entry: &IndexedDomain, host: &str, flow: DomainFlow<'_>)
 
 /// A `tcp`/`udp` resource only carries its own protocol; `all` carries any.
 ///
-/// ICMP can be carried by either an explicit `icmp` resource or `all`. The
-/// zju-connect matcher has the same predicate, although its current aTrust
-/// parser inconsistently filters explicit `icmp` resources before matching.
+/// ICMP can be carried by either an explicit `icmp` resource or `all`.
 fn protocol_matches(resource: ResourceProtocol, flow: FlowProtocol) -> bool {
     matches!(
         (resource, flow),
@@ -1134,8 +1132,7 @@ mod tests {
         assert!(!FlowProtocol::Icmp.has_ports());
         assert!(FlowProtocol::Tcp.has_ports());
     }
-    /// An `icmp` resource must authorize ICMP flows and nothing else, matching
-    /// zju-connect's `resource.Protocol == protocol || == "all"` check.
+    /// An `icmp` resource must authorize ICMP flows and nothing else.
     #[test]
     fn icmp_resource_authorizes_only_icmp() {
         let resource = IpResource {

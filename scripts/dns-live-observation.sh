@@ -3,7 +3,7 @@
 # This sends only ordinary DNS wire queries and records metadata, not answers.
 set -uo pipefail
 
-REPO="${REPO:-/home/nancunchild/projects/Hermes}"
+REPO="${REPO:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}"
 PROBE="$REPO/target/debug/atrust-probe"
 SESSION="${HERMES_SESSION_FILE:-$HOME/.hermes/xidian-session.json}"
 GATEWAY="${HERMES_GATEWAY:-atrust.xidian.edu.cn}"

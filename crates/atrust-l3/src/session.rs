@@ -50,7 +50,7 @@ use crate::conntrack::{
 use crate::get_ip::{GetIpv4Error, GetIpv4Response, request_ipv4};
 use crate::packet::{Ipv4Flow, PacketError, parse_ipv4_flow};
 
-/// Heartbeat cadence for one L3 connection (Go: every 25 seconds).
+/// Heartbeat cadence validated for one L3 connection.
 pub const L3_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
 
 /// Monotonic flow-authorization counters for diagnostics and concurrency tests.
@@ -834,7 +834,7 @@ impl L3Session {
     /// without touching the wire. Concurrent callers for the same flow send one
     /// `0x13` and all wait on the same response.
     ///
-    /// On timeout the flow is evicted, so a caller that wants Go's
+    /// On timeout the flow is evicted, so a caller that wants the compatibility
     /// "retry once, then drop the packet" behaviour calls this a second time.
     pub async fn authorize_flow(
         &self,
@@ -1113,8 +1113,7 @@ enum Inbound<'a> {
 ///
 /// `Ok(None)` means "need more bytes"; the caller must not consume anything.
 ///
-/// Framing follows zju-connect `readFrame`, which is the client proven against
-/// the real gateway:
+/// Framing follows behavior validated by gateway observations and local fixtures:
 ///
 /// - `05 93` / `05 96` / `05 97` carry a status byte *before* the length;
 /// - `05 94` is the dual-format data body;
@@ -1754,8 +1753,8 @@ mod tests {
         ));
     }
 
-    /// zju-connect `readFrame` skips unknown `05` commands using the generic
-    /// `<u16 len>` layout and keeps the session alive; so must Hermes.
+    /// Unknown `05` commands use the generic `<u16 len>` layout and do not end
+    /// an otherwise healthy session.
     #[test]
     fn next_frame_skips_unknown_commands_generically() {
         let mut buf = vec![L3_VERSION, 0x42, 0x00, 0x03, 0xaa, 0xbb, 0xcc];

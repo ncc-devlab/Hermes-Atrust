@@ -1,13 +1,14 @@
+# Template: replace @HERMES_REPO@ with the absolute checkout path before installation.
 [Unit]
 Description=Hermes E11 resume decisive S0/S1 lifetime check
-Documentation=file:/home/nancunchild/projects/Hermes/docs/open-questions.md
+Documentation=file:@HERMES_REPO@/docs/open-questions.md
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/nancunchild/projects/Hermes
-ExecStart=/usr/bin/systemd-inhibit --what=sleep --mode=block --who=Hermes-E11-Resume --why=Resume_E11_decisive_lifetime_check /home/nancunchild/projects/Hermes/scripts/e11-headless-resume-monitor.sh
+WorkingDirectory=@HERMES_REPO@
+ExecStart=/usr/bin/systemd-inhibit --what=sleep --mode=block --who=Hermes-E11-Resume --why=Resume_E11_decisive_lifetime_check @HERMES_REPO@/scripts/e11-headless-resume-monitor.sh
 Restart=no
 TimeoutStartSec=infinity
 KillMode=mixed

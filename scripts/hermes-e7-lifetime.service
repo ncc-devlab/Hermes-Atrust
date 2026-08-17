@@ -1,12 +1,13 @@
+# Template: replace @HERMES_REPO@ with the absolute checkout path before installation.
 [Unit]
 Description=Hermes E7: L3 connection lifetime — idle timeout or absolute limit
-Documentation=file:/home/nancunchild/projects/Hermes/docs/open-questions.md
+Documentation=file:@HERMES_REPO@/docs/open-questions.md
 After=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/home/nancunchild/projects/Hermes
-ExecStart=/home/nancunchild/projects/Hermes/scripts/e7-lifetime.sh
+WorkingDirectory=@HERMES_REPO@
+ExecStart=@HERMES_REPO@/scripts/e7-lifetime.sh
 
 # The arms run sequentially and the longest is capped at HOLD+600s inside the
 # script, so systemd must not be the thing that decides when this ends.
@@ -24,7 +25,7 @@ SyslogIdentifier=hermes-e7
 WantedBy=default.target
 
 # Install with:
-#   cp scripts/hermes-e7-lifetime.service ~/.config/systemd/user/
+#   sed "s|@HERMES_REPO@|$PWD|g" scripts/hermes-e7-lifetime.service > ~/.config/systemd/user/hermes-e7-lifetime.service
 #   systemctl --user daemon-reload
 #   systemctl --user start hermes-e7-lifetime.service
 #

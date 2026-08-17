@@ -11,7 +11,7 @@
 | `onlineInfo` | **已实测** | ~27ms，`username_present=true` |
 | `clientResource` | **已实测** | 200，~1.3MB / 12.5s；1361 IP / 523 域名 |
 | 节点地址解析 | **已实测** | 1 major 组、2 endpoints、0 sdpc placeholder |
-| 节点可达性探测 | **西电已 live** | TCP + TLS 探测后按时延选优（对照 Go `getBestNodes`） |
+| 节点可达性探测 | **西电已 live** | TCP + TLS 探测后按时延选优（由互操作回归覆盖） |
 | SID | **已导出并实测** | 完整恢复需要 Cookie `sid + sid.sig`；裸 SID 仅够 Get-IP |
 | DeviceID | **可现场生成，西电已实测** | F1 使用全新客户端随机值完成 L3 + TCP/HTTPS |
 | ConnectionID | **可现场生成，西电已实测** | `UPPER(MD5(deviceId)) + "-" + unix_micros`；F1 通过 |
@@ -48,7 +48,7 @@
    `node-probe --primary` 可显式缩减为每组第一个端点。同进程路径免去会话持久化。
 2. 对每个候选：`TcpStream` + `rustls`（默认 Verify；仅私有网关显式 insecure）
 3. 记录：成功/超时/证书错误；**不**发送 `05 01 81...`（`probe_nodes_tls` 共享实现）
-4. 后续再加 3 次短 TCP 时延选优（对齐 Go `pingNum=3`）
+4. 后续再加 3 次短 TCP 时延选优（由互操作回归覆盖）
 
 **状态（2026-07-31 更正）：** 已接线并 live。此前记的「外网 `:441` 网络层不可达」是误判——
 探测打在了 DNS 解析出的 `61.150.43.99`（该 IP 的 `:441` 确实是死端口），且带了 SNI。
@@ -60,7 +60,7 @@
 
 前置：Phase A 材料齐备 + Phase B 至少一节点可连。
 
-对照 Go `DialTCP` / `docs/atrust-protocol-analysis.md` §4：
+依据黑盒互操作样本和 `docs/atrust-protocol-analysis.md` §4：
 
 ```text
 TLS 到节点
@@ -78,7 +78,7 @@ TLS 到节点
 1. ~~新 crate~~ **已落地 `atrust-tcp`**：`dial_tcp` / `complete_handshake` / `TcpTunnel`（AsyncRead+Write 帧）。
 2. JSON 必须用 `atrust_protocol::to_wire_json` 固定字段顺序；签名用
    `calculate_request_signature`（HMAC-SHA256 大写 hex）。
-3. **禁止** `fmt::sprintf` 拼签名 JSON（Go 现网有此模式，Rust 重写必须强类型）。
+3. **禁止**字符串格式化拼签名 JSON；Rust 实现必须使用强类型 DTO。
 4. 首个联调目标：校内已知 HTTP 端口或用户指定 `host:port`，只验证读写回环。
 5. 超时、取消、半关闭、short-write：握手 + 应用帧回环已有基础 mock；完整半关闭和
    short-write 对端行为仍待补，不能视为已覆盖。
@@ -92,9 +92,9 @@ psw 登录 → jar 导出 SID → `SessionMaterial`（`sign_key_provisional=true
 兼容放行）、帧与状态机逐字节互通。节点 `--node` 覆盖为必需（`policy.json` 广告的是
 服务端本机 `127.0.0.1:8444`）。拨号 TLS connect+handshake 约 6.3s（链路较慢），超时预算宜放宽。
 
-2026-08-05 同会话 zju-connect 对照已证明西电 TCP 应用 framing 和隧道内 TLS 可用；三个 HTTPS
+2026-08-05 同会话黑盒互操作对照已证明西电 TCP 应用 framing 和隧道内 TLS 可用；三个 HTTPS
 目标均返回 HTTP 200。Hermes 的 rustls ClientHello 被目标路径关闭，问题已收敛到 TLS 指纹差异，
-不是 aTrust `01 00` 布局。完整结果和 zju 资源匹配缺陷登记在 `open-questions.md` 的 D4。
+不是 aTrust `01 00` 布局。完整结果和资源匹配差异登记在 `open-questions.md` 的 D4。
 
 ### Phase D — L3（Get-IP 探针已落地）
 
@@ -173,15 +173,14 @@ EasyConnect 不在本规划内。
 收一个下行包 → 关闭。`--auth-only` 可停在鉴权。`--target` 只收 IPv4 字面量：L3 搬的是包，
 在这里做域名解析等于自造一个资源表从未授权的目的地。
 
-**zju-connect 对照订正（2026-07-31）。** 以 `/home/nancunchild/projects/zju-connect`
-（`client/atrust/`，已验证可用的真实客户端）逐行对照后修掉三处：
+**互操作回归订正（2026-07-31）。** 依据真实网关观测和独立黑盒客户端对照修正三处：
 
 1. **VIP 帧长度**——`addrType=1` 的整帧是 **10 字节**（4 字节头 + 6 字节 body，前 4 为 IPv4），
    Hermes 原按 8 字节读。独立 Get-IP 下不可见（读完即关连接），但会让保持长连接的
    L3 会话从第一帧起错位。这是 mock 测试**不可能**发现的——mock 是照着 Hermes 自己的
-   理解写的。已按 `vipPayloadLength` 实现 addrType 驱动的长度，并加回归测试断言
+   理解写的。已实现 addrType 驱动的长度，并加回归测试断言
    VIP 帧后的下一帧仍对齐。
-2. **`53 00` 可以出现在会话中途**（不只 Get-IP 阶段），zju-connect `readFrame` 跳过它；
+2. **`53 00` 可以出现在会话中途**（不只 Get-IP 阶段）；兼容客户端会跳过该带内消息，
    Hermes 原会判成版本错乱直接杀死会话。
 3. **未知 `05 <cmd>` 按通用 `<u16 len>` 跳过**，不再报错杀会话——原设计想让新帧「立刻暴露」，
    但代价是一条本来健康的隧道死掉，而通用布局正是已验证客户端赖以保持同步的机制。
@@ -189,7 +188,7 @@ EasyConnect 不在本规划内。
 
 顺带修掉两处会**静默丢资源**的解析问题：`icmp` 协议值原本解析失败被整条丢弃
 （连 `--show-all` 都看不见），端口 `0` 与倒置区间同样被丢弃——而 ICMP 资源的端口通常正是 `0`。
-zju-connect 两者都保留。
+互操作策略样本会保留这两类条目。
 
 对端行为已用 `crates/atrust-l3/tests/mock_session.rs`（8 项）覆盖：包往返、
 已授权流走缓存不重发、并发同流只发一个 `0x13`、服务端拒绝、对端断开立即唤醒等待者、
@@ -215,7 +214,7 @@ atrust-probe         人工诊断子命令：auth / cas-login / client-resource 
 | --- | --- |
 | A | 节点解析单测（已有）；资源 golden；资源匹配单测（已有，17 项）；可选 live 仅计数 |
 | B | mock TCP 可连；TLS 策略默认 Verify；超时 |
-| C | init 帧 golden（与 Go 逐字节或固定 fixture）；握手状态机；应用帧；ignored live |
+| C | init 帧 golden（与固定兼容性 fixture 逐字节一致）；握手状态机；应用帧；ignored live |
 | D | L3 模拟对端会话（已有 8 项 `mock_session`）；IPv4 解析边界（已有）；codec property / fuzz 仍待 |
 
 真实登录、真实拨号：**永不**进入默认 CI。

@@ -1,4 +1,4 @@
-//! Per-flow conntrack and connectToken state (Go `conntrackMgr` parity).
+//! Per-flow conntrack and connectToken state.
 //!
 //! Auth wait is 8 seconds. One outstanding auth attempt per flow key.
 
@@ -28,15 +28,14 @@ impl std::fmt::Debug for ReusableAuthFrame {
     }
 }
 
-/// Default wait for a per-flow `0x93` response (Go `ensureAuth`).
+/// Default wait for a per-flow `0x93` response.
 pub const L3_AUTH_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// How long an authorized flow survives without carrying a packet.
 ///
-/// **This is a deliberate divergence from zju-connect, which never expires a
-/// conntrack entry.** That is survivable for a short-lived process and a memory
-/// leak for a long-lived tunnel: every short connection burns a fresh source
-/// port, so an hour of ordinary browsing produces tens of thousands of distinct
+/// Long-running tunnels expire idle entries to bound state growth: every short
+/// connection burns a fresh source port, so an hour of ordinary browsing
+/// produces tens of thousands of distinct
 /// five-tuples that would otherwise be retained until the connection dies.
 ///
 /// 5 minutes is chosen against two measured quantities rather than as a round
@@ -54,7 +53,7 @@ pub const L3_CONNTRACK_IDLE_TTL: Duration = Duration::from_secs(300);
 /// them, which is a condition worth surfacing rather than absorbing silently.
 pub const L3_CONNTRACK_CAPACITY: usize = 8192;
 
-/// Stable key for one L3 flow (Go `connTrackKey`).
+/// Stable key for one L3 flow.
 ///
 /// Format: `{atype}:{protocol}:{src}:{srcPort}-{dst}:{dstPort}`.
 ///
@@ -116,7 +115,7 @@ impl AuthOutcome {
 #[derive(Debug)]
 pub struct ConntrackEntry {
     pub key: FlowKey,
-    /// Client-generated id sent as `conntrackHash` (Go `authID`).
+    /// Client-generated id sent as `conntrackHash`.
     pub auth_id: u64,
     pub app_id: String,
     pub node_group_id: String,
@@ -213,7 +212,7 @@ impl ConntrackEntry {
     }
 }
 
-/// Conntrack table keyed by flow and by auth id (Go `conntrackMgr`).
+/// Conntrack table keyed by flow and by auth id.
 #[derive(Debug)]
 pub struct ConntrackTable {
     next_auth_id: AtomicU64,
@@ -420,7 +419,7 @@ impl ConntrackTable {
 
     /// Completes auth for `auth_id` from a parsed `0x93` body.
     ///
-    /// Empty tokens on success become a failure (Go requires connect token).
+    /// Empty tokens on success become a failure because authorization requires a connect token.
     pub fn mark_auth(
         &mut self,
         auth_id: u64,

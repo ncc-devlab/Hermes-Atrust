@@ -6,7 +6,7 @@ use thiserror::Error;
 use crate::json::{ProtocolJsonError, to_wire_json};
 use crate::signing::calculate_request_signature;
 
-/// Client process identity embedded in TCP tunnel init JSON (Go DialTCP parity).
+/// Client process identity embedded in TCP tunnel init JSON.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessIdentity {
     pub name: String,
@@ -14,7 +14,7 @@ pub struct ProcessIdentity {
 }
 
 impl ProcessIdentity {
-    /// Matches the Go client's hardcoded Linux process spoofing.
+    /// Uses the Linux process identity observed in interoperability samples.
     pub fn default_for_port(port: u16) -> Self {
         if port == 22 {
             Self {
@@ -29,7 +29,7 @@ impl ProcessIdentity {
         }
     }
 
-    /// Uppercase hex SHA-256 of the process path bytes (Go `fmt.Sprintf("%X", sha256(...))`).
+    /// Uppercase hex SHA-256 of the process path bytes.
     pub fn proc_hash(&self) -> String {
         let digest = Sha256::digest(self.path.as_bytes());
         let mut out = String::with_capacity(digest.len() * 2);
@@ -58,7 +58,7 @@ pub struct TcpInitParams<'a> {
 
 /// Builds compact signed JSON bytes for the TCP init frame body.
 ///
-/// Field order is fixed by the wire struct declaration and must match the Go client.
+/// Field order is fixed by the validated wire format.
 pub fn build_signed_tcp_init_json(
     params: &TcpInitParams<'_>,
     sign_key: &SignKey,
@@ -117,7 +117,7 @@ pub fn build_signed_tcp_init_json(
     Ok(to_wire_json(&signed)?)
 }
 
-/// Wire DTO matching Go DialTCP JSON layout exactly (mixed camelCase / snake_case).
+/// Wire DTO preserving the validated TCP init JSON layout (mixed camelCase / snake_case).
 #[derive(Serialize)]
 struct TcpInitWire<'a> {
     sid: &'a str,
@@ -205,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn default_process_identity_matches_go() {
+    fn default_process_identity_matches_interop_fixture() {
         assert_eq!(
             ProcessIdentity::default_for_port(443).name,
             "google-chrome-stable"
@@ -214,7 +214,7 @@ mod tests {
     }
 
     #[test]
-    fn signed_init_json_matches_go_layout() {
+    fn signed_init_json_matches_validated_layout() {
         let sid = SessionId::new("sid-value").unwrap();
         let device = DeviceId::new("device-1").unwrap();
         let connection = ConnectionId::from_device_at(&device, 1_700_000_000_000_000).unwrap();
@@ -247,7 +247,7 @@ mod tests {
         assert!(text.starts_with(&prefix), "unexpected wire JSON: {text}");
         assert!(!text.contains(r#""xRequestSig":"""#));
 
-        // Go: sign JSON with empty xRequestSig, then splice signature into the last field.
+        // Sign JSON with an empty xRequestSig, then place the signature in the last field.
         // `prefix` already ends with the opening quote of xRequestSig's value.
         let unsigned = format!(r#"{prefix}"}}"#);
         let expected = calculate_request_signature(&key, unsigned.as_bytes());

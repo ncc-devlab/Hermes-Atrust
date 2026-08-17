@@ -33,7 +33,7 @@
 
 ### 2.1 登录和密码运算
 
-实现位于 `client/easyconnect/request.go`。
+以下流程来自隔离整理的兼容性需求，尚未由 Hermes 完整实现：
 
 1. 客户端 GET `https://server/por/login_auth.csp?apiversion=1`。
 2. 从 XML 响应读取 `TwfID`、RSA 模数 `RSA_ENCRYPT_KEY`、指数
@@ -53,7 +53,7 @@
 
 5. POST `/por/login_psw.csp?anti_replay=1&encrypt=1&type=cs`，表单中携带用户名、
    十六进制密文、验证码和 `TWFID` Cookie。
-6. 服务端可能继续要求短信验证码、TOTP 或客户端证书。源码支持：
+6. 服务端可能继续要求短信验证码、TOTP 或客户端证书。兼容性需求包含：
    `auth/sms`、`auth/token` 和 PKCS#12 证书登录；图形验证码则下载图片后由用户
    输入。
 7. 登录成功后保存新的 TWFID，并继续请求服务端配置、线路、资源和虚拟 IP。
@@ -63,8 +63,8 @@ RSA 只用于保护登录密码，不是后续 IP 数据的独立加密层。后
 
 ### 2.2 特制 TLS ClientHello
 
-实现位于 `client/easyconnect/protocol.go` 的 `tlsConn`。连接到 VPN 服务器的
-443 端口后，客户端不使用普通的 Go TLS ClientHello，而是用 uTLS 手工设置字段，
+隔离兼容性需求描述了一种特制 ClientHello。连接到 VPN 服务器的
+443 端口后，客户端不使用普通 TLS ClientHello，而是显式设置字段，
 以便网关在同一端口区分 Web/HTTP 和 VPN 流量：
 
 ```text
@@ -76,7 +76,7 @@ SessionID："L3IP" + 其余填充到 32 字节
 扩展：自定义 5 字节 heartbeat 扩展
 ```
 
-源码还允许跳过服务端证书验证。SessionID 的 `L3IP`、TLS 1.1、RC4 和自定义
+兼容模式还允许跳过服务端证书验证。SessionID 的 `L3IP`、TLS 1.1、RC4 和自定义
 heartbeat 都是兼容私有网关的识别信号，不应理解为新的密码学设计。
 
 ### 2.3 发送和接收握手
@@ -136,18 +136,16 @@ aTrust 的认证代码位于 `client/atrust/auth`。整体顺序是：
 aTrust 的密码登录同样会使用服务端提供的 RSA/反重放参数，但它与 EasyConnect
    的 `/por/login_*.csp` XML 流程不是同一个协议，不能混用 TWFID 和 SID。
 
-### 3.1b 基准来源说明（2026-07-31）
+### 3.1b 证据来源说明（2026-07-31）
 
-本文的 L3 部分现以 **zju-connect**（`/home/nancunchild/projects/zju-connect`，
-`client/atrust/`）为对照基准。它是已被证实在真实 aTrust 网关上可用的客户端，
-优先级高于 `Hermes-aTrust-Server`——后者是依据抓包和控制台表现重建的服务端推测，
-用它验证客户端属于循环论证。
+本文的 L3 结论来自真实网关线路观测、黑盒互操作实验和 Hermes 自有协议夹具。
+`Hermes-aTrust-Server` 仅用于开发回归；因其行为由同一批观测重建，不能反向证明客户端协议正确。
 
-已逐行核对且**一致**的部分：`connTrackKey` 格式 `{atype}:{src}:{sport}-{dst}:{dport}`、
-鉴权 JSON 字段顺序与 `atype=0x0800`/`protocol=IANA号`、HMAC-SHA256 大写 hex 签名覆盖
-`xRequestSig=""` 的字节串、`0x13`/`0x14` 编码、`0x93`/`0x96` 的 status-在-长度-之前布局、
-`0x94` 的双格式判别、25s 心跳、8s 鉴权超时、CAS 式单次发起鉴权。首字段
-`0 < n ≤ 4096` 直接按长度前缀处理；更大的值只有在 IPv4/IPv6 头内长度与 `n` 一致时才走该分支。
+当前验证范围包括 flow key 格式 `{atype}:{src}:{sport}-{dst}:{dport}`、鉴权 JSON 字段顺序与
+`atype=0x0800`/`protocol=IANA号`、HMAC-SHA256 大写 hex 签名覆盖 `xRequestSig=""` 的字节串、
+`0x13`/`0x14` 编码、`0x93`/`0x96` 的 status-在-长度-之前布局、`0x94` 的双格式判别、
+25s 心跳、8s 鉴权超时和单次发起鉴权。首字段 `0 < n ≤ 4096` 直接按长度前缀处理；
+更大的值只有在 IPv4/IPv6 头内长度与 `n` 一致时才走该分支。
 
 ### 3.2 L3 隧道总连接认证
 
@@ -169,28 +167,26 @@ aTrust 的密码登录同样会使用服务端提供的 RSA/反重放参数，�
 <虚拟IP头和定长虚拟IP数据>
 ```
 
-`53 00` 是一个嵌套的长度包。源码还会忽略或跳过部分 `53 00` 协议消息，因此
+`53 00` 是一个嵌套的长度包。互操作观测显示客户端会忽略或跳过部分 `53 00` 协议消息，因此
 抓包分析时不能只按 `05 <cmd> <len>` 一种格式解析。
 
-**虚拟 IP 帧的长度由 addrType 决定（2026-07-31 由 zju-connect 订正）：**
+**虚拟 IP 帧的长度由 addrType 决定（2026-07-31 经互操作回归订正）：**
 
 ```text
 05 <status> <reserved> <addrType>        4 字节头
-<vipData>                                长度 = vipPayloadLength(addrType)
+<vipData>                                长度由 addrType 决定
     addrType=1 → 6 字节（前 4 为 IPv4，尾 2 字节用途未知）
     addrType=4 → 18 字节（IPv6）
     addrType=5 → 22 字节（IPv4 4 字节 + IPv6 16 字节）
     其它       → 4 字节
 ```
 
-即 addrType=1 时整帧 **10 字节，不是 8 字节**。zju-connect 自身两处不一致：
-`ip.go::getIP` 只读 8 字节（少读 2），`l3tunnelconn.go::authTunnel` 读满 10 字节。
-前者读完即关连接，少读不可见；后者连接要继续用，必须读满。**以 authTunnel 为准。**
-Hermes 原先按 8 字节读，在独立 Get-IP 下无害，但会让保持长连接的 L3 会话从第一帧起错位。
+即 addrType=1 时整帧 **10 字节，不是 8 字节**。黑盒长连接实验确认必须消费完整的
+6 字节 body；只读 8 字节整帧会使后续 L3 帧立即错位。Hermes 原先按 8 字节读取，
+在读完即关闭的独立 Get-IP 中不易暴露，但不适用于保持连接的会话。
 
-另注：`getIP` 的 `05 01 d0 53 00 00 53` 把长度写死为 `0x0053`=83，恰好等于 73 字符 SID 的
-`{"sid":"..."}` 长度；而 `authTunnel::wrapAuthReqData` 是**动态**计算长度的。
-这解决了架构文档未决项 1——动态才是正确形态，`0x0053` 只是对 73 字符 SID 成立的巧合。
+另注：`05 01 d0 53 00 00 53` 中的 `0x0053`=83 恰好等于 73 字符 SID 的
+`{"sid":"..."}` 长度；实现必须按实际 JSON **动态**计算长度。
 
 ### 3.3 按连接授权：JSON、conntrack 和 HMAC
 
@@ -235,7 +231,7 @@ xRequestSig = UPPERCASE(hex(digest))
 ```
 
 服务端响应命令为 `0x94`。`05 94` 之后的 body 按首 2 字节 `n = u16-be` 分帧
-（与 zju-connect `readDataRespPayload` / Hermes `atrust-protocol::l3_frame` 一致）：
+（由 Hermes `atrust-protocol::l3_frame` 的夹具覆盖）：
 
 - `0 < n ≤ 4096`：**长度前缀** — 随后 `n` 字节为一整包原始 IP；
 - `n > 4096` 且后续 IPv4/IPv6 头声明同一长度：仍为**长度前缀**；
@@ -311,7 +307,7 @@ TCP 隧道由 `DialTCP` 使用，适合代理单个 TCP 连接，和 L3 TUN 是�
 ### 不应误认为已实现
 
 - EasyConnect 没有独立的 TCP 隧道模式。
-- L3 路径的 `processIPV4` 只处理 IPv4 包；虽然元数据编码器包含 IPv6 分支，
+- L3 路径目前只处理 IPv4 包；虽然元数据编码器包含 IPv6 分支，
   这不代表端到端 IPv6 已打通。
 - `icmp6` 等协议名称在辅助函数中存在，不等价于实际分流和服务端授权支持。
 - 这是客户端兼容协议，不是通用的 IPsec、WireGuard、OpenVPN 或 SOCKS 加密
@@ -379,20 +375,18 @@ EasyConnect 主动伪造 TLS 1.1、RC4 和自定义扩展。现代 TLS 库或中
    `SessionID`/版本特征。
 2. 记录 EasyConnect 的发送/接收握手及首字节状态码。
 3. 对 aTrust 分别记录总连接认证、首次五元组鉴权、首个数据包和心跳。
-4. 用源码中的大端序长度、token 长度和逐包长度逐层解码，不要把 TLS 明文内容
+4. 用协议夹具验证的大端序长度、token 长度和逐包长度逐层解码，不要把 TLS 明文内容
    当作可以直接在公网读取的协议。
 5. 验证四类流量：IPv4 TCP、IPv4 UDP、ICMP，以及域名资源下的 TCP；再单独验证
    TUN、SOCKS/HTTP 和 TCP 隧道。
 6. 测试服务端重启、节点切换、鉴权超时和 DNS 劫持关闭后的行为，因为这些路径
    暴露了最多的实现假设。
 
-## 8. 源码索引
+## 8. Hermes 实现索引
 
-- EasyConnect 登录和 RSA：`client/easyconnect/request.go`
-- EasyConnect 特制 TLS、发送/接收握手：`client/easyconnect/protocol.go`
-- EasyConnect 双 L3 连接：`client/easyconnect/l3conn.go`
-- aTrust L3 帧、鉴权、HMAC、心跳：`client/atrust/l3tunnelconn.go`
-- aTrust IPv4 资源匹配和重试：`client/atrust/l3tunnelpacket.go`
-- aTrust TCP 隧道和 HMAC：`client/atrust/tcptunnel.go`
-- aTrust 节点组连接缓存：`client/atrust/l3tunnel.go`
+- aTrust 控制面与资源策略：`crates/atrust-auth/`
+- aTrust L3 帧、鉴权和心跳：`crates/atrust-l3/`、`crates/atrust-protocol/`
+- aTrust TCP 隧道：`crates/atrust-tcp/`
+- 传输与 TLS：`crates/hermes-transport/`
+- 互操作探针：`apps/atrust-probe/`
 - 命令行支持矩阵和运行注意事项：`README.md`

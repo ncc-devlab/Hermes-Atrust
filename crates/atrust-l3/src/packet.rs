@@ -1,4 +1,4 @@
-//! IPv4 packet inspection for L3 flow classification (Go `processIPV4` parity).
+//! IPv4 packet inspection for L3 flow classification.
 //!
 //! Only IPv4 is parsed. IPv6 packets are rejected rather than silently treated
 //! as IPv4: the auth five-tuple and the resource matcher are both IPv4-shaped,
@@ -14,7 +14,7 @@ use thiserror::Error;
 
 use crate::conntrack::FlowKey;
 
-/// Address-type value used in the conntrack flow key (Go `connTrackKey`).
+/// Address-type value used in the conntrack flow key.
 ///
 /// Distinct from the auth JSON's `atype`, which is the EtherType `0x0800`
 /// (`L3AuthFiveTuple::ATYPE_IPV4`). Both are correct in their own place.

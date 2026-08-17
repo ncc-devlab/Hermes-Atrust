@@ -133,10 +133,10 @@ enum Command {
         /// Per-node TLS connect timeout (seconds) used by `--probe-nodes`.
         #[arg(long, default_value_t = 5)]
         node_connect_timeout_seconds: u64,
-        /// Export a one-shot zju-connect client_data JSON after onlineInfo succeeds.
+        /// Export a one-shot interoperability session JSON after onlineInfo succeeds.
         /// The file contains live gateway cookies and is forced to mode 0600.
         #[arg(long)]
-        zju_client_data_file: Option<PathBuf>,
+        compat_client_data_file: Option<PathBuf>,
         /// Persist the harvested session so `tcp-dial`, `node-probe`, and
         /// `client-resource` can reuse this CAS login in a later process instead
         /// of repeating IDS + slider + SMS. Forced to 0600; holds live cookies,
@@ -381,8 +381,8 @@ enum Command {
         ///
         /// The probe completes a full TLS handshake to the node and drops it
         /// having sent nothing. This makes the dial the process's only
-        /// connection to the node, matching the zju-connect reference, so the
-        /// probe can be ruled in or out as an influence on the dial.
+        /// connection to the node, providing a controlled single-dial baseline.
+        /// This lets the probe be ruled in or out as an influence on the dial.
         #[arg(long, requires = "node")]
         skip_node_probe: bool,
         /// Server-side destination the tunnel connects to, as `host:port`.
@@ -794,7 +794,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             keep_browser_open,
             probe_nodes,
             node_connect_timeout_seconds,
-            zju_client_data_file,
+            compat_client_data_file,
             session_file,
             get_ip_node,
             get_ip_timeout_seconds,
@@ -968,10 +968,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             "sid_present": sid_present,
                         }),
                     )?;
-                    if let Some(path) = zju_client_data_file.as_deref() {
-                        write_zju_client_data(path, &endpoint, &login.gateway_cookies)?;
+                    if let Some(path) = compat_client_data_file.as_deref() {
+                        write_compat_client_data(path, &endpoint, &login.gateway_cookies)?;
                         info!(
-                            event = "probe.zju_client_data_exported",
+                            event = "probe.compat_client_data_exported",
                             cookie_count = login.gateway_cookies.len()
                         );
                     }
@@ -3158,7 +3158,7 @@ async fn select_data_nodes(
     };
     // The probe completes a full TLS handshake and drops it with zero
     // application bytes. Skipping it leaves the dial as the only connection this
-    // process makes to the node, which is what the zju-connect control does.
+    // process makes to the node, isolating the application dial from prior probes.
     let selection = if request.skip_probe {
         warn!(
             event = "probe.node_select.probe_skipped",
@@ -4759,7 +4759,7 @@ fn append_probe_trace(
     Ok(())
 }
 
-fn write_zju_client_data(
+fn write_compat_client_data(
     path: &Path,
     endpoint: &GatewayEndpoint,
     cookies: &[hermes_transport::GatewayCookie],
@@ -5177,9 +5177,9 @@ mod tests {
     }
 
     #[test]
-    fn zju_client_data_export_is_compatible_and_private() {
+    fn compat_client_data_export_is_private() {
         let path = std::env::temp_dir().join(format!(
-            "hermes-zju-client-data-{}-{}.json",
+            "hermes-compat-client-data-{}-{}.json",
             std::process::id(),
             random_hex(8)
         ));
@@ -5193,7 +5193,7 @@ mod tests {
             http_only: true,
         }];
 
-        write_zju_client_data(&path, &endpoint, &cookies).unwrap();
+        write_compat_client_data(&path, &endpoint, &cookies).unwrap();
         let metadata = std::fs::metadata(&path).unwrap();
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
         let value: serde_json::Value =

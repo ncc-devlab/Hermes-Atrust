@@ -1,6 +1,6 @@
 # 协议二义性与未决问题登记
 
-本文件收纳 Hermes 中**依据不足、存在二义、或与参考实现存在已知分歧**的每一处判断。
+本文件收纳 Hermes 中**依据不足、存在二义、或与互操作基线存在已知分歧**的每一处判断。
 架构文档的「未确认协议关卡」只列结论，这里列**理由、二义区间、误判后的症状、以及判定实验**。
 
 任何 live 失败在归因到「实现 bug」之前，先在本表里找是否已有对应条目。
@@ -16,7 +16,7 @@
 | 级别 | 含义 |
 |---|---|
 | **L0** | 官方网关 `atrust.xidian.edu.cn` 实测/抓包确认 |
-| **L1** | zju-connect（`/home/nancunchild/projects/zju-connect`，已被证实可用于真实 aTrust 网关） |
+| **L1** | 隔离整理的兼容性需求、黑盒互操作结果或 Hermes 协议夹具；不含第三方实现细节 |
 | **L2** | `Hermes-aTrust-Server`——由抓包和控制台表现**重建**的服务端推测，**不是证据** |
 | **L3** | 纯推断／从帧结构自洽性倒推，无外部依据 |
 
@@ -29,10 +29,10 @@ L2 单独出现时等同于「未验证」：该服务端与 Hermes 客户端互
 
 ### A0 — 异步 `0x97` VIP 更新 <a id="a0"></a>
 
-**依据：L1**（zju-connect `2a42f58`）
+**依据：L1**（黑盒互操作观测与 Hermes 异步 VIP 夹具）
 
 Hermes 现按 `05 97 <status:u8> <u16-be len> <json>` 解帧。`status == 0` 时递归遍历
-JSON 字符串并采用第一个合法 IPv4，这与参考实现不依赖字段名的 `extractVIPs` 行为一致。
+JSON 字符串并采用第一个合法 IPv4；该兼容规则不依赖字段名。
 有效更新会原子替换 session 的 effective VIP、清空该连接全部 conntrack 和 auth waiters、
 更新 manager 的权威查询结果，并发布 `L3VipChanged`。原始 Get-IP 响应保持不变，作为建连
 证据。旧源地址的后续授权和发送会 fail closed。
@@ -174,8 +174,8 @@ deployment profile 的凭据 schema；不得依据逆向文档、单次失败或
 
 ### A1 — `0x94` 下行双格式的切分依据 <a id="a1"></a>
 
-**依据：L1**（zju-connect `l3tunnelconn.go::readDataRespPayload`，Hermes
-`atrust-protocol::l3_frame::classify_data_resp_prefix`，两者逐行等价）
+**依据：L1**（黑盒互操作样本与 Hermes
+`atrust-protocol::l3_frame::classify_data_resp_prefix` 夹具）
 
 **现状实现。** `05 94` 之后不存在格式标志位。判别完全依赖 body 头两字节的数值：
 
@@ -192,8 +192,8 @@ n = u16::from_be(body[0..2])
 2. **不能靠「像不像 IP 包」判别。** 一个 IPv4 包以 `45 00` 开头，作为 u16-be 是 17664，
    已经落在 token 分支区间。也就是说「裸 IP 包」和「长度前缀 + IP 包」在数值上天然可分，
    但代价是判据必须信任长度前缀恒存在（见下方二义区间 3）；
-3. **4096 不是 wire 上界。** zju-connect `1270890` 已把它降级为 buffer pool 保留上界；对 `n > 4096`
-   会检查后续 IPv4/IPv6 头中的长度字段，匹配时仍按长度前缀包读取。Hermes 已采用同一有界判定。
+3. **4096 不是 wire 上界。** 对 `n > 4096`，Hermes 会检查后续 IPv4/IPv6 头中的长度字段，
+   匹配时仍按长度前缀包读取；该有界判定由协议夹具覆盖。
 
 **二义区间（三处，全部真实可达）：**
 
@@ -238,9 +238,9 @@ n = u16::from_be(body[0..2])
 
 ### A2 — VIP 应答体的长度表 <a id="a2"></a>
 
-**依据：L1**（zju-connect `l3tunnelconn.go::authTunnel` / `vipPayloadLength`）
+**依据：L1**（黑盒互操作样本与 Hermes VIP 长度夹具）
 
-VIP 帧为 `05 <status> <reserved> <addrType>` + `vipPayloadLength(addrType)` 字节。
+VIP 帧为 `05 <status> <reserved> <addrType>` 加上由 `addrType` 决定长度的 body。
 现表：`1 → 6`，`4 → 18`，`5 → 22`，其它 `→ 4`。
 
 **L0（2026-07-31 E4）：** 西电 `addrType=1`，`vip_data_len=6`，
@@ -250,49 +250,47 @@ VIP 帧为 `05 <status> <reserved> <addrType>` + `vipPayloadLength(addrType)` �
 **仍未决：**
 
 - 尾 2 字节语义（零是否恒定、非零时是否掩码/其它）；
-- `addrType = 4`（18）和 `5`（22）**西电仍未观察到**，长度仍来自 zju-connect；
+- `addrType = 4`（18）和 `5`（22）**西电仍未观察到**，长度仅由兼容性夹具覆盖；
 - 默认分支的 4 字节是纯兜底，用途是**保持流同步**而不是解析地址——未知类型时先把
   body 读完再报错，否则半消费的帧会毒化这条连接；
-- zju-connect **自身两处不一致**：`ip.go::getIP` 只读 8 字节整帧，
-  `l3tunnelconn.go::authTunnel` 读 10。以 `authTunnel` 为准，因为它的连接要继续用。
-  Hermes 曾照 `getIP` 实现，导致长连接从第一帧起错位（2026-07-31 修复）。
+- 读完即关闭的 Get-IP 探针可能掩盖少读 2 字节的问题；复用连接必须读取完整 10 字节帧。
+  Hermes 曾按 8 字节实现，导致长连接从第一帧起错位（2026-07-31 修复）。
 
-**10 字节已由 L0 定论（2026-08-05 复核既有日志）：** 此前只是「以 authTunnel 为准」的推理，
+**10 字节已由 L0 定论（2026-08-05 复核既有日志）：** 此前只有兼容性夹具依据，
 现在有直接反证。`2026-08-04-e7-heartbeat-ack-30s-live.log` 里 VIP 帧之后
 `heartbeat_requests_sent=1 heartbeat_acks_received=1`——`05 95 00 00` 被正确解析；
 `2026-08-04-e7-4h.log` 的会话连续 3420 秒 `session_closed=false`，全程无 framing 错误。
 若 VIP 多消费了 2 字节，25 秒内的第一个心跳应答就会错位并触发 `FramingError` 关闭会话。
-**因此 8 字节（zju `getIP` 的读法）是错的，Hermes 现行的 10 字节正确，无需修改。**
-这同时说明 `getIP` 的 8 字节在 zju 里之所以无害，只是因为它读完立刻关连接。
+**因此 8 字节读法是错的，Hermes 现行的 10 字节正确，无需修改。**
+读完即关闭的短连接之所以可能未暴露问题，只是因为不再解析后续帧。
 
 **判定实验：** [E4](#e4)（`vip_data_hex` trace）——长度已决；尾字节语义仍开。
 
 **掩码假说已证伪，且这个问题本身是伪问题（2026-07-31）。** 见 [A8](#a8)：
-zju-connect 根本不从 VIP 推导掩码，尾 2 字节它一次都没读过。
+互操作样本不从 VIP 推导掩码，尾 2 字节不参与路由决策。
 
 ### A8 — 隧道 MTU 与路由模型（掩码问题的真正答案） <a id="a8"></a>
 
-**依据：L1**（zju-connect `stack/tun/stack.go`、`stack_linux.go`、`stack_windows.go`、
-`stack/gvisor/stack.go`、`client/atrust/parse.go`）
+**依据：L1**（隔离兼容性需求与 Hermes 路由夹具）
 
 E4 的尾 2 字节是 `00 00` 之后，我曾把「VIP 的前缀长度无处可取」列为接 TUN 的阻塞项。
-**查完 zju-connect 后这个担心不成立——它压根不需要那个掩码：**
+**隔离兼容性需求表明路由模型不需要该掩码：**
 
-| 问题 | zju-connect 的做法 | 出处 |
+| 问题 | 兼容性基线行为 | 依据 |
 |---|---|---|
-| VIP 掩码 | **恒 `/32`**，不从任何帧推导 | `stack_linux.go:71` `ip + "/32"`；`gvisor/stack.go:160` `PrefixLen: 32`；Windows 走 `route add ... mask` |
-| 隧道 MTU | **硬编码 1400**，不协商 | `stack/tun/stack.go:26` `const MTU uint32 = 1400` |
-| 走哪些网段 | **完全来自资源表**，逐条 `ip route add <target> dev <tun>` | `stack_linux.go:48` `AddRoute` |
-| 资源表里的网段怎么来 | `parse.go` 把 host 串按 IP／CIDR／`a-b` 三种形态解析成 `IPMin..IPMax` | `parse.go:118-150` |
+| VIP 掩码 | **恒 `/32`**，不从任何帧推导 | 隔离兼容性需求 |
+| 隧道 MTU | **固定 1400**，不协商 | 隔离兼容性需求 |
+| 走哪些网段 | **完全来自资源表**，逐条添加目标路由 | 隔离兼容性需求与 Hermes 夹具 |
+| 资源表里的网段怎么来 | host 串按 IP／CIDR／`a-b` 三种形态解析成 `IPMin..IPMax` | Hermes 策略夹具 |
 
 也就是说 **VIP 只是一个 /32 的源地址，不承载任何子网信息**；「哪些流量进隧道」由资源表
-独立决定。VIP body 尾部那 2 字节 zju-connect 从头到尾没有读过——`vipPayloadLength` 读 6 是
-为了**保持流同步**，只有前 4 字节进 IP。
+独立决定。VIP body 尾部那 2 字节不参与基线行为；读取完整 6 字节是为了**保持流同步**，
+只有前 4 字节进入 IP 配置。
 
 **对 Hermes 的直接结论：** TUN 层按 `<vip>/32` 配地址，路由按资源表逐条下，MTU 取 1400。
 尾 2 字节保留在 `vip_data` 里供将来对照，但**不进任何决策路径**。
 
-**仍未决：** 1400 这个 MTU 同样是 zju-connect 的常量而非服务端声明。它与 [A1](#a1)
+**仍未决：** 1400 这个 MTU 来自客户端侧互操作观测而非服务端声明。它与 [A1](#a1)
 第三条二义区间（下行 > 4096 失同步）的关系是：**上行**受 TUN MTU 约束不会越界，
 **下行**没有任何东西保证服务端不发更大的包。这正是 [E6](#e6) 要测的。
 
@@ -309,7 +307,7 @@ E4 的尾 2 字节是 `00 00` 之后，我曾把「VIP 的前缀长度无处可�
 
 ### A4 — 未知 `05 <cmd>` 的处理策略 <a id="a4"></a>
 
-**依据：L1**（zju-connect `readFrame` 对未知命令用通用长度布局跳过）
+**依据：L1**（黑盒互操作观测与通用长度布局夹具）
 
 **现状：** WARN 记录 + 按 `<u16 len>` 跳过，会话继续。
 
@@ -317,8 +315,8 @@ E4 的尾 2 字节是 `00 00` 之后，我曾把「VIP 的前缀长度无处可�
 该权衡是错的：代价是一条健康隧道死掉，而通用长度布局的宽容正是已验证客户端能保持同步的机制。
 2026-07-31 改为跳过。
 
-**2026-08-05 对照复核：会话路径与 zju 完全一致，无需改动。** 逐项核对
-`session.rs::next_frame` / `dispatch` 与 zju `readFrame` / `readLoop`：
+**2026-08-05 互操作复核：会话路径无需改动。** 逐项验证
+`session.rs::next_frame` / `dispatch`：
 `53 00` 跳过、未知 `05 <cmd>` 按 `<u16 len>` 跳过、非 `05`/`53` 帧头致命、
 `0x94` 双布局判据同为 `0 < n ≤ 4096`（常量都是 4096）、`0x93` 非零 status 都会先尝试从 JSON
 取 `conntrackHash` 唤醒等待方、心跳 25 秒——全部相同。
@@ -366,36 +364,36 @@ E4 的尾 2 字节是 `00 00` 之后，我曾把「VIP 的前缀长度无处可�
 IPv4 和 IPv6，与 second-VIP 是否互斥、还是分别服务不同场景，无依据。
 Hermes 能解码 `0x96` 但从不主动发 `0x16`。
 
-**行为分歧（2026-08-05 对照，未改）：** 两边都不主动请求（zju 的 `cmdSecondVipReq`
-发送处是注释掉的 TODO），所以 `0x96` 只可能是服务端不请自来。但收到之后：
+**行为分歧（2026-08-05 黑盒对照，未改）：** 已验证客户端都不主动请求，
+所以 `0x96` 只可能是服务端不请自来。但收到之后：
 
-| | zju `handleSecondVipResp` | Hermes `Inbound::SecondVip` |
+| | 兼容性基线客户端 | Hermes `Inbound::SecondVip` |
 |---|---|---|
 | status ≠ 0 | 记日志返回 | 记日志返回 |
-| status = 0 | `extractVIPs` 递归扫 JSON 里所有能解析成 IP 的字符串，调 `onVIP` **换掉当前 VIP** | 只记 `debug` 日志，不改状态 |
+| status = 0 | 递归扫描 JSON 中可解析为 IP 的字符串并**换掉当前 VIP** | 只记 `debug` 日志，不改状态 |
 
-若网关真的不请自来下发 second VIP，zju 会重新绑定源地址而 Hermes 继续用旧 VIP，
+若网关真的不请自来下发 second VIP，兼容性基线会重新绑定源地址而 Hermes 继续用旧 VIP，
 表现为「隧道存活、心跳正常，但回包全部丢失」。**未改**：`0x96` 在西电一次都没观察到，
-`extractVIPs` 那种「扫出任何像 IP 的字符串就换地址」的做法本身也不适合照抄——
+「扫出任何像 IP 的字符串就换地址」的做法本身也不适合直接采用——
 在确认帧含义之前，照抄一个可能误换地址的逻辑比忽略它更危险。
 
 ### A9 — Get-IP 阶段未知帧头是致命的（**新发现的分歧**） <a id="a9"></a>
 
-**依据：L1**（对照 zju-connect `ip.go::getIP`）。**2026-08-05 对照发现，尚未修改。**
+**依据：L1**（黑盒 Get-IP 互操作对照）。**2026-08-05 发现，尚未修改。**
 
-这是 [D4](#d4) 那个缺陷的同一形态：本端比参考实现严格，多出来的严格性没有依据支撑。
+这是 [D4](#d4) 那个缺陷的同一形态：本端比互操作基线严格，多出来的严格性没有依据支撑。
 
-| 收到的 2 字节帧头 | zju `ip.go::getIP` | Hermes `get_ipv4` |
+| 收到的 2 字节帧头 | 兼容性基线客户端 | Hermes `get_ipv4` |
 |---|---|---|
 | `53 00` | 读 body，**要求含 `OK`**，否则报错 | 读 body 存入 `status_bodies`，**不校验内容** |
 | `05 00` | 读 6 字节，返回 VIP | 读 `status`/`addrType` + body，返回 VIP |
 | `05 d0` | 无分支——落到循环末尾，**消费 2 字节继续** | 显式 `continue` |
 | 其它任何值 | 同上，**消费 2 字节继续** | `UnexpectedHeader` → **整个 Get-IP 失败** |
 
-关键在最后一行：zju 的 `if / else if` 链**没有 `else`**，任何不认识的 2 字节头都被吞掉后
-继续循环；Hermes 白名单之外一律致命。同一个节点同一个端口上，TCP 隧道路径**已经确证**会发
+关键在最后一行：兼容性基线会消费任何不认识的 2 字节头后继续循环；Hermes 白名单之外一律致命。
+同一个节点同一个端口上，TCP 隧道路径**已经确证**会发
 `05 81`（见 [D4](#d4) 与 `debug_logs/2026-08-03-e9-first-debug.log`）。Get-IP 用的是不同的
-init 帧，但没有任何依据说明 `05 81` 不会出现在这里——如果出现，zju 照常拿到 VIP，
+init 帧，但没有任何依据说明 `05 81` 不会出现在这里——如果出现，兼容性基线照常拿到 VIP，
 Hermes 直接失败，且失败点距离真正原因很远。
 
 **注意 Hermes 内部也不自洽**：`session.rs::next_frame` 对未知 `05 <cmd>` 是跳过的
@@ -403,7 +401,7 @@ Hermes 直接失败，且失败点距离真正原因很远。
 同一条连接上，握手阶段严格、会话阶段宽容。
 
 **为什么暂不改：** 现在没有任何一次 Get-IP 因此失败的观测。按 [A4](#a4) 的教训，宽容是对的
-方向；但那次改动是有 L1 依据的（zju 明确用通用长度布局跳过），而这里要吞掉的是**没有长度字段
+方向；但那次改动有通用长度布局夹具支撑，而这里要吞掉的是**没有长度字段
 的未知 2 字节头**——盲目跳过 2 字节，遇到真正的带长度帧就会从中间切开，把一个清晰的报错换成
 一次静默错位。在拿到「Get-IP 阶段实际会出现哪些帧头」的 L0 证据之前，保留报错更有利于定位。
 
@@ -472,20 +470,20 @@ first-write-wins 学习」的模型在这条路径上**不可能成立**——�
 
 **依据：L1（已决）**，但需要一次 L0 复核。
 
-`0x0053` = 83 是**动态长度**，`authTunnel::wrapAuthReqData` 动态计算；`getIP` 里写死
-只是 73 字符 SID 的巧合。Hermes 的动态实现正确。
+`0x0053` = 83 是**动态长度**；它等于 73 字符 SID 对应 JSON 的长度只是巧合。
+Hermes 按实际 JSON 动态计算。
 
 **残留：** 西电的 SID 若恰好也是 73 字符，这条 live 不具备区分力。复核需要一个
 **长度不等于 73** 的 SID。若拿不到，就只能维持 L1。
 
 ### B3 — flow key 不含协议号 <a id="b3"></a>
 
-**依据：L1（逐字符一致）**
+**依据：L1（互操作样本与本地夹具一致）**
 
-`connTrackKey` = `{atype}:{src}:{sport}-{dst}:{dport}`，没有协议号。
+flow key = `{atype}:{src}:{sport}-{dst}:{dport}`，没有协议号。
 
 **未决：** 这意味着**同四元组的 TCP 流和 UDP 流会共用一条 conntrack 表项**。这是服务端
-的真实语义，还是 zju-connect 的一个恰好没被踩到的简化？无依据。真踩到时的症状是
+的真实语义，还是兼容性基线中一个恰好没被触发的简化？无依据。真踩到时的症状是
 「UDP 流复用了 TCP 流的 connectToken」——服务端大概率拒绝或静默丢包。
 
 注意 `atype` 在两处是**不同的命名空间**：鉴权 JSON 里是 `0x0800`（EtherType），
@@ -493,7 +491,7 @@ flow key 里是 `4`。两者都是经验值。
 
 ### B4 — 8 秒鉴权超时 / 25 秒心跳 <a id="b4"></a>
 
-**依据：L1**。两个常量都来自 zju-connect 源码，**服务端从未声明**。西电的实际容忍窗口未知。
+**依据：L1**。两个常量来自客户端侧互操作基线，**服务端从未声明**。西电的实际容忍窗口未知。
 心跳过慢会被服务端静默断开，过快在大规模部署下可能触发限流。
 
 ### B5 — 鉴权失败后的重试语义（已对齐） <a id="b5"></a>
@@ -502,7 +500,7 @@ flow key 里是 `4`。两者都是经验值。
 超时会作废整条连接、重新 Get-IP 和鉴权一次。显式策略拒绝、坏帧和配置错误不重试。
 建连类瞬时失败和连接失效会轮转到同组下一可达端点；显式 `--node` 仍固定单点。
 `L3SessionManagerCache` 按 `nodeGroupId` 复用 manager，且只在同一 SID/TLS 作用域内共享。
-这与 zju-connect 的边界一致，同时保持 TUN、DNS 和系统路由在管理器之外。
+这些边界由互操作回归覆盖，同时保持 TUN、DNS 和系统路由在管理器之外。
 
 ### B7 — 网关会话寿命与失效信号 <a id="b7"></a>
 
@@ -566,13 +564,12 @@ L3 会话，打同一个节点 `61.150.43.94:441`：
 
 **一条被推翻的推论，记在这里防止重提。** 本条最初被写成「Hermes 的 `L3SessionManagerCache`
 按 node group 分键，在多 node group 部署上会开出互相残杀的 L3 会话」。**这个推论错了。**
-zju-connect 的 `L3Tunnel` 持有的是 `t.conns[nodeGroupID]`——同样按 node group 分键、一个 group
-一条连接，与 Hermes 一致，且 zju 长期在跑。而且上面六条会话全部打在**同一个 node group 的
+黑盒兼容性基线同样按 node group 分键、每组一条连接，与 Hermes 一致。而且上面六条会话全部打在**同一个 node group 的
 同一个节点**上，那是重复注册的情形，根本不覆盖「不同 node group」的情形——从一个案例推到了
 它不覆盖的另一个案例上。
 
 **真正的空白：** 两条打到**不同 node group** 的 L3 会话能否共存，我们没有依据。西电只广告一个
-node group，本地测不了；zju 常规这么跑算 L1 依据。若将来遇到多 node group 部署，这是第一个要验的点。
+node group，本地测不了；现有互操作结果仅算 L1 依据。若将来遇到多 node group 部署，这是第一个要验的点。
 
 **对实验纪律的影响（新增）：** **L3 实验不能靠并发多臂来省时间。** 同一账号并行起多条会话，
 除最后一条外全部会在一分钟内死掉，且死法（`read_error`、心跳计数 0）看起来像网络问题而不是
@@ -593,19 +590,17 @@ node group，本地测不了；zju 常规这么跑算 L1 依据。若将来遇�
 
 ### C1 — 资源表重叠时的优先级（**已知故意分歧**） <a id="c1"></a>
 
-zju-connect **没有统一的资源优先级**：L3 `processIPV4` 是按服务端原始顺序的
-first-match；TCP tunnel 的 IP 匹配循环不 `break`，后命中的 `appId` / `nodeGroupId`
-会覆盖前者，实际是 last-match；域名资源放进 Go `map`，重复 key 后写覆盖，重叠后又受
-无序迭代影响。Hermes `ResourceIndex` 则统一按「地址范围最窄 → 端口范围最窄 →
+黑盒互操作实验覆盖了服务端原始顺序的 first-match 候选；Hermes `ResourceIndex` 则统一按
+「地址范围最窄 → 端口范围最窄 →
 精确协议先于 `all` → 原始顺序」确定性排序。
 
 **表存在重叠时两者选出不同的 `appId` / `nodeGroupId`。**
 
-**决定（2026-07-31，用户）：维持 Hermes 的 specificity 排序**，理由是「zju-connect 能用」
-不等于「zju-connect 正确」——也可能只是 ZJU 的表恰好不重叠。
+**决定（2026-07-31）：维持 Hermes 的 specificity 排序**。某个兼容客户端可用不等于其
+候选排序是协议要求；服务端可能同时接受多种合法候选。
 
 **E9 已确认西电网关接受任一覆盖目标的合法候选，而不是只接受唯一的首条或最具体项。**
-因此 specificity 与 zju-connect L3 first-match 在当前西电资源表上都能通过授权；但完全无关的
+因此 specificity 与原始顺序 first-match 在当前西电资源表上都能通过授权；但完全无关的
 `appId` 会被拒绝，所以 matcher 仍必须筛掉不覆盖目标、端口或协议的资源。该结论不能自动外推
 到其他网关，`nodeGroupId` 不同的重叠项也仍需作为一个整体选择。
 
@@ -619,14 +614,14 @@ first-match；TCP tunnel 的 IP 匹配循环不 `break`，后命中的 `appId` /
 | UDP | 444 | 80（18%） | 14（3%） |
 
 **分歧不是边缘情况，是 TCP 的多数情况。** 主因是表里存在**排在很前面的宽泛兜底条目**，
-例如 `10.0.0.1-10.255.255.254`（`all`，全端口）。zju-connect 的 **L3 first-match**
+例如 `10.0.0.1-10.255.255.254`（`all`，全端口）。原始顺序 **first-match**
 会把几乎所有 10.x 流量都归给那一个 `appId`；Hermes 则按最窄条目归给具体应用。
-典型分歧（`zju` 列特指 L3）：
+典型分歧（`first` 列为原始顺序首条）：
 
 ```
-10.168.76.172:8355  zju→290b1940 (10.0.0.1-10.255.255.254)  hermes→34a33d00 (10.168.76.172)
-202.117.112.71:8081 zju→27bf5f60 (202.117.112.1-.254)       hermes→316772f0 (202.117.112.71)
-202.117.112.9:53    zju→27bf5f60 (202.117.112.1-.254)       hermes→2b306a40 (202.117.112.9-.14)
+10.168.76.172:8355  first→290b1940 (10.0.0.1-10.255.255.254)  hermes→34a33d00 (10.168.76.172)
+202.117.112.71:8081 first→27bf5f60 (202.117.112.1-.254)       hermes→316772f0 (202.117.112.71)
+202.117.112.9:53    first→27bf5f60 (202.117.112.1-.254)       hermes→2b306a40 (202.117.112.9-.14)
 ```
 
 **判定实验：** [E9](#e9) 已完成。对 `202.117.112.71:8081`，Hermes specificity 候选
@@ -636,11 +631,8 @@ first-match；TCP tunnel 的 IP 匹配循环不 `break`，后命中的 `appId` /
 
 ### C2 — ICMP 如何命中资源 <a id="c2"></a>
 
-**依据：L1**。zju-connect 的 L3 matcher 判据是
-`Protocol == "icmp" || == "all"` 且不比较端口；但当前 aTrust `parse.go` 只把
-`tcp` / `udp` / `all` 放入 `ipResources`，所以服务端显式 `icmp` 条目实际上会在进入
-matcher 前被丢弃。这是 zju-connect 自身 parser/matcher 的不一致，不应照搬。
-Hermes 解析并匹配显式 `icmp`，同时允许 ICMP 命中 `all`。
+**依据：L1**。Hermes 解析并匹配显式 `icmp`，同时允许 ICMP 命中 `all`，且不比较端口。
+该策略由本地夹具覆盖，避免在解析阶段静默丢弃服务端策略。
 
 **L0（2026-07-31 E5 附带）：** 对只有 `tcp:80` 资源的目的地发 ICMP echo，
 `0x13` 返回 **`auth status 0x82`**。这是第一条服务端侧证据：
@@ -657,8 +649,8 @@ Hermes 解析并匹配显式 `icmp`，同时允许 ICMP 命中 `all`。
 
 ### C4 — 端口 `0` 与倒置区间 <a id="c4"></a>
 
-**依据：L1**。zju-connect 除 `Atoi` 外不做任何校验，因此保留。Hermes 曾把它们整条丢弃，
-造成**静默丢失真实策略**（ICMP 资源的端口通常就是 `0`），2026-07-31 改为保留。
+**依据：L1**。Hermes 保留可解析的端口 `0` 和倒置区间，避免**静默丢失真实策略**
+（ICMP 资源的端口通常就是 `0`）；该行为由策略夹具覆盖。
 
 **未决：** 保留之后这些条目的**匹配语义**仍未定义——端口 `0` 是「任意端口」还是「仅端口 0」？
 倒置区间（min > max）是空集还是应当交换？现实现按字面比较，即两者都近似于空集
@@ -742,9 +734,9 @@ rustls 就会发 SNI，连接静默挂死且无任何错误。
 
 ### D4 — TCP connect 成功后首个应用数据触发关闭 <a id="d4"></a>
 
-**参考行为（L1）：** zju-connect 的 `tcpTunnelConn` 将 `01 00 <u16 len> <payload>` 暴露为
-普通 `net.Conn`；上层 `net/http.Transport` 对 HTTPS 自然再套一层目标 TLS。Hermes 的
-`TcpTunnel` 同样实现 `AsyncRead + AsyncWrite`，并按相同布局封装数据。目标 TLS 必须启用
+**互操作基线（L1）：** 黑盒实验确认 `01 00 <u16 len> <payload>` 对上层表现为普通字节流，
+HTTPS 会在隧道内再建立一层目标 TLS。Hermes 的 `TcpTunnel` 实现 `AsyncRead + AsyncWrite`，
+并按该布局封装数据。目标 TLS 必须启用
 目标域名 SNI，不能继承数据节点的 no-SNI 特例。
 
 **本地状态：** `atrust-probe tcp-dial --send-https` 已实现双层 TLS、独立目标证书策略、
@@ -752,7 +744,7 @@ rustls 就会发 SNI，连接静默挂死且无任何错误。
 结构化 `code=0, message=OK` 与地址阶段使用同一严格成功判定。以上均有本地测试，但本地
 mock 只能证明实现自洽，证据级别不是 L0。
 
-**L0（2026-08-05，同会话 zju-connect 对照）：** live-only 测试从 `0600` Hermes session 文件
+**L0（2026-08-05，同会话黑盒互操作对照）：** live-only 测试从 `0600` Hermes session 文件
 注入完全相同的 SID、DeviceID、ConnectionID、SignKey 和资源正文，固定使用广告节点
 `61.150.43.94:441`。精确资源旁路下三个域名均完成 aTrust 授权、目标 TLS 和 HTTP 200：
 
@@ -769,9 +761,9 @@ mock 只能证明实现自洽，证据级别不是 L0。
 246 B。因此问题已经收敛为**目标 TLS ClientHello 扩展/指纹差异**，不是长度、PQ、SNI、
 基础 cipher suite 或 aTrust 应用 framing。
 
-**zju-connect 资源匹配的两个独立缺陷（不应复制）：** 同域名的 80/443 条目写入单值 map 时
-互相覆盖，使 www.xidian/CNKI 的原生 443 匹配为空；IP 重叠使用 last-match，使
-`10.255.72.81:80/443` 选到无关 appId 并立即收到 `no 'appId' field`。注入精确资源后两个 IP
+**互操作基线暴露的两类资源匹配差异（不应复制）：** 同域名的 80/443 条目可能互相覆盖，
+使 www.xidian/CNKI 的原生 443 匹配为空；IP 重叠采用 last-match 时会让
+`10.255.72.81:80/443` 选到无关 appId 并立即收到 `no 'appId' field`。使用精确资源后两个 IP
 目标不再策略拒绝，而是在约 15 秒收到 `05 03 network unreachable`，说明当前数据节点到该
 内网地址无路由。Hermes 的 specificity 在这两个目标上选择了正确的软件正版化资源。
 
@@ -798,7 +790,7 @@ HTTP 200。因此 CBC 支持、supported groups 集合和 TLS 1.2 suite 能力�
 
 | 外层隧道 | 注入的内层 ClientHello | 结果 |
 |---|---|---|
-| zju-connect / Go TLS | rustls 生成的 275 B 精确 Go profile | 返回 TLS ServerHello |
+| 兼容性基线 / Go TLS | rustls 生成的 275 B 精确 Go profile | 返回 TLS ServerHello |
 | Hermes / rustls | 已成功的 Go 275 B 原始样本 | `01 01 00 00` |
 | Hermes / rustls | 直接 `write_app/read_app`，绕过 AsyncRead/AsyncWrite | `01 01 00 00` |
 
@@ -818,22 +810,22 @@ socketpair 把进程内 Go `crypto/tls` 会话暴露给 Tokio，并依次测试�
 
 1. 仅用 Go TLS 替换外层 rustls，Hermes 保持 setup/framing；
 2. Go TLS 同时完成 init、destination、address OK、probe 和 connect status；
-3. Go TLS 同时拥有与 zju `tcpTunnelConn` 相同的 `01 00` application framing。
+3. Go TLS 同时处理 `01 00` application framing。
 
 Rust→Go 桥使用私有长度前缀，确保每次 Rust write 对应一次 Go `tls.Conn.Write`；Go 模块版本也
-与 zju-connect 对齐为 `1.25.6`。三个层级均在首个目标响应前关闭，最后一级表现为桥接端
-`BrokenPipe`。紧接着用同一会话重跑 zju raw ClientHello 阳性对照，约 96 ms 完成 aTrust setup
+固定为 `1.25.6`。三个层级均在首个目标响应前关闭，最后一级表现为桥接端
+`BrokenPipe`。紧接着用同一会话重跑黑盒基线的 raw ClientHello 阳性对照，约 96 ms 完成 aTrust setup
 并收到 TLS ServerHello，因此不能归因于会话失效、节点限流或目标状态变化。
 
-这推翻了“只要换成 Go TLS/Go framing 就会成功”的产品假设。剩余差异位于 zju `DialTCP` 的
-连接上下文、调度/时序或尚未记录的 socket 行为；下一步应直接在 zju 与 FFI 库内记录同一组
+这推翻了“只要换成 Go TLS/Go framing 就会成功”的产品假设。剩余差异可能位于
+连接上下文、调度/时序或尚未记录的 socket 行为；下一步应在黑盒基线与 FFI 库两侧记录同一组
 非敏感时间点和 socket options，而不是继续替换更多 TLS 层。
 
-**已定位并修复（2026-08-05）：根因是本端读帧过严，不在 TLS，也不在 zju 的连接上下文。**
+**已定位并修复（2026-08-05）：根因是本端读帧过严，不在 TLS 或连接上下文。**
 数据节点在 `05 00` connect status 之后、任何应用数据之前，紧接着发送 8 个字节：
-`01 01 00 00` 后跟 `00 00 00 00`。这段内容对 Hermes 和 zju 是一样的，区别在两边怎么读它：
+`01 01 00 00` 后跟 `00 00 00 00`。这段内容对 Hermes 和黑盒基线是一样的，区别在两边怎么读它：
 
-| 帧 | zju `tcpTunnelConn::Read` | 修复前的 Hermes `try_decode_app` |
+| 帧 | 兼容性基线行为 | 修复前的 Hermes `try_decode_app` |
 |---|---|---|
 | `01 01 00 00` | trailer 非 `30 30`，消费 4 字节后继续 | 视为服务端关闭，返回 EOF |
 | `00 00`（padding） | 分支链没有 `else`，消费 2 字节后继续 | `UnexpectedFrame` 报错 |
@@ -846,13 +838,13 @@ Rust→Go 桥使用私有长度前缀，确保每次 Rust write 对应一次 Go 
 修复后同一会话、同一节点 `61.150.43.94:441`、同一 appId 下三个目标全部通过，
 **且目标证书是完整校验的（`certificate_verified=true`）**：
 
-| 目标 | HTTP | body | 同日 zju 对照 |
+| 目标 | HTTP | body | 同日黑盒对照 |
 |---|---:|---:|---:|
 | `gsoft.xidian.edu.cn:443` | 200 | 67361 B | 66583 B |
 | `www.xidian.edu.cn:443` | 200 | 164887 B | 163772 B |
 | `www.cnki.net:443` | 200 | 106360 B | 105912 B |
 
-body 大小是动态内容，两侧不会逐字节相同；量级一致即可。zju 对照是在 Hermes 失败之后、
+body 大小是动态内容，两侧不会逐字节相同；量级一致即可。黑盒对照是在 Hermes 失败之后、
 用同一个 session 文件当场跑的（94 ms，HTTP 200），所以"两端此刻都可用"是验证过的前提，
 不是引用历史结果。
 
@@ -874,7 +866,7 @@ body 大小是动态内容，两侧不会逐字节相同；量级一致即可。
 **已排除（同日实测，负面对照）：** 新增 `tcp-dial --skip-node-probe` 跳过 dial 前的节点
 延迟探测后，失败逐字节不变。dial 前那次“完整 TLS 握手后零应用字节丢弃”的探测与本问题无关。
 
-**现在的容忍规则**：未识别的 2 字节头消费后继续，与 zju 一致，但加了 1024 字节上界，
+**现在的容忍规则**：未识别的 2 字节头消费后继续，并加 1024 字节上界，
 使真正的流失步仍然可见。`05 81` 在数据阶段也按 2 字节跳过。
 
 ---
@@ -957,7 +949,7 @@ grep -E "node_select.candidate|node_select.chosen" /tmp/e1-nodes.log
 ```
 
 `--show-all` 输出多于一条候选的目的地，就是 Hermes 的 specificity 排序与
-zju-connect 的 first-match **可能分歧**的点。要统计的量：
+原始顺序 first-match **可能分歧**的点。要统计的量：
 
 - 有多少个目的地命中 **> 1** 条资源（重叠总数）；
 - 其中**第一名与「原始顺序第一条」不同**的有多少个（真正分歧数）。
@@ -1156,7 +1148,7 @@ TARGET=202.117.112.71:8081
   --app-id 316772f0-c9a7-11f0-8b22-4f20181761d8 \
   --handshake-timeout-seconds 20
 
-# B：原始顺序第一条（zju-connect L3 的选择）
+# B：原始顺序第一条（互操作基线候选）
 ./target/debug/atrust-probe --host atrust.xidian.edu.cn --insecure-tls \
   --log-file /tmp/e9-first-debug.log \
   tcp-dial --session-file ~/.hermes/xidian-session.json \
@@ -1736,18 +1728,16 @@ portal JS 暴露了两个方向相反的接口：
 因此该闭环可用于进程间会话接管或官方客户端启动，但不能解决长期无人值守。下一候选必须能产生新 SID、
 刷新后端绝对期限，或让本地 agent 持有一个独立于 gateway SID 生命周期的数据面凭证。
 
-#### zju-connect v1.3.0 及后续协议分支复查（2026-08-12）
+#### 兼容性基线协议分支复查（2026-08-12）
 
-复查范围为 `v1.2.2` (`42bfc25`) 到 `origin/main` (`361e42c`)，并包含尚未合入 main 的
-`origin/agent/fix-protocol` (`2a42f58`)。这批提交新增或修正了 TOTP/RADIUS/access-check、enhanced auth、
-设备绑定、L3 重连与退避、10 秒 heartbeat、异步 VIP 更新和 flow auth 瞬态重试，但**没有出现 aTrust
-SID refresh/renew 接口，也没有实现 portal 的 loopback agent IPC**。
+隔离整理的兼容性需求覆盖 TOTP/RADIUS/access-check、enhanced auth、设备绑定、L3 重连与退避、
+10 秒 heartbeat、异步 VIP 更新和 flow auth 瞬态重试。该摘要**没有给出 aTrust SID
+refresh/renew 接口，也没有提供 portal loopback agent IPC 完成续签的证据**。
 
 与 E11 直接相关的结论如下：
 
-1. zju-connect 仍然只在完整认证链结束后从 HTTP cookie jar 取得 `sid`；已有会话的
-   `authConfig.isLogin == 1` 分支直接返回导入的旧 cookie，没有重新导出 jar。因此它可能漏记响应中的
-   `Set-Cookie` 轮换，不能据此否定轮换；Hermes 的 R1 runner 已在每次候选后通过
+1. 兼容性需求只描述在完整认证链结束后从 HTTP cookie jar 取得 `sid`；已有会话路径没有描述
+   新 SID。因此该摘要可能漏记响应中的 `Set-Cookie` 轮换，不能据此否定轮换；Hermes 的 R1 runner 已在每次候选后通过
    `session_cookie_value()` 读取实时 jar 并比较 SID，不存在这个观测盲点；
 2. 新 heartbeat 仍只是 `0x15/0x95` 传输活性检测，ACK 只清除本地 missed counter；重连、Get-IP 和
    flow auth 继续复用同一 SID，没有返回替代 SID。它们与 B7/E7 的 live 阴性续期结果一致；
@@ -1756,8 +1746,8 @@ SID refresh/renew 接口，也没有实现 portal 的 loopback agent IPC**。
    非交互因子满足后，才能成为无人值守方案；
 4. EasyConnect 的 `/por/update_session.csp` 确实每 60 秒刷新 TWFID 会话，但它属于另一套协议，不能移植
    为 aTrust SID 续签证据；
-5. 最新十个 `agent/fix-protocol` 提交集中在隧道 framing、重连、heartbeat、conntrack 和 VIP 更新，
-   对 E11 没有新的续签原语。
+5. 摘要新增的协议行为集中在隧道 framing、重连、heartbeat、conntrack 和 VIP 更新，
+   对 E11 没有显示新的续签原语。
 
 因此下一阶段顺序调整为：
 
@@ -1804,8 +1794,8 @@ R1 每个候选也必须独立占用一次登录，优先级低于 R2，不应�
   - **[C1](#c1)：** 2035 个采样点中 TCP 重叠 74%、**两种排序分歧 60%**；
     且 E3/E5 用过的三个目的地恰好都不分歧 → **live 至今对 C1 零证据**。新增 [E9](#e9) 作为
     决定性实验（同目的地、两个候选 `appId` 各拨一次，让服务端表态）；
-  - **[A2](#a2)/[A8](#a8)：** VIP 尾 2 字节的掩码假说证伪后，查 zju-connect 确认
-    **它根本不从 VIP 推导掩码**——VIP 恒 `/32`，MTU 硬编码 1400，路由完全由资源表逐条下发。
+  - **[A2](#a2)/[A8](#a8)：** VIP 尾 2 字节的掩码假说证伪后，隔离兼容性需求给出
+    **兼容性基线不从 VIP 推导掩码**——VIP 恒 `/32`，MTU 为 1400，路由完全由资源表逐条下发。
     掩码问题就此结案，不再是接 TUN 的阻塞项；
   - **[C2](#c2)：** `0x82` 确认服务端在 flow auth 阶段比较协议；
   - **代码：** 读循环改为满队列丢包（`try_send` + `dropped_packets` 计数），

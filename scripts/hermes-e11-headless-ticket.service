@@ -1,13 +1,14 @@
+# Template: replace @HERMES_REPO@ with the absolute checkout path before installation.
 [Unit]
 Description=Hermes E11 headless gateway ticket exchange experiment
-Documentation=file:/home/nancunchild/projects/Hermes/docs/open-questions.md
+Documentation=file:@HERMES_REPO@/docs/open-questions.md
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/nancunchild/projects/Hermes
-ExecStart=/usr/bin/systemd-inhibit --what=sleep --mode=block --who=Hermes-E11-Headless --why=Keep_E11_headless_timeline_alive /home/nancunchild/projects/Hermes/scripts/e11-headless-ticket-renewal.sh
+WorkingDirectory=@HERMES_REPO@
+ExecStart=/usr/bin/systemd-inhibit --what=sleep --mode=block --who=Hermes-E11-Headless --why=Keep_E11_headless_timeline_alive @HERMES_REPO@/scripts/e11-headless-ticket-renewal.sh
 Restart=no
 TimeoutStartSec=infinity
 KillMode=mixed

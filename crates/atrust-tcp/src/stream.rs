@@ -7,12 +7,12 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, Re
 use tracing::debug;
 
 /// Trailer that makes an `01 01` frame the server closing the tunnel, as
-/// distinct from the `01 01 00 00` this side sends. Matches Go `tcpTunnelConn`.
+/// distinct from the `01 01 00 00` this side sends.
 const SERVER_CLOSE_TRAILER: [u8; 2] = [0x30, 0x30];
 
 /// Framed TCP tunnel after a successful handshake.
 ///
-/// Application frames match Go `tcpTunnelConn`:
+/// Application frames validated by the interoperability fixtures:
 /// - data: `01 00 <u16-be len> <payload>`
 /// - close sent by this side: `01 01 00 00`
 /// - close sent by the server: `01 01 30 30`; any other `01 01` trailer is a
@@ -135,8 +135,8 @@ fn try_decode_app(read_buf: &mut Vec<u8>) -> Result<Decode, TunnelError> {
         }
 
         // `01 01` carries a two-byte trailer, and only the ASCII "00" trailer is
-        // the server closing the tunnel. Go `tcpTunnelConn::Read` consumes every
-        // other trailer and keeps reading, and the node does send `01 01 00 00`
+        // the server closing the tunnel. Other trailers are consumed while the
+        // stream keeps reading, and the node does send `01 01 00 00`
         // ahead of the first response: treating that as EOF ends the stream just
         // before the target's data arrives.
         if h0 == 0x01 && h1 == 0x01 {
@@ -191,11 +191,10 @@ fn try_decode_app(read_buf: &mut Vec<u8>) -> Result<Decode, TunnelError> {
             continue;
         }
 
-        // The node emits a run of padding after the connect status, and Go
-        // `tcpTunnelConn::Read` walks past it: its branch chain has no final
-        // `else`, so an unrecognised two-byte header is consumed and the loop
-        // continues. Rejecting it here ended the tunnel on the node's very first
-        // response. The bound is ours, not Go's — it keeps a genuine
+        // The node emits a run of padding after the connect status. An
+        // unrecognised two-byte header is consumed and the loop continues;
+        // rejecting it ended the tunnel on the node's first response. The bound
+        // keeps a genuine
         // desynchronisation from spinning forever on buffered garbage.
         skipped += 2;
         if skipped > MAX_SKIPPED_CHATTER_BYTES {

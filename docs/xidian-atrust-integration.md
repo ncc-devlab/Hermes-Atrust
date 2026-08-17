@@ -278,8 +278,8 @@ cargo run -p atrust-probe -- --host atrust.xidian.edu.cn resource-match \
 `matched=false` 是有效结果：数据面对未命中资源的目标**必须不发**。域名目标走域名表，
 不在本地先解析——域名资源与 IP 资源可能是不同的 `appId` 和节点组（§6.4）。
 
-ICMP 不比较端口，可命中显式 `icmp` 或 `all`；zju-connect 的 matcher 虽支持前者，
-其当前 aTrust parser 却会提前丢弃显式 `icmp`，Hermes 不复制这个内部不一致。
+ICMP 不比较端口，可命中显式 `icmp` 或 `all`；Hermes 会保留并匹配显式 `icmp` 策略，
+避免在解析阶段静默丢弃。
 仍待真机确认的规则是 `*.example.edu` 是否覆盖 apex。
 
 `tcp-dial` 现在强制使用 matcher 返回的 `appId + nodeGroupId`，只在该组的端点中选节点；
@@ -304,17 +304,17 @@ DNS 或系统路由。
 
 ## 双轨实验计划
 
-### 实验一：浏览器会话交给 zju-connect 数据面
+### 实验一：浏览器会话交给独立互操作数据面
 
 `atrust-browser` 是复杂 CAS/MFA 浏览器生命周期的唯一实现。实验桥接只交付 HTTPS
 网关 origin 及完整网关 Cookie 属性，不交付 IDS Cookie、CAS/portal ticket、密码或短信码。
-zju-connect 导入 Cookie 后只能执行 `authConfig(mod=1, needTicket=false)`、`onlineInfo` 和
+黑盒兼容客户端导入 Cookie 后只能执行 `authConfig(mod=1, needTicket=false)`、`onlineInfo` 和
 `clientResource`，不得再次消费 CAS callback，也不得再次执行 `reportEnv` 或 MFA。
 
 验收顺序：
 
 1. 人工完成 IDS/CAS、滑块和 aTrust SMS，关窗后获得含 `sid` 的网关 Cookie；
-2. zju-connect 导入会话并通过 `onlineInfo`，随后解析 `clientResource`；
+2. 黑盒兼容客户端导入会话并通过 `onlineInfo`，随后解析 `clientResource`；
 3. 校内网络对 major 组的每个端点执行 TCP/TLS-only 探测，不发送 init；
 4. 调用只依赖 SID 的 Get-IP，确认 Cookie SID 与数据面会话一致；
 5. 对一个明确授权的目标建立单 TCP 隧道；L3/TUN 不在本实验中启用。
@@ -326,9 +326,9 @@ zju-connect 导入 Cookie 后只能执行 `authConfig(mod=1, needTicket=false)`�
 
 ChromeDriver 使用 `--ignore-explicit-port` 自动选择高端口，Hermes 将实际端口传给
 `cas-login --webdriver-url`。人工完成 CAS/MFA 并关窗后收割 10 个网关 Cookie，`sid`
-存在，`onlineInfo` 成功；会话以 `0600` 的一次性 zju-connect `client_data` 文件交接。
+存在，`onlineInfo` 成功；会话以 `0600` 的一次性兼容会话文件交接。
 
-zju-connect 未指定认证类型，导入后直接报告 `Already logged in`，随后成功执行
+黑盒兼容客户端未指定认证类型，导入后直接报告 `Already logged in`，随后成功执行
 `onlineInfo`、`clientResource` 和资源解析。两个数据端点的 TLS-only 结果为：
 
 - 私网端点 `:441` TCP connect 5 秒超时；
@@ -336,12 +336,12 @@ zju-connect 未指定认证类型，导入后直接报告 `Already logged in`，
 - 汇总：`attempted=2 / tcp_succeeded=1 / tls_succeeded=1`。
 
 探测后进程在 Get-IP、L3、TUN 和路由初始化前退出。该结果证明浏览器 Cookie 会话可以由
-zju-connect 接管，也证明当前网络至少存在一个可达的 Xidian aTrust 数据节点；尚未发送
+独立数据面接管，也证明当前网络至少存在一个可达的 Xidian aTrust 数据节点；尚未发送
 aTrust init 或验证 SID 数据面认证。
 
 #### SID-only Get-IP（2026-07-29）
 
-复用同一 `0600` 会话文件再次执行 Cookie adoption，`authConfig` 仍报告已登录；zju-connect
+复用同一 `0600` 会话文件再次执行 Cookie adoption，`authConfig` 仍报告已登录；兼容客户端
 重新获取资源并选择上一步可达的公网 `:441` 节点。随后只发送 SID 初始化和 Get-IP 请求，
 服务端返回 `OK` 并分配有效的 `10.x` 客户端 IPv4。
 
@@ -359,7 +359,7 @@ Hermes 原生等价探针现已接入同进程 CAS 路径。使用前先从上�
 联调时可加 `--insecure-tls` 做诊断，生产路径应改为固定 CA / 指纹，而非常态 insecure。
 
 响应侧：Xidian 可能先回 L3 method ack `05 d0`，再 `53 00 …OK` 与 `05 00` IPv4；
-`atrust-l3` 按帧循环读取，与 zju-connect Get-IP / L3 auth 行为对齐。
+`atrust-l3` 按帧循环读取，并由 Get-IP / L3 auth 黑盒互操作样本验证。
 
 ```bash
 HERMES_LOG=info cargo run -p atrust-probe -- \
@@ -380,8 +380,8 @@ HERMES_LOG=info cargo run -p atrust-probe -- \
 
 ### 实验二：Hermes 原生数据面与 L3
 
-Hermes 使用同一 `atrust-browser` 会话列出资源和节点，并以 zju-connect 的已授权协议行为
-作为对照，不共享其运行时会话。验收顺序固定为：节点解析、TLS-only、Get-IP、单 TCP、
+Hermes 使用同一 `atrust-browser` 会话列出资源和节点，并以独立黑盒客户端的互操作结果
+作为对照，不共享运行时会话。验收顺序固定为：节点解析、TLS-only、Get-IP、单 TCP、
 L3 SID 认证、单流授权、心跳与关闭，最后才是 TUN/DNS/路由。
 
 每一阶段必须有本地 mock/golden test，并将真实失败区分为 DNS、TCP、TLS、SID、设备绑定、

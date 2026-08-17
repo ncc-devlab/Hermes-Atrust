@@ -42,8 +42,8 @@ impl fmt::Debug for SessionMaterial {
 impl SessionMaterial {
     /// Builds material from a harvested gateway cookie SID and client-generated peers.
     ///
-    /// SignKey defaults to a 32-byte random key (64 hex chars), matching the Go client's
-    /// common `randHex(64)` pattern. Server registration of that key remains unconfirmed.
+    /// SignKey defaults to a 32-byte random key (64 hex chars), preserving the
+    /// validated wire shape. Server registration of that key remains unconfirmed.
     pub fn from_cookie_sid(
         sid_value: &SecretString,
         sid_cookie_name: impl Into<String>,
@@ -180,7 +180,7 @@ pub fn generate_provisional_sign_key() -> Result<SignKey, MaterialError> {
     use rand::RngCore as _;
     let mut bytes = [0_u8; 32];
     rand::rng().fill_bytes(&mut bytes);
-    // Go stores randHex(64) as the key string and uses those hex digits as key material via
+    // The wire format stores 64 random hex characters and uses those digits as key material via
     // hex decode in some paths; Hermes models SignKey as raw bytes. Prefer 32 random bytes
     // (cryptographically equivalent entropy) for HMAC.
     SignKey::from_bytes(bytes.to_vec()).map_err(MaterialError::Secret)

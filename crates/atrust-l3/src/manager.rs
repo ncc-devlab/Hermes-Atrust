@@ -677,7 +677,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_budget_matches_zju_connect_boundaries() {
+    fn retry_budget_honors_configured_boundaries() {
         let mut budget = RetryBudget::default();
         for remaining in (0..L3_CLOSED_RETRIES).rev() {
             assert_eq!(

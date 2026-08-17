@@ -4,7 +4,7 @@ set -euo pipefail
 
 umask 077
 
-REPO="${REPO:-/home/nancunchild/projects/Hermes}"
+REPO="${REPO:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}"
 PROBE="${PROBE:-$REPO/target/debug/atrust-probe}"
 RUN_DIR="${HERMES_E11_R2_RUN_DIR:-$HOME/.hermes/e11-r2}"
 PROFILE="${HERMES_E11_R2_PROFILE:-$RUN_DIR/browser-profile}"

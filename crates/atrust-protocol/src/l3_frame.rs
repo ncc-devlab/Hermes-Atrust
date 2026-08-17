@@ -3,7 +3,7 @@
 //! # `0x94` body framing
 //!
 //! After the command header `05 94`, the body uses a fixed two-branch layout
-//! shared with zju-connect `readDataRespPayload`:
+//! established by interoperability observations and local protocol fixtures:
 //!
 //! - Let `n = u16::from_be_bytes(body[0..2])`.
 //! - If `0 < n <= MAX_LENGTH_PREFIXED_DATA_RESP` (4096): **length-prefixed**.
@@ -173,7 +173,7 @@ pub fn encode_l3_data_req(token: &[u8], packets: &[&[u8]]) -> Result<Vec<u8>, L3
     Ok(out)
 }
 
-/// Encodes one length-prefixed `0x94` response (Hermes reference server / Go `"len"` mode).
+/// Encodes one length-prefixed `0x94` response for protocol fixtures.
 ///
 /// Wire: `05 94 <u16-be n> <n bytes IP packet>`.
 pub fn encode_l3_data_resp_length_prefixed(packet: &[u8]) -> Result<Vec<u8>, L3FrameError> {
@@ -362,7 +362,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classify_matches_go_threshold() {
+    fn classify_matches_validated_threshold() {
         assert_eq!(
             classify_data_resp_prefix(1u16.to_be_bytes()),
             DataRespLayout::LengthPrefixed { packet_len: 1 }

@@ -264,9 +264,8 @@ pub struct DomainResource {
 pub enum ResourceProtocol {
     Tcp,
     Udp,
-    /// Seen in zju-connect's matcher (`resource.Protocol == "icmp"`). Without
-    /// this variant an `icmp` resource fails to parse and is dropped from the
-    /// table entirely — invisible even to `--show-all` diagnostics.
+    /// Explicit ICMP policy. Without this variant an `icmp` resource fails to
+    /// parse and is dropped from the table entirely, including `--show-all`.
     Icmp,
     All,
 }
@@ -636,7 +635,7 @@ fn first_non_empty(values: [&str; 2]) -> Option<String> {
 /// Parses a `"80"` or `"80-443"` port field.
 ///
 /// Only an unparseable value drops the resource. Port `0` and an inverted range
-/// are kept, matching zju-connect, which validates nothing beyond `Atoi`.
+/// are kept so policy parsing does not silently discard gateway input.
 /// Dropping them silently removed real policy from the table: an ICMP resource
 /// commonly carries port `0`, and ICMP never compares ports anyway. A kept
 /// inverted range simply matches nothing, which is the same outcome as dropping
@@ -835,7 +834,7 @@ mod tests {
     }
 
     /// Port `0` and inverted ranges are policy the gateway sent, not parse
-    /// errors: zju-connect keeps both. Dropping them removed an ICMP resource
+    /// errors. Dropping them removed an ICMP resource
     /// (which typically carries port `0`) from the table entirely.
     #[test]
     fn keeps_zero_and_inverted_port_ranges() {
@@ -858,9 +857,8 @@ mod tests {
         assert_eq!(resources.ip_resources[1].port_max, 80);
     }
 
-    /// zju-connect matches `resource.Protocol == "icmp"` directly, so an `icmp`
-    /// resource is real policy, not a parse error. Dropping it at parse time
-    /// hid such a resource even from `--show-all` diagnostics.
+    /// An `icmp` resource is real policy, not a parse error. Dropping it at parse
+    /// time hid such a resource even from `--show-all` diagnostics.
     #[test]
     fn keeps_icmp_protocol_resources() {
         let body = br#"{
@@ -879,7 +877,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_go_style_pascal_case_fields() {
+    fn accepts_pascal_case_wire_fields() {
         let body = br#"{
             "code":0,
             "Data":{

@@ -2,8 +2,8 @@
 
 评估对象（2026-08-13 收到，不复制进仓库）：
 
-- `/home/nancunchild/Downloads/atrust-tunnel-binary-paths.md`
-- `/home/nancunchild/Downloads/atrust-protocol.md`
+- `<external-notes-dir>/atrust-tunnel-binary-paths.md`
+- `<external-notes-dir>/atrust-protocol.md`
 
 第一份给出 macOS `aTrustXTunnel` 与 Android `libsangforsdk.so` 的命名函数、地址和调用路径；
 第二份将其中 TCP/QConn 结果整理为实现约束。它们不含本项目可复现的二进制 hash、版本号、
@@ -18,7 +18,7 @@
    framed profile；L3 初始鉴权与 `0x13..0x16` command 阶段分离；各 command 的头并不统一。
 2. 给出 Hermes 之前缺少的官方客户端实现细节：QConn 独立读写状态与复用关闭；`0x84..0x87`
    flow-auth 状态；基于写活动的心跳；IPv6 事件触发的 second-VIP；大包分片。
-3. 暴露版本/profile 差异。材料中的严格 parser、prefix-only close 与西电/zju-connect 已观测的
+3. 暴露版本/profile 差异。材料中的严格 parser、prefix-only close 与西电黑盒互操作已观测的
   兼容行为冲突，必须先做版本和线路实验，不能直接“修正”当前实现。
 
 它们没有提供任何反证来扩张外部凭据集合。文档中的 tunnel auth 仍以 SID 为入口，也没有证明
@@ -68,7 +68,7 @@ profile；禁止由 payload 内容自动探测。
 ### 4. 严格 L3 parser 与兼容 parser
 
 材料中的特定 macOS/Android 版本只注册 `0x93..0x96`，遇到未知 command 或迟到 `53 00`
-会重建连接。Hermes 依据 zju-connect 接受通用长度未知帧和迟到 `53 00`，并已支持材料中没有的
+会重建连接。Hermes 依据既有互操作样本接受通用长度未知帧和迟到 `53 00`，并已支持材料中没有的
 异步 `0x97` VIP 更新。这说明至少存在客户端版本或部署 profile 差异，而不是任一文档天然正确。
 
 建议设立 `E14 l3-parser-profile`：向官方客户端的受控连接分别注入迟到 `53 00`、通用布局未知
@@ -88,7 +88,7 @@ command、状态布局未知 command 和 `0x97`，随后附合法 `0x95`，观�
 ### 6. MTU、分片与批量
 
 材料称 macOS 路径对超过 1500 字节的包先做 IP 分片，再放进可批量的 `0x14`。Hermes codec
-支持批量但不分片；现有 zju-connect 证据又给出 TUN MTU 1400。可能是版本、入口或层次差异。
+支持批量但不分片；既有兼容性样本采用 TUN MTU 1400。可能是版本、入口或层次差异。
 
 建议设立 `E16 l3-mtu-fragmentation`：测试 1400/1401/1500/1501/4096/4097 字节，记录官方
 客户端是在 TUN 前阻止、IP 分片、拆成多个 `0x14` entry，还是原样发送。TUN 实现前必须决定
@@ -104,11 +104,11 @@ MTU 和分片责任。
 
 | 外部材料主张 | 现有证据冲突 | 当前处理 |
 |---|---|---|
-| L3 数据期只接受 `0x93..0x96` | Hermes/zju 路径支持迟到 `53 00`、未知通用 frame、`0x97` | 视为版本/profile 差异，保持兼容 parser |
+| L3 数据期只接受 `0x93..0x96` | Hermes 互操作路径支持迟到 `53 00`、未知通用 frame、`0x97` | 视为版本/profile 差异，保持兼容 parser |
 | 任意 `01 01 xx xx` 都是 QConn EOF | Hermes live 兼容路径区分特定 trailer/marker | 不改 parser，先做 E13 |
-| 下行 `0x94` 始终为单包长度前缀 | zju-connect 明确还有 token-framed 分支；Hermes 已双格式测试 | 保留双格式；继续收集 L0 token 分支样本 |
+| 下行 `0x94` 始终为单包长度前缀 | 兼容性样本还包含 token-framed 分支；Hermes 已双格式测试 | 保留双格式；继续收集 L0 token 分支样本 |
 | 官方 heartbeat 只按写活动工作 | Hermes 周期 heartbeat + ACK 统计已稳定运行 | 记录差异，先做 E15 |
-| 超过 1500 字节由客户端分片 | zju TUN MTU 为 1400，Hermes 尚无 TUN | 留给 E16 和 TUN 设计 |
+| 超过 1500 字节由客户端分片 | 兼容性样本的 TUN MTU 为 1400，Hermes 尚无 TUN | 留给 E16 和 TUN 设计 |
 
 ## 验证层级与“未观察到”的含义
 

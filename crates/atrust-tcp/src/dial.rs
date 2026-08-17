@@ -20,9 +20,7 @@ use crate::target::TunnelTarget;
 /// Default budget for TCP/TLS establishment and for the aTrust handshake.
 pub const TCP_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// zju-connect may repeat one failed underlay dial after refreshing the network
-/// interface. Hermes has no interface owner, but makes the same single retry for
-/// transient failures before any application bytes can have been sent.
+/// Allow one transient underlay retry before any application bytes are sent.
 pub const TCP_DIAL_RETRIES: usize = 1;
 
 #[derive(Clone, Debug)]
@@ -223,7 +221,7 @@ where
     }
 }
 
-/// After probe: `05 <status>` where `00` is success (Go waitForTCPConnect).
+/// After probe: `05 <status>` where `00` is success.
 async fn wait_for_connect_status<S>(stream: &mut S) -> Result<(), DialTcpError>
 where
     S: AsyncRead + Unpin,

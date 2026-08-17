@@ -48,7 +48,7 @@ identifier!(
 );
 
 impl ConnectionId {
-    /// Go-compatible form: `UPPER(MD5(deviceId)) + "-" + microsecond_unix_timestamp`.
+    /// Validated wire form: `UPPER(MD5(deviceId)) + "-" + microsecond_unix_timestamp`.
     pub fn from_device(device_id: &DeviceId) -> Result<Self, IdentifierError> {
         let micros = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -103,7 +103,7 @@ mod tests {
     }
 
     #[test]
-    fn connection_id_matches_go_shape() {
+    fn connection_id_matches_validated_shape() {
         let device = DeviceId::new("device-abc").unwrap();
         let connection = ConnectionId::from_device_at(&device, 1_700_000_000_000_000).unwrap();
         let value = connection.as_str();

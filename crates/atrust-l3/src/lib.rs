@@ -36,8 +36,8 @@ pub use session::{
     L3CloseReason, L3Session, L3SessionConfig, L3SessionError,
 };
 
-/// Match zju-connect's retry boundary: five reconnects after a closed L3
-/// connection, and one fresh-connection retry after flow-auth timeout.
+/// Permit five reconnects after a closed L3 connection and one fresh-connection
+/// retry after flow-auth timeout.
 pub const L3_CLOSED_RETRIES: usize = 5;
 pub const L3_AUTH_TIMEOUT_RETRIES: usize = 1;
 

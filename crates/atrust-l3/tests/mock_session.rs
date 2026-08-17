@@ -202,7 +202,7 @@ fn spawn_peer(
             .await
             .expect("status frame");
         // Real VIP frame: `05 00 <reserved> <addrType=1>` then a SIX byte body
-        // whose first four are the IPv4 (zju-connect `vipPayloadLength`). The
+        // whose first four are the IPv4. The
         // two trailing bytes are what an 8-byte reader would leave on the wire.
         server
             .write_all(&[0x05, 0x00, 0x00, 0x01, 10, 8, 0, 7, 0xde, 0xad])
@@ -1173,7 +1173,7 @@ async fn caller_close_records_the_first_close_reason() {
 #[tokio::test]
 async fn token_framed_data_response_is_delivered() {
     // Exercises the 0x94 token branch, which the reference server does not emit
-    // but the Go client accepts.
+    // but the compatibility fixture accepts.
     let (client, mut server) = tokio::io::duplex(64 * 1024);
     let peer = tokio::spawn(async move {
         let mut prefix = [0u8; 7];
@@ -1187,7 +1187,7 @@ async fn token_framed_data_response_is_delivered() {
             .await
             .expect("address request");
         // Real VIP frame: `05 00 <reserved> <addrType=1>` then a SIX byte body
-        // whose first four are the IPv4 (zju-connect `vipPayloadLength`). The
+        // whose first four are the IPv4. The
         // two trailing bytes are what an 8-byte reader would leave on the wire.
         server
             .write_all(&[0x05, 0x00, 0x00, 0x01, 10, 8, 0, 7, 0xde, 0xad])

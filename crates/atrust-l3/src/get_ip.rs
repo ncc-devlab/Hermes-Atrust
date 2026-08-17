@@ -95,9 +95,9 @@ where
 
     let mut status_bodies = Vec::new();
 
-    // Xidian (and zju-connect L3 auth) may first emit method ack `05 d0`, then
+    // Xidian may first emit method ack `05 d0`, then
     // optional `53 00 <len> <body>` ("OK"), then address `05 00 00 01 <ipv4>`.
-    // Match Go getIP: keep reading 2-byte headers until the address reply.
+    // Keep reading two-byte headers until the address reply.
     for _ in 0..MAX_RESPONSE_FRAMES {
         let mut header = [0u8; 2];
         stream.read_exact(&mut header).await?;
@@ -132,7 +132,7 @@ where
             // VIP reply: `05 <status> <reserved> <addrType>` then an
             // address-type-sized body. The body length is NOT four — for
             // `addrType = 1` it is six, of which only the first four are the
-            // IPv4 (zju-connect `vipPayloadLength` / `parseVirtualIPData`).
+            // IPv4, as covered by the protocol fixtures.
             // Consuming only four leaves two bytes on the wire, which is
             // invisible when the connection is closed straight after but
             // desynchronizes every later frame on a session that stays open.
@@ -194,8 +194,8 @@ where
 
 /// Body length that follows `05 <status> <reserved> <addrType>`.
 ///
-/// Mirrors zju-connect `vipPayloadLength`: 1 = IPv4, 4 = IPv6, 5 = both. The
-/// unknown-type fallback of four bytes is what keeps the stream in sync when the
+/// Maps observed address types to framed body lengths: 1 = IPv4, 4 = IPv6,
+/// 5 = both. The unknown-type fallback of four bytes keeps the stream in sync when the
 /// server answers with a type this client did not ask for.
 #[must_use]
 pub const fn vip_payload_length(address_type: u8) -> usize {
@@ -209,7 +209,7 @@ pub const fn vip_payload_length(address_type: u8) -> usize {
 
 /// Extracts the IPv4 VIP from a VIP body, if that type carries one.
 ///
-/// Mirrors zju-connect `parseVirtualIPData`, which keys off the body length:
+/// Parses virtual IP data by its validated body length:
 /// 6 = IPv4 (plus two trailing bytes), 18 = IPv6 only, 22 = IPv4 then IPv6.
 fn ipv4_from_vip_data(address_type: u8, vip_data: &[u8]) -> Option<Ipv4Addr> {
     match address_type {

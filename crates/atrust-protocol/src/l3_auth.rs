@@ -51,7 +51,7 @@ impl L3IpProtocol {
 /// Five-tuple fields embedded in L3 auth JSON (`ip` object).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct L3AuthFiveTuple {
-    /// Address family wire value: Go uses `0x0800` for IPv4, `0x86DD` for IPv6.
+    /// Address family wire value: `0x0800` for IPv4, `0x86DD` for IPv6.
     pub atype: u32,
     pub protocol: L3IpProtocol,
     pub dest_addr: String,
@@ -61,9 +61,9 @@ pub struct L3AuthFiveTuple {
 }
 
 impl L3AuthFiveTuple {
-    /// IPv4 Ethernet type constant used by Go `authIPType` for non-IPv6.
+    /// IPv4 Ethernet type used by the validated auth wire format.
     pub const ATYPE_IPV4: u32 = 0x0800;
-    /// IPv6 Ethernet type constant used by Go for atype 6.
+    /// IPv6 Ethernet type constant used for atype 6.
     pub const ATYPE_IPV6: u32 = 0x86DD;
 
     /// Builds an IPv4 five-tuple (`atype = 0x0800`).
@@ -102,7 +102,7 @@ pub struct L3AuthParams<'a> {
 
 /// Builds compact signed JSON for an L3 `0x13` auth request.
 ///
-/// Field order matches Go `authRequestIP`. `url` is `{scheme}:{dest}:{port}`
+/// Field order is part of the validated wire format. `url` is `{scheme}:{dest}:{port}`
 /// without `//` (unlike TCP init's `tcp://`).
 pub fn build_signed_l3_auth_json(
     params: &L3AuthParams<'_>,
@@ -178,7 +178,7 @@ pub struct L3AuthResponse {
     pub code: i64,
     pub message: String,
     pub conntrack_hash: u64,
-    /// Prefer `connectToken`; falls back to `token` (Go parity).
+    /// Prefer `connectToken`; fall back to the compatibility field `token`.
     pub connect_token: String,
 }
 
@@ -209,7 +209,7 @@ pub fn parse_l3_auth_response(json: &[u8]) -> Result<L3AuthResponse, L3AuthError
     })
 }
 
-/// Wire DTO matching Go `authRequestIP` field order.
+/// Wire DTO preserving the validated auth request field order.
 #[derive(Serialize)]
 struct L3AuthWire<'a> {
     sid: &'a str,

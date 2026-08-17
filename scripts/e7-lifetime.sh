@@ -22,7 +22,7 @@
 #                                    2026-08-04 samples before drawing anything
 set -uo pipefail
 
-REPO="${REPO:-/home/nancunchild/projects/Hermes}"
+REPO="${REPO:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}"
 PROBE="$REPO/target/debug/atrust-probe"
 SESSION="${HERMES_SESSION_FILE:-$HOME/.hermes/xidian-session.json}"
 NODE="${HERMES_NODE:-61.150.43.94:441}"

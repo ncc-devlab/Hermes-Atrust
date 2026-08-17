@@ -4,7 +4,7 @@ set -uo pipefail
 
 umask 077
 
-REPO="${REPO:-/home/nancunchild/projects/Hermes}"
+REPO="${REPO:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}"
 PROBE="${PROBE:-$REPO/target/debug/atrust-probe}"
 RUN_DIR="${HERMES_E11_RUN_DIR:-$HOME/.hermes/e11}"
 SESSION="${HERMES_SESSION_FILE:-$HOME/.hermes/xidian-session.json}"

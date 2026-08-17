@@ -74,7 +74,7 @@ application
 每个协议模块至少需要：
 
 1. 纯单元测试；
-2. 与 Go 实现或脱敏抓包逐字节一致的 golden test；
+2. 与隔离兼容性夹具或脱敏抓包逐字节一致的 golden test；
 3. 本地模拟对端测试，包括拆包、粘包、截断、超长、超时和未知状态；
 4. 显式启用的真实对端测试。
 
@@ -105,9 +105,9 @@ cargo test --workspace
 
 以下事实未经真实对端和抓包确认前，不得当作稳定协议继续向上封装：
 
-1. ~~Go Get-IP 请求中的 `0x0053` 是否为固定值，还是应由 SID JSON 长度动态计算~~
-   **已决（2026-07-31，zju-connect 对照）：动态。** `authTunnel::wrapAuthReqData` 动态计算，
-   `getIP` 写死的 `0x0053`=83 只是 73 字符 SID 的巧合。Hermes 的动态实现正确；
+1. ~~Get-IP 请求中的 `0x0053` 是否为固定值，还是应由 SID JSON 长度动态计算~~
+   **已决（2026-07-31，互操作回归）：动态。** `0x0053`=83 只是 73 字符 SID 的巧合，
+   Hermes 按实际 JSON 长度动态计算；
 2. ~~L3 `0x94` 下行双格式判别~~（已决：body 首 `u16-be n`，`0 < n ≤ 4096` → 长度前缀，否则 token 帧；见 `atrust-protocol::l3_frame`）；
 3. ~~SignKey 是否被服务端硬校验~~ **已决（2026-08-04，E3 + E3b）：西电两条路径都不校验。**
    TCP init（E3，2026-07-31）与 L3 `0x13`（E3b）分别做过坏 key 负对照，均仍然通过；
@@ -116,22 +116,19 @@ cargo test --workspace
    仍未决的是是否存在独立注册接口，以及该结论能否外推到其他网关（见 open-questions B1）；
 4. second VIP 的请求条件和用途。addrType=5 的 VIP 帧同时带 IPv4 与 IPv6，
    `0x16`/`0x96` 是独立的 second-VIP 请求/响应对——两者关系仍未确认；
-5. ~~L3 flow key 是否必须包含协议号~~ **已决：不含。** zju-connect `connTrackKey` =
-   `{atype}:{src}:{sport}-{dst}:{dport}`，与 Hermes `FlowKey` 逐字符一致；
+5. ~~L3 flow key 是否必须包含协议号~~ **已决：不含。** 黑盒互操作样本使用
+   `{atype}:{src}:{sport}-{dst}:{dport}`，Hermes `FlowKey` 按该格式编码；
 6. ~~L3 授权 URL 应使用 `tcp:` 还是 `tcp://`~~ **已决：`tcp:`（无 `//`）。**
-   zju-connect `buildAuthRequest` 用 `protoName(proto):dstIP:dstPort`，Hermes 一致；
+   互操作样本使用 `protocol:dstIP:dstPort`，Hermes 一致；
 7. ~~资源表重叠时服务端的优先级规则~~ **西电已决（2026-08-03，E9）：任一匹配候选均可授权。**
-   zju-connect 没有统一策略：L3 `processIPV4` 按服务端原始顺序 first-match；TCP tunnel
-   的 IP 循环不 `break`，实际由 last-match 覆盖；域名资源使用 Go `map`，重复与重叠选择
-   也不稳定。Hermes 的 `ResourceIndex` 按「地址范围最窄 → 端口范围最窄 →
-   精确协议先于 `all` → 原始顺序」排序取第一名。表存在重叠时两者会选出不同的
+   黑盒互操作实验覆盖了原始顺序首条候选；Hermes 的 `ResourceIndex` 按「地址范围最窄 → 端口范围最窄 →
+   精确协议先于 `all` → 原始顺序」排序取第一名。表存在重叠时不同策略会选出不同的
    `appId`/`nodeGroupId`。E9 对同一目标测试 specificity、原始首条和无关 appId：前两者在
    TCP/L3 均通过 app 授权，无关项分别被 TCP `0x02`、L3 `0x82` 拒绝。故西电验证 appId
    是否属于匹配资源，但不强制唯一排序；Hermes 保持确定性的 specificity。该结论尚不能外推
    到其他网关或跨 node-group 的重叠项；
-8. **ICMP 如何命中资源**。zju-connect 的判据是 `resource.Protocol == "icmp" || == "all"`
-   且不比较端口，但其 aTrust parser 当前会提前过滤显式 `icmp` 条目。Hermes 同时解析并匹配
-   显式 `icmp` 与 `all`，不复制这个 parser/matcher 不一致；
+8. **ICMP 如何命中资源**。Hermes 同时解析并匹配显式 `icmp` 与 `all`，且不比较端口；
+   该规则由本地策略夹具覆盖，仍待更多网关样本确认；
 9. **域名通配符语义**。现按 `*.example.edu` 覆盖任意子域但不含 apex 实现，
    服务端是否同此仍待确认。
 
@@ -270,11 +267,11 @@ cargo run -p atrust-probe -- \
 - ~~初始化 JSON DTO、确定性签名~~（已实现）；golden vector 仍待补（与脱敏抓包逐字节）；
 - ~~IPv4/域名目标地址帧~~（已实现）；
 - ~~`05 81`、`53 00` 和 connect status 状态机~~（已实现并 live 验证）；
-- 应用数据帧已实现；同会话 zju-connect 对三个西电授权 HTTPS 目标完成 TLS + HTTP 200，证明
+- 应用数据帧已实现；同会话黑盒互操作对照对三个西电授权 HTTPS 目标完成 TLS + HTTP 200，证明
   framing 可用；Hermes 当前剩余差异是 rustls ClientHello 指纹被目标路径关闭；
 - 隧道内目标 TLS、目标 SNI/证书策略和有界多帧 HTTP 响应累计已实现并有本地测试；
 - 半关闭、服务端关闭、short-write 的对端行为测试仍待补；
-- ~~受控 HTTP 目标的真实联调~~（公网参考服务端和西电 zju 对照已完成；Hermes 目标 TLS 待换用
+- ~~受控 HTTP 目标的真实联调~~（公网参考服务端和西电互操作对照已完成；Hermes 目标 TLS 待换用
   可控 ClientHello 的后端或定位具体扩展差异）。
 
 ### L3 隧道
@@ -309,7 +306,7 @@ cargo run -p atrust-probe -- \
 ### 测试和诊断
 
 - 本地 HTTP/TLS 模拟服务器及拆包、超限和超时测试；
-- Go/Rust 认证请求逐字节 golden fixture；
+- 认证请求逐字节 golden fixture；
 - codec property test 和 fuzz target；
 - ticket 后认证和资源获取的 ignored live tests；
 - `atrust-probe` 的认证续接、资源、节点、TCP 和 L3 子命令；
