@@ -10,11 +10,15 @@ use atrust_auth::MatchedResource;
 use atrust_client::AtrustClient;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+mod dial;
 mod dns_wire;
+mod fake_ip;
 mod resolve;
 #[cfg(test)]
 mod test_support;
 mod udp;
+pub use dial::{ProxyConnector, ProxyDialer};
+pub use fake_ip::FakeIpPool;
 pub use resolve::{DnsExchange, Resolver, ResolverConfig};
 pub use udp::AtrustUdp;
 
