@@ -1353,3 +1353,40 @@ async fn stalled_write_deadline_closes_the_session() {
     );
     session.close().await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn unanswered_heartbeats_close_the_session() {
+    let (client, mut peer) = tokio::io::duplex(1024);
+    let drain = tokio::spawn(async move {
+        read_get_ip(&mut peer).await;
+        peer.write_all(&[5, 0, 0, 1, 10, 8, 0, 7, 0, 0])
+            .await
+            .unwrap();
+        let mut heartbeat = [0; 4];
+        while peer.read_exact(&mut heartbeat).await.is_ok() {}
+    });
+    let session = L3Session::start(
+        client,
+        &sid(),
+        Duration::from_secs(25),
+        GET_IP_TIMEOUT,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    for _ in 0..5 {
+        tokio::time::advance(Duration::from_secs(25)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
+    assert!(session.is_closed());
+    assert_eq!(
+        session.close_info().unwrap().reason,
+        L3CloseReason::HeartbeatTimeout
+    );
+    assert_eq!(session.heartbeat_stats().acknowledgements_received, 0);
+    session.close().await;
+    drain.await.unwrap();
+}

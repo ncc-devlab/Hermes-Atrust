@@ -52,6 +52,8 @@ use crate::packet::{Ipv4Flow, PacketError, parse_ipv4_flow};
 
 /// Heartbeat cadence validated for one L3 connection.
 pub const L3_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
+/// Close after three unanswered probe intervals; cadence remains deployment-controlled.
+pub const L3_HEARTBEAT_MISS_LIMIT: u64 = 3;
 
 /// Monotonic flow-authorization counters for diagnostics and concurrency tests.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -109,6 +111,7 @@ pub enum L3CloseReason {
     WriteError,
     FlushError,
     WriteTimeout,
+    HeartbeatTimeout,
     FramingError,
     InboundBufferLimit,
     PacketConsumerDropped,
@@ -125,6 +128,7 @@ impl L3CloseReason {
             Self::WriteError => "write_error",
             Self::FlushError => "flush_error",
             Self::WriteTimeout => "write_timeout",
+            Self::HeartbeatTimeout => "heartbeat_timeout",
             Self::FramingError => "framing_error",
             Self::InboundBufferLimit => "inbound_buffer_limit",
             Self::PacketConsumerDropped => "packet_consumer_dropped",
@@ -230,6 +234,7 @@ struct SessionShared {
     heartbeat_requests_sent: AtomicU64,
     heartbeat_acks_received: AtomicU64,
     last_heartbeat_ack: Mutex<Option<(SystemTime, Instant)>>,
+    last_heartbeat_ack_monotonic: Mutex<Option<tokio::time::Instant>>,
     /// Broadcast stop signal. Every task selects on it, so closing a session
     /// does not have to wait for a task's own timer to fire.
     stop_tx: watch::Sender<bool>,
@@ -277,6 +282,7 @@ impl SessionShared {
             heartbeat_requests_sent: AtomicU64::new(0),
             heartbeat_acks_received: AtomicU64::new(0),
             last_heartbeat_ack: Mutex::new(None),
+            last_heartbeat_ack_monotonic: Mutex::new(None),
             stop_tx: watch::channel(false).0,
             events,
             seen_length_prefixed: AtomicBool::new(false),
@@ -460,6 +466,10 @@ impl SessionShared {
         self.heartbeat_acks_received.fetch_add(1, Ordering::Relaxed);
         *self.last_heartbeat_ack.lock().expect("heartbeat ack mutex") =
             Some((SystemTime::now(), Instant::now()));
+        *self
+            .last_heartbeat_ack_monotonic
+            .lock()
+            .expect("heartbeat clock mutex") = Some(tokio::time::Instant::now());
     }
 }
 
@@ -628,17 +638,31 @@ impl L3Session {
         });
 
         let heartbeat_tx = write_tx.clone();
+        let heartbeat_shared = Arc::clone(&shared);
         let mut heartbeat_stop = shared.stop_signal();
         let heartbeat = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(heartbeat_interval);
             // The first tick fires immediately; skip it so establishing a
             // session does not put a heartbeat ahead of the caller's first auth.
             ticker.tick().await;
+            let mut first_probe_at = None;
             loop {
                 tokio::select! {
                     biased;
                     _ = heartbeat_stop.changed() => break,
                     _ = ticker.tick() => {
+                        let now = tokio::time::Instant::now();
+                        let last_ack = *heartbeat_shared.last_heartbeat_ack_monotonic
+                            .lock().expect("heartbeat clock mutex");
+                        if first_probe_at.is_some_and(|first| {
+                            now.saturating_duration_since(last_ack.unwrap_or(first))
+                                >= heartbeat_interval.saturating_mul(L3_HEARTBEAT_MISS_LIMIT as u32)
+                        }) {
+                            heartbeat_shared.shutdown(L3CloseReason::HeartbeatTimeout,
+                                "L3 peer did not acknowledge heartbeat probes");
+                            break;
+                        }
+                        first_probe_at.get_or_insert(now);
                         if heartbeat_tx.send(OutboundFrame {
                             bytes: encode_l3_heartbeat_req().to_vec(),
                             written: None,
