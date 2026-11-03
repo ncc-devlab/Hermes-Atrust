@@ -58,6 +58,9 @@ impl ClientSession {
         if *stop.borrow() {
             return Err(ClientError::Closed);
         }
+        if self.resources.is_session_invalid() {
+            return Err(ClientError::AuthenticationRequired);
+        }
         tokio::select! {
             biased;
             _ = stop.changed() => Err(ClientError::Closed),
@@ -233,6 +236,10 @@ impl AtrustClient {
     /// caches use this alongside the resource generation to reject stale state.
     pub fn session_epoch(&self) -> u64 {
         self.session_epoch.load(Ordering::Acquire)
+    }
+
+    pub async fn check_session(&self) -> Result<(), ClientError> {
+        self.active.read().await.run(async { Ok(()) }).await
     }
 
     // ---- Observation --------------------------------------------------------
@@ -777,6 +784,8 @@ fn tunnel_target(host: &str, port: u16, app_id: &str) -> TunnelTarget {
 
 #[derive(Debug, Error)]
 pub enum ClientError {
+    #[error("gateway session has expired; provide a newly authenticated session")]
+    AuthenticationRequired,
     #[error("resource requires TCP over L3; use a packet network stack")]
     L3StackRequired,
     #[error("client session has been closed or replaced")]
@@ -1281,6 +1290,41 @@ mod tests {
             Err(ClientError::L3StackRequired)
         ));
         assert!(client.node_health().await.is_empty());
+        client.shutdown().await;
+    }
+    #[tokio::test]
+    async fn invalidated_session_blocks_new_operations_until_validated_replacement() {
+        let client = client_with(vec![
+            resource_response(),
+            HttpResponse {
+                status: 200,
+                location: None,
+                body: br#"{"code":75500002,"message":"invalid","data":{}}"#.to_vec(),
+            },
+        ])
+        .await;
+        assert!(client.refresh_resources().await.is_err());
+        assert!(matches!(
+            client.check_session().await,
+            Err(ClientError::AuthenticationRequired)
+        ));
+        assert!(matches!(
+            client.dial_tcp("10.9.0.7", 80).await,
+            Err(ClientError::AuthenticationRequired)
+        ));
+        let auth = replacement_auth(vec![
+            HttpResponse {
+                status: 200,
+                location: None,
+                body: br#"{"code":0,"data":{"username":"new-user"}}"#.to_vec(),
+            },
+            resource_response(),
+        ]);
+        client
+            .replace_session(auth, configuration(), material())
+            .await
+            .unwrap();
+        client.check_session().await.unwrap();
         client.shutdown().await;
     }
 }

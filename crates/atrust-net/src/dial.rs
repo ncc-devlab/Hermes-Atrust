@@ -65,6 +65,7 @@ impl ProxyDialer {
         port: u16,
         protocol: FlowProtocol,
     ) -> io::Result<String> {
+        self.client.check_session().await.map_err(crate::io_error)?;
         let Ok(ip) = host.parse::<Ipv4Addr>() else {
             return dns_wire::normalize(host);
         };
@@ -109,6 +110,7 @@ impl ProxyDialer {
         host: &str,
         max_ttl: Duration,
     ) -> io::Result<(Ipv4Addr, Duration)> {
+        self.client.check_session().await.map_err(crate::io_error)?;
         let host = dns_wire::normalize(host)?;
         let epoch = self.client.session_epoch();
         let snapshot = self.client.resources().await;

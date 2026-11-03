@@ -72,6 +72,7 @@ impl AtrustStack {
 #[async_trait]
 impl NetworkStack for AtrustStack {
     async fn dial_tcp(&self, target: Destination) -> io::Result<TcpStream> {
+        self.client.check_session().await.map_err(io_error)?;
         // Recheck policy at the point of use. A resolved destination is a hint,
         // never an authority to override the latest server resource table.
         let host = if target.domain_resource {
@@ -113,6 +114,7 @@ impl NetworkStack for AtrustStack {
     }
 
     async fn dial_udp(&self, target: Destination) -> io::Result<Arc<dyn Datagram>> {
+        self.client.check_session().await.map_err(io_error)?;
         Ok(Arc::new(
             AtrustUdp::connect(Arc::clone(&self.client), target).await?,
         ))
@@ -120,7 +122,17 @@ impl NetworkStack for AtrustStack {
 }
 
 pub(crate) fn io_error(error: impl std::error::Error + Send + Sync + 'static) -> io::Error {
-    io::Error::other(error)
+    let kind = match (&error as &dyn std::error::Error).downcast_ref::<atrust_client::ClientError>()
+    {
+        Some(
+            atrust_client::ClientError::Unauthorized { .. }
+            | atrust_client::ClientError::AuthenticationRequired,
+        ) => io::ErrorKind::PermissionDenied,
+        Some(atrust_client::ClientError::Closed) => io::ErrorKind::ConnectionReset,
+        Some(atrust_client::ClientError::L3StackRequired) => io::ErrorKind::Unsupported,
+        _ => io::ErrorKind::Other,
+    };
+    io::Error::new(kind, error)
 }
 
 #[cfg(test)]

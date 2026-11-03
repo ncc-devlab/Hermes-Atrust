@@ -136,6 +136,7 @@ impl Resolver {
     }
 
     pub async fn lookup_with_ttl(&self, host: &str) -> io::Result<(Vec<Ipv4Addr>, Duration)> {
+        self.client.check_session().await.map_err(crate::io_error)?;
         if let Ok(ip) = host.parse() {
             return Ok((vec![ip], Duration::ZERO));
         }

@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use hermes_events::{EventBus, HermesEvent, OptionalEventBus as _};
@@ -50,6 +50,7 @@ pub struct ResourceCache {
     /// Refreshes that have failed back-to-back. Reset by any success, so a
     /// consumer can tell "one flaky request" from "this session is finished".
     consecutive_failures: AtomicU32,
+    invalidated: AtomicBool,
 }
 
 impl ResourceCache {
@@ -61,6 +62,7 @@ impl ResourceCache {
             updates,
             events: None,
             consecutive_failures: AtomicU32::new(0),
+            invalidated: AtomicBool::new(false),
         }
     }
 
@@ -75,6 +77,10 @@ impl ResourceCache {
     #[must_use]
     pub fn consecutive_failures(&self) -> u32 {
         self.consecutive_failures.load(Ordering::Relaxed)
+    }
+
+    pub fn is_session_invalid(&self) -> bool {
+        self.invalidated.load(Ordering::Acquire)
     }
 
     pub async fn load(
@@ -131,6 +137,7 @@ impl ResourceCache {
     /// resource table that can only get staler.
     async fn report_failure(&self, error: &AuthError) {
         if error.is_session_invalid() {
+            self.invalidated.store(true, Ordering::Release);
             error!(
                 event = "atrust_auth.session_invalidated",
                 error = %error,
