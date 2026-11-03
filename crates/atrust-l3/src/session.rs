@@ -108,6 +108,7 @@ pub enum L3CloseReason {
     ReadError,
     WriteError,
     FlushError,
+    WriteTimeout,
     FramingError,
     InboundBufferLimit,
     PacketConsumerDropped,
@@ -123,6 +124,7 @@ impl L3CloseReason {
             Self::ReadError => "read_error",
             Self::WriteError => "write_error",
             Self::FlushError => "flush_error",
+            Self::WriteTimeout => "write_timeout",
             Self::FramingError => "framing_error",
             Self::InboundBufferLimit => "inbound_buffer_limit",
             Self::PacketConsumerDropped => "packet_consumer_dropped",
@@ -164,6 +166,8 @@ const READ_CHUNK: usize = 16 * 1024;
 const WRITE_QUEUE_DEPTH: usize = 64;
 const AUTH_RETRY_QUEUE_DEPTH: usize = 64;
 const PACKET_QUEUE_DEPTH: usize = 256;
+const WRITE_TIMEOUT: Duration = Duration::from_secs(20);
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 struct OutboundFrame {
     bytes: Vec<u8>,
@@ -469,7 +473,7 @@ pub struct L3Session {
     shared: Arc<SessionShared>,
     write_tx: mpsc::Sender<OutboundFrame>,
     packets: AsyncMutex<mpsc::Receiver<Vec<u8>>>,
-    tasks: Mutex<Vec<JoinHandle<()>>>,
+    tasks: AsyncMutex<Vec<JoinHandle<()>>>,
 }
 
 impl L3Session {
@@ -565,25 +569,28 @@ impl L3Session {
                     _ = writer_stop.changed() => break,
                     frame = write_rx.recv() => {
                         let Some(frame) = frame else { break };
-                        if let Err(error) = write_half.write_all(&frame.bytes).await {
+                        let result = tokio::select! {
+                            biased;
+                            _ = writer_stop.changed() => break,
+                            result = timeout(WRITE_TIMEOUT, async {
+                                write_half.write_all(&frame.bytes).await
+                                    .map_err(|error| (L3CloseReason::WriteError, error))?;
+                                write_half.flush().await
+                                    .map_err(|error| (L3CloseReason::FlushError, error))
+                            }) => result,
+                        };
+                        if result.is_err() {
+                            writer_shared.shutdown(L3CloseReason::WriteTimeout, "L3 write deadline exceeded");
+                            break;
+                        }
+                        if let Err((reason, error)) = result.expect("write completed before deadline") {
                             if let Some(written) = frame.written {
                                 let _ = written.send(Err(()));
                             }
                             warn!(event = "atrust_l3.session.write_failed", %error);
                             writer_shared.shutdown(
-                                L3CloseReason::WriteError,
+                                reason,
                                 format!("L3 connection write failed: {error}"),
-                            );
-                            break;
-                        }
-                        if let Err(error) = write_half.flush().await {
-                            if let Some(written) = frame.written {
-                                let _ = written.send(Err(()));
-                            }
-                            warn!(event = "atrust_l3.session.flush_failed", %error);
-                            writer_shared.shutdown(
-                                L3CloseReason::FlushError,
-                                format!("L3 connection flush failed: {error}"),
                             );
                             break;
                         }
@@ -598,7 +605,7 @@ impl L3Session {
                     }
                 }
             }
-            let _ = write_half.shutdown().await;
+            let _ = timeout(CLOSE_TIMEOUT, write_half.shutdown()).await;
             debug!(event = "atrust_l3.session.writer_stopped");
         });
 
@@ -724,7 +731,7 @@ impl L3Session {
             shared,
             write_tx,
             packets: AsyncMutex::new(packets_rx),
-            tasks: Mutex::new(vec![writer, reader, heartbeat, retry_scheduler]),
+            tasks: AsyncMutex::new(vec![writer, reader, heartbeat, retry_scheduler]),
         })
     }
 
@@ -1037,8 +1044,16 @@ impl L3Session {
     /// acknowledgement a dead socket looks successful to callers, preventing
     /// the connection owner from performing a safe L3 retry.
     async fn write_frame(&self, bytes: Vec<u8>) -> Result<(), L3SessionError> {
+        let mut stop = self.shared.stop_signal();
+        if self.is_closed() {
+            return Err(L3SessionError::Closed);
+        }
         let (written, receiver) = oneshot::channel();
-        self.write_tx
+        tokio::select! {
+            biased;
+            _ = stop.changed() => Err(L3SessionError::Closed),
+            result = async {
+                self.write_tx
             .send(OutboundFrame {
                 bytes,
                 written: Some(written),
@@ -1046,9 +1061,11 @@ impl L3Session {
             })
             .await
             .map_err(|_| L3SessionError::Closed)?;
-        match receiver.await {
+                match receiver.await {
             Ok(Ok(())) => Ok(()),
             _ => Err(L3SessionError::Closed),
+                }
+            } => result,
         }
     }
 
@@ -1061,9 +1078,13 @@ impl L3Session {
     pub async fn close(&self) {
         self.shared
             .shutdown(L3CloseReason::Caller, "L3 session closed by caller");
-        let handles: Vec<_> = std::mem::take(&mut *self.tasks.lock().expect("tasks mutex"));
-        for handle in handles {
-            let _ = handle.await;
+        let mut handles = self.tasks.lock().await;
+        while let Some(handle) = handles.last_mut() {
+            if timeout(CLOSE_TIMEOUT, &mut *handle).await.is_err() {
+                handle.abort();
+                let _ = handle.await;
+            }
+            handles.pop();
         }
         debug!(event = "atrust_l3.session.closed");
     }
@@ -1074,10 +1095,8 @@ impl Drop for L3Session {
         // A dropped session must not leave three tasks holding a live socket.
         self.shared
             .shutdown(L3CloseReason::Dropped, "L3 session object dropped");
-        if let Ok(mut tasks) = self.tasks.lock() {
-            for handle in tasks.drain(..) {
-                handle.abort();
-            }
+        for handle in self.tasks.get_mut().drain(..) {
+            handle.abort();
         }
     }
 }

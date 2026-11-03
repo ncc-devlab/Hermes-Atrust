@@ -1306,3 +1306,50 @@ async fn v2_foreign_version_fails_closed_without_packets() {
     assert!(session.recv_packet().await.is_none());
     peer.abort();
 }
+
+async fn stalled_write_session() -> (Arc<L3Session>, DuplexStream) {
+    let (client, mut peer) = tokio::io::duplex(128);
+    let handshake = tokio::spawn(async move {
+        read_get_ip(&mut peer).await;
+        peer.write_all(&[5, 0, 0, 1, 10, 8, 0, 7, 0, 0])
+            .await
+            .unwrap();
+        peer
+    });
+    let session = L3Session::start(client, &sid(), IDLE_HEARTBEAT, GET_IP_TIMEOUT, None, None)
+        .await
+        .unwrap();
+    (Arc::new(session), handshake.await.unwrap())
+}
+
+#[tokio::test]
+async fn close_interrupts_a_blocked_write_and_wakes_senders() {
+    let (session, _peer) = stalled_write_session().await;
+    let sender_session = Arc::clone(&session);
+    let sender = tokio::spawn(async move {
+        sender_session
+            .send_packet(&"t".repeat(32), &tcp_packet(40000, 443, &[0; 4000]))
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(!sender.is_finished());
+    tokio::time::timeout(Duration::from_millis(200), session.close())
+        .await
+        .unwrap();
+    assert!(matches!(sender.await.unwrap(), Err(L3SessionError::Closed)));
+    assert_eq!(session.close_info().unwrap().reason, L3CloseReason::Caller);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_write_deadline_closes_the_session() {
+    let (session, _peer) = stalled_write_session().await;
+    let result = session
+        .send_packet(&"t".repeat(32), &tcp_packet(40000, 443, &[0; 4000]))
+        .await;
+    assert!(matches!(result, Err(L3SessionError::Closed)));
+    assert_eq!(
+        session.close_info().unwrap().reason,
+        L3CloseReason::WriteTimeout
+    );
+    session.close().await;
+}
