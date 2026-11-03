@@ -26,7 +26,9 @@
 
 mod client;
 mod config;
+mod nodes;
 mod stats;
+pub use nodes::NodeHealth;
 
 pub use client::{AtrustClient, ClientError, DialedTunnel, SentFlow};
 pub use config::AtrustClientConfig;

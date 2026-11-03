@@ -31,6 +31,9 @@ pub struct AtrustClientConfig {
     /// How often a complete `clientResource` generation is fetched. A failure
     /// keeps the previous generation; see `ResourceCache`.
     pub resource_refresh_interval: Duration,
+    /// Zero disables automatic TLS-only node measurement.
+    pub node_refresh_interval: Duration,
+    pub node_probe_timeout: Duration,
     /// Endpoint list used when `endpoint_override_node_group_id` matches.
     ///
     /// Exists because advertised order is not preference order: Xidian lists
@@ -60,10 +63,18 @@ impl AtrustClientConfig {
             heartbeat_interval: L3_HEARTBEAT_INTERVAL,
             tcp_handshake_timeout: Duration::from_secs(20),
             resource_refresh_interval: Duration::from_secs(300),
+            node_refresh_interval: Duration::from_secs(300),
+            node_probe_timeout: Duration::from_secs(3),
             endpoint_override: None,
             endpoint_override_node_group_id: None,
             lang: "en-US".to_owned(),
         }
+    }
+
+    #[must_use]
+    pub fn with_node_refresh_interval(mut self, interval: Duration) -> Self {
+        self.node_refresh_interval = interval;
+        self
     }
 
     #[must_use]

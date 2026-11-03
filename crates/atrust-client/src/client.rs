@@ -22,6 +22,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::config::AtrustClientConfig;
+use crate::nodes::{NodeHealth, NodeSelector, refresh_interval};
 use crate::stats::{ClientStats, NodeGroupStats};
 
 /// The assembled runtime: authenticated session, live resource table, node
@@ -42,6 +43,7 @@ struct ClientSession {
     material: SessionMaterial,
     resources: Arc<ResourceCache>,
     managers: Arc<L3SessionManagerCache>,
+    nodes: Arc<NodeSelector>,
     background: Mutex<Option<Background>>,
     stop: watch::Sender<bool>,
 }
@@ -64,7 +66,9 @@ impl ClientSession {
 
     async fn shutdown(&self) {
         self.stop.send_replace(true);
-        if let Some(background) = self.background.lock().await.take() {
+        if let Some(mut background) = self.background.lock().await.take() {
+            background.nodes.0.abort();
+            let _ = (&mut background.nodes.0).await;
             background.reconciler.shutdown().await;
             background.refresh.shutdown().await;
         }
@@ -77,6 +81,15 @@ impl ClientSession {
 struct Background {
     refresh: ResourceRefreshTask,
     reconciler: Reconciler,
+    nodes: NodeTask,
+}
+
+#[derive(Debug)]
+struct NodeTask(JoinHandle<()>);
+impl Drop for NodeTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// One opened TCP tunnel plus the routing decision that produced it.
@@ -162,6 +175,32 @@ impl AtrustClient {
             config.endpoint_override_node_group_id.clone(),
         );
 
+        let nodes = Arc::new(NodeSelector::new(config.clone()));
+        let node_task = {
+            let nodes = Arc::clone(&nodes);
+            let resources = Arc::clone(&resources);
+            let managers = Arc::clone(&managers);
+            let interval = refresh_interval(config.node_refresh_interval);
+            let enabled = !config.node_refresh_interval.is_zero();
+            tokio::spawn(async move {
+                if !enabled {
+                    return;
+                }
+                loop {
+                    tokio::time::sleep(interval).await;
+                    let snapshot = resources.snapshot().await;
+                    for group in &snapshot.resources().node_groups {
+                        let endpoints = nodes.endpoints(&snapshot, &group.id).await;
+                        managers.update_endpoints_for_generation(
+                            &group.id,
+                            endpoints,
+                            snapshot.generation(),
+                        );
+                    }
+                }
+            })
+        };
+
         let snapshot = resources.snapshot().await;
         info!(
             event = "atrust_client.started",
@@ -178,9 +217,11 @@ impl AtrustClient {
             material,
             resources,
             managers,
+            nodes,
             background: Mutex::new(Some(Background {
                 refresh,
                 reconciler,
+                nodes: NodeTask(node_task),
             })),
             stop: watch::channel(false).0,
         }))
@@ -259,6 +300,11 @@ impl AtrustClient {
         }
     }
 
+    pub async fn node_health(&self) -> Vec<NodeHealth> {
+        let active = self.active.read().await.clone();
+        active.nodes.health().await
+    }
+
     // ---- Data plane ---------------------------------------------------------
 
     /// Authorizes and sends one raw IPv4 packet.
@@ -298,8 +344,9 @@ impl AtrustClient {
                         destination: format!("{}:{}", flow.dst_addr, flow.dst_port),
                         protocol: flow.protocol.scheme(),
                     })?;
-                let manager =
-                    self.manager_for_snapshot(&active, &snapshot, &route.node_group_id)?;
+                let manager = self
+                    .manager_for_snapshot(&active, &snapshot, &route.node_group_id)
+                    .await?;
 
                 let process = ProcessIdentity::default_for_port(flow.dst_port);
                 let ctx = L3AuthContext {
@@ -335,13 +382,13 @@ impl AtrustClient {
     /// Endpoints come from the same generation that produced the route, so a
     /// refresh landing mid-dispatch cannot pair one generation's `appId` with
     /// another's node addresses.
-    fn manager_for_snapshot(
+    async fn manager_for_snapshot(
         &self,
         active: &ClientSession,
         snapshot: &ResourceSnapshot,
         node_group_id: &str,
     ) -> Result<Arc<L3SessionManager>, ClientError> {
-        let endpoints = self.endpoints_for(snapshot, node_group_id);
+        let endpoints = active.nodes.endpoints(snapshot, node_group_id).await;
         if endpoints.is_empty() {
             return Err(ClientError::NoEndpoints {
                 node_group_id: node_group_id.to_owned(),
@@ -352,32 +399,13 @@ impl AtrustClient {
             .manager_for_generation(node_group_id, endpoints, snapshot.generation()))
     }
 
+    #[cfg(test)]
     fn endpoints_for(
         &self,
         snapshot: &ResourceSnapshot,
         node_group_id: &str,
     ) -> Vec<L3NodeEndpoint> {
-        let override_matches = self.config.endpoint_override_node_group_id.as_deref()
-            == Some(node_group_id)
-            || (self.config.endpoint_override_node_group_id.is_none()
-                && snapshot.resources().node_groups.len() == 1
-                && snapshot.resources().node_groups[0].id == node_group_id);
-        if override_matches && let Some(override_endpoints) = &self.config.endpoint_override {
-            return override_endpoints.clone();
-        }
-        snapshot
-            .resources()
-            .resolve_node_groups(&self.config.gateway)
-            .into_iter()
-            .find(|group| group.id == node_group_id)
-            .map(|group| {
-                group
-                    .endpoints
-                    .into_iter()
-                    .map(|endpoint| L3NodeEndpoint::new(endpoint.host, endpoint.port))
-                    .collect()
-            })
-            .unwrap_or_default()
+        crate::nodes::configured_endpoints(&self.config, snapshot, node_group_id)
     }
 
     /// Establishes (or reuses) a node group's connection and returns it.
@@ -396,7 +424,8 @@ impl AtrustClient {
             .run(async {
                 let snapshot = active.resources.snapshot().await;
                 Ok(self
-                    .manager_for_snapshot(&active, &snapshot, node_group_id)?
+                    .manager_for_snapshot(&active, &snapshot, node_group_id)
+                    .await?
                     .session()
                     .await?)
             })
@@ -448,7 +477,10 @@ impl AtrustClient {
                     })?;
                 let target = tunnel_target(host, port, &route.app_id);
 
-                let endpoints = self.endpoints_for(&snapshot, &route.node_group_id);
+                let endpoints = active
+                    .nodes
+                    .endpoints(&snapshot, &route.node_group_id)
+                    .await;
                 if endpoints.is_empty() {
                     return Err(ClientError::NoEndpoints {
                         node_group_id: route.node_group_id,
@@ -1170,9 +1202,37 @@ mod tests {
             .await
             .unwrap();
         assert!(client.dial_tcp("10.9.0.7", 80).await.is_err());
-        assert_eq!(underlay.0.load(Ordering::Relaxed), TCP_DIAL_RETRIES + 1);
-        assert!(client.connect_node_group("group-1").await.is_err());
         assert_eq!(underlay.0.load(Ordering::Relaxed), TCP_DIAL_RETRIES + 2);
+        assert!(client.connect_node_group("group-1").await.is_err());
+        assert_eq!(underlay.0.load(Ordering::Relaxed), TCP_DIAL_RETRIES + 3);
+        assert_eq!(client.node_health().await.len(), 1);
+        client.shutdown().await;
+    }
+    #[tokio::test(start_paused = true)]
+    async fn failed_node_probes_are_cached_and_reconnects_back_off() {
+        let underlay = Arc::new(RefusingUnderlay::default());
+        let auth = replacement_auth(vec![resource_response(), resource_response()]);
+        let config = AtrustClientConfig::new(
+            GatewayEndpoint::new("gateway.test", 443).unwrap(),
+            TlsPolicy::Verify,
+        )
+        .with_underlay(underlay.clone());
+        let client = AtrustClient::start(auth, configuration(), material(), config)
+            .await
+            .unwrap();
+        let active = client.active.read().await.clone();
+        let snapshot = active.resources.snapshot().await;
+        active.nodes.endpoints(&snapshot, "group-1").await;
+        active.nodes.endpoints(&snapshot, "group-1").await;
+        assert_eq!(underlay.0.load(Ordering::Relaxed), 1);
+        let before = tokio::time::Instant::now();
+        for _ in 0..3 {
+            assert!(client.connect_node_group("group-1").await.is_err());
+        }
+        assert!(before.elapsed() >= std::time::Duration::from_millis(750));
+        let updated = client.refresh_resources().await.unwrap();
+        active.nodes.endpoints(&updated, "group-1").await;
+        assert_eq!(underlay.0.load(Ordering::Relaxed), 5);
         client.shutdown().await;
     }
 }

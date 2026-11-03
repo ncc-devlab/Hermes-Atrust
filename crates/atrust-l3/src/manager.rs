@@ -103,6 +103,8 @@ struct SessionState {
     /// change can be reported. A new VIP invalidates every cached flow and any
     /// interface or route configured for the old one.
     last_vip: Option<Ipv4Addr>,
+    failures: u32,
+    retry_at: Option<tokio::time::Instant>,
 }
 
 impl L3SessionManager {
@@ -162,6 +164,10 @@ impl L3SessionManager {
         if let Some(closed) = state.session.take() {
             state.last_vip = Some(closed.vip());
             closed.close().await;
+            state.retry_at = Some(tokio::time::Instant::now() + Duration::from_millis(250));
+        }
+        if let Some(retry_at) = state.retry_at {
+            tokio::time::sleep_until(retry_at).await;
         }
         let endpoints = self
             .endpoints
@@ -195,6 +201,8 @@ impl L3SessionManager {
             .await;
             match result {
                 Ok(session) => {
+                    state.failures = 0;
+                    state.retry_at = None;
                     let session = Arc::new(session);
                     state.next_endpoint = (index + 1) % endpoints.len();
                     state.session = Some(Arc::clone(&session));
@@ -220,6 +228,10 @@ impl L3SessionManager {
                 Err(error) => return Err(error.into()),
             }
         }
+        state.failures = state.failures.saturating_add(1);
+        let delay = Duration::from_millis(250)
+            .saturating_mul(1u32 << state.failures.saturating_sub(1).min(5));
+        state.retry_at = Some(tokio::time::Instant::now() + delay);
         Err(last_error
             .expect("non-empty endpoint list produced an error")
             .into())
@@ -446,6 +458,22 @@ struct CachedManager {
 }
 
 impl L3SessionManagerCache {
+    /// Applies a probe result only to an existing manager at the same or a
+    /// newer resource generation. Delayed probes never resurrect retired groups.
+    pub fn update_endpoints_for_generation(
+        &self,
+        group: &str,
+        endpoints: Vec<L3NodeEndpoint>,
+        generation: u64,
+    ) {
+        let mut cache = self.managers.lock().expect("L3 manager cache poisoned");
+        if let Some(cached) = cache.get_mut(group)
+            && generation >= cached.resource_generation
+        {
+            cached.resource_generation = generation;
+            cached.manager.update_endpoints(endpoints);
+        }
+    }
     pub fn with_default_heartbeat(
         tls_policy: TlsPolicy,
         sid: SessionId,
