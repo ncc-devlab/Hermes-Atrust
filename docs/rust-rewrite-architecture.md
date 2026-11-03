@@ -7,6 +7,7 @@
 
 ```text
 application
+  -> hermes-proxy -> atrust-net
   -> atrust-client
       -> auth / resource / discovery / tcp / l3
           -> atrust-protocol
@@ -33,15 +34,17 @@ application
 - `atrust-browser`：可复用的 WebDriver/BiDi 复杂 CAS/MFA 人工登录、网关 Cookie
   收割和全保真 trace（`0600`，见强制边界 12）；
 - `atrust-tcp`：单连接 TCP 隧道握手和帧化 I/O；
-- `atrust-l3`：Get-IP、conntrack/`connectToken`、每流 `0x13` 帧组装；全双工读循环 / TUN 未做；
+- `atrust-l3`：Get-IP、conntrack/`connectToken`、每流 `0x13`、全双工读写、心跳失联、重连 owner 和独立 flow 回包订阅；TUN 未做；
 - `atrust-client`：**装配层**。`atrust-auth` 与 `atrust-l3` 互不依赖，两者之间的接线
   （路由一个包 → 选节点组 → 拥有重连 → 保持资源表新鲜 → 让 manager 跟上每个代际）此前
   不属于任何 crate，只存在于 `atrust-probe` 的一个 match arm 里，没有第二个消费者能复用，
   也没有测试覆盖。现在它是 `AtrustClient`，并额外提供 CLI arm 给不了的三样东西：
   **观察**（一条 `hermes-events` 流）、**控制**（`refresh_resources` / `reconnect` /
-  `shutdown`）、**包入口**（`send_ipv4` / `authorize_ipv4` / `connect_node_group`）。
+  `replace_session` / `shutdown`）、**包入口**（`send_ipv4` / `authorize_ipv4` / `connect_node_group`）。
   仍然不含 TUN、DNS、路由和登录——认证由调用方完成，本类型从已认证的 `SessionMaterial` 起步；
 - `atrust-probe`：组合上述库进行真实对端诊断，不再拥有浏览器协议实现，也不再自己装配数据面。
+- `atrust-net`：统一连接适配、原生 TCP/L3 UDP、远端 DNS、域名身份与 Fake IP；TCP over L3 由宿主提供网络栈。
+- `hermes-proxy`：有界本地 SOCKS5 TCP/UDP、HTTP 和 UDP/TCP DNS 服务；`atrust-probe serve` 负责启动、会话文件接管与信号退出。详见 [`proxy-runtime.md`](proxy-runtime.md)。
 
 只有存在实际实现时才新增 crate，禁止先创建无职责的空壳模块。
 
@@ -116,8 +119,8 @@ cargo test --workspace
    仍未决的是是否存在独立注册接口，以及该结论能否外推到其他网关（见 open-questions B1）；
 4. second VIP 的请求条件和用途。addrType=5 的 VIP 帧同时带 IPv4 与 IPv6，
    `0x16`/`0x96` 是独立的 second-VIP 请求/响应对——两者关系仍未确认；
-5. ~~L3 flow key 是否必须包含协议号~~ **已决：不含。** 黑盒互操作样本使用
-   `{atype}:{src}:{sport}-{dst}:{dport}`，Hermes `FlowKey` 按该格式编码；
+5. **本地 L3 flow key 包含协议号。** 当前使用
+   `{atype}:{protocol}:{src}:{sport}-{dst}:{dport}`，避免 TCP/UDP 复用授权；本地键不直接作为 wire 字段发送，见 open-questions B3；
 6. ~~L3 授权 URL 应使用 `tcp:` 还是 `tcp://`~~ **已决：`tcp:`（无 `//`）。**
    互操作样本使用 `protocol:dstIP:dstPort`，Hermes 一致；
 7. ~~资源表重叠时服务端的优先级规则~~ **西电已决（2026-08-03，E9）：任一匹配候选均可授权。**

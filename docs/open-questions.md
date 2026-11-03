@@ -476,18 +476,13 @@ Hermes 按实际 JSON 动态计算。
 **残留：** 西电的 SID 若恰好也是 73 字符，这条 live 不具备区分力。复核需要一个
 **长度不等于 73** 的 SID。若拿不到，就只能维持 L1。
 
-### B3 — flow key 不含协议号 <a id="b3"></a>
+### B3 — 本地 flow key 必须区分协议 <a id="b3"></a>
 
-**依据：L1（互操作样本与本地夹具一致）**
+当前实现使用 `{atype}:{protocol}:{src}:{sport}-{dst}:{dport}`，本地 TCP 与 UDP 即使四元组相同也保持独立授权。对应回归见 `tcp_and_udp_with_the_same_endpoints_have_distinct_keys`。
 
-flow key = `{atype}:{src}:{sport}-{dst}:{dport}`，没有协议号。
+此前这里把兼容实现的本地键格式误写成服务端线协议要求。实际 wire 使用独立生成的数字 `conntrackHash`，鉴权五元组也显式携带协议号；本地 map key 的字符串格式不直接发送给服务端。因此无需为了兼容本地键格式而合并 TCP/UDP 状态。
 
-**未决：** 这意味着**同四元组的 TCP 流和 UDP 流会共用一条 conntrack 表项**。这是服务端
-的真实语义，还是兼容性基线中一个恰好没被触发的简化？无依据。真踩到时的症状是
-「UDP 流复用了 TCP 流的 connectToken」——服务端大概率拒绝或静默丢包。
-
-注意 `atype` 在两处是**不同的命名空间**：鉴权 JSON 里是 `0x0800`（EtherType），
-flow key 里是 `4`。两者都是经验值。
+`atype` 的两处命名空间仍然不同：鉴权 JSON 为 `0x0800`（EtherType），本地 flow key 为 `4`。
 
 ### B4 — 8 秒鉴权超时 / 25 秒心跳 <a id="b4"></a>
 
