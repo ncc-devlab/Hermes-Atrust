@@ -1421,3 +1421,31 @@ async fn changed_app_for_the_same_flow_reauthorizes_on_the_wire() {
     assert_eq!(session.conntrack_len(), 1);
     session.close().await;
 }
+
+#[tokio::test]
+async fn flow_receivers_demultiplex_replies_and_close_with_the_session() {
+    let (session, mut peer) = stalled_write_session().await;
+    let packet = tcp_packet(40000, 443, b"");
+    let flow = flow_of(&packet);
+    let mut replies = session.subscribe_flow(&flow).unwrap();
+    assert!(matches!(
+        session.subscribe_flow(&flow),
+        Err(L3SessionError::FlowAlreadySubscribed)
+    ));
+    let mut reply = packet.clone();
+    reply[12..16].copy_from_slice(&packet[16..20]);
+    reply[16..20].copy_from_slice(&packet[12..16]);
+    reply[20..22].copy_from_slice(&packet[22..24]);
+    reply[22..24].copy_from_slice(&packet[20..22]);
+    peer.write_all(&v2_data_response(&reply)).await.unwrap();
+    assert_eq!(replies.recv().await.unwrap(), reply);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), session.recv_packet())
+            .await
+            .is_err()
+    );
+    drop(replies);
+    let mut replies = session.subscribe_flow(&flow).unwrap();
+    session.close().await;
+    assert!(replies.recv().await.is_none());
+}

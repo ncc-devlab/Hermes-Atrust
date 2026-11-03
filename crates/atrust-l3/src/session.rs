@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use atrust_protocol::{
@@ -46,7 +46,9 @@ use crate::auth::{
     AuthWireDisposition, FlowAuthError, L3AuthContext, apply_auth_wire_status,
     build_flow_auth_frame, classify_auth_wire_status,
 };
-use crate::conntrack::{AuthOutcome, ConntrackTable, L3_AUTH_TIMEOUT, L3_CONNTRACK_CAPACITY};
+use crate::conntrack::{
+    AuthOutcome, ConntrackTable, FlowKey, L3_AUTH_TIMEOUT, L3_CONNTRACK_CAPACITY,
+};
 use crate::get_ip::{GetIpv4Error, GetIpv4Response, request_ipv4};
 use crate::packet::{Ipv4Flow, PacketError, parse_ipv4_flow};
 
@@ -215,6 +217,8 @@ struct SessionShared {
     /// Callers awaiting a `0x93` for a given auth id. A flow can have more than
     /// one waiter when several packets race into the same unauthorized flow.
     waiters: Mutex<HashMap<u64, Vec<oneshot::Sender<AuthOutcome>>>>,
+    packet_subscribers: Mutex<HashMap<FlowKey, (u64, mpsc::Sender<Vec<u8>>)>>,
+    next_subscriber: AtomicU64,
     closed: AtomicBool,
     close_info: Mutex<Option<L3CloseInfo>>,
     /// Inbound packets discarded because the consumer was not keeping up.
@@ -264,6 +268,8 @@ impl SessionShared {
             node_group_id,
             conntrack: Mutex::new(ConntrackTable::new()),
             waiters: Mutex::new(HashMap::new()),
+            packet_subscribers: Mutex::new(HashMap::new()),
+            next_subscriber: AtomicU64::new(1),
             closed: AtomicBool::new(false),
             close_info: Mutex::new(None),
             dropped_packets: AtomicU64::new(0),
@@ -316,6 +322,10 @@ impl SessionShared {
             .collect();
         drop(drained);
         self.auth_in_flight.store(0, Ordering::Relaxed);
+        self.packet_subscribers
+            .lock()
+            .expect("packet subscribers mutex")
+            .clear();
 
         warn!(
             event = "atrust_l3.session.vip_changed",
@@ -429,6 +439,10 @@ impl SessionShared {
             self.closed.store(true, Ordering::SeqCst);
         }
         let _ = self.stop_tx.send(true);
+        self.packet_subscribers
+            .lock()
+            .expect("packet subscribers mutex")
+            .clear();
         let cancelled = {
             let mut table = self.conntrack.lock().expect("conntrack mutex");
             let cancelled = table.scheduled_retries();
@@ -486,7 +500,68 @@ pub struct L3Session {
     tasks: AsyncMutex<Vec<JoinHandle<()>>>,
 }
 
+/// Exclusive bounded reply queue for an outbound five-tuple. Matching packets
+/// do not compete with the raw packet reader or another flow's receiver.
+#[derive(Debug)]
+pub struct FlowPackets {
+    shared: Weak<SessionShared>,
+    key: FlowKey,
+    id: u64,
+    receiver: mpsc::Receiver<Vec<u8>>,
+}
+impl FlowPackets {
+    pub async fn recv(&mut self) -> Option<Vec<u8>> {
+        self.receiver.recv().await
+    }
+}
+impl Drop for FlowPackets {
+    fn drop(&mut self) {
+        if let Some(shared) = self.shared.upgrade() {
+            let mut subscribers = shared
+                .packet_subscribers
+                .lock()
+                .expect("packet subscribers mutex");
+            if subscribers
+                .get(&self.key)
+                .is_some_and(|(id, _)| *id == self.id)
+            {
+                subscribers.remove(&self.key);
+            }
+        }
+    }
+}
+
 impl L3Session {
+    pub fn subscribe_flow(&self, flow: &Ipv4Flow) -> Result<FlowPackets, L3SessionError> {
+        let mut subscribers = self
+            .shared
+            .packet_subscribers
+            .lock()
+            .expect("packet subscribers mutex");
+        if self.is_closed() {
+            return Err(L3SessionError::Closed);
+        }
+        if flow.src_addr != self.vip() {
+            return Err(L3SessionError::VipChanged {
+                packet_source: flow.src_addr,
+                session_vip: self.vip(),
+            });
+        }
+        let key = flow.flow_key();
+        if subscribers.contains_key(&key) {
+            return Err(L3SessionError::FlowAlreadySubscribed);
+        }
+        let id = self.shared.next_subscriber.fetch_add(1, Ordering::Relaxed);
+        let (sender, receiver) = mpsc::channel(64);
+        subscribers.insert(key.clone(), (id, sender));
+        Ok(FlowPackets {
+            shared: Arc::downgrade(&self.shared),
+            key,
+            id,
+            receiver,
+        })
+    }
+
     /// Connects to a node, performs Get-IP, and starts the session on that
     /// same connection.
     pub async fn establish(config: L3SessionConfig<'_>) -> Result<Self, L3SessionError> {
@@ -1363,6 +1438,20 @@ fn deliver(
     shared: &Arc<SessionShared>,
     packet: Vec<u8>,
 ) -> Option<String> {
+    let subscriber = parse_ipv4_flow(&packet).ok().and_then(|flow| {
+        shared
+            .packet_subscribers
+            .lock()
+            .expect("packet subscribers mutex")
+            .get(&flow.reverse_flow_key())
+            .map(|(_, sender)| sender.clone())
+    });
+    if let Some(sender) = subscriber {
+        if sender.try_send(packet).is_err() {
+            shared.record_drop();
+        }
+        return None;
+    }
     match packets_tx.try_send(packet) {
         Ok(()) => None,
         Err(mpsc::error::TrySendError::Full(_)) => {
@@ -1640,6 +1729,8 @@ fn dispatch(
 
 #[derive(Debug, Error)]
 pub enum L3SessionError {
+    #[error("flow already has an exclusive packet subscriber")]
+    FlowAlreadySubscribed,
     #[error("TLS connection failed: {0}")]
     Tls(#[from] TlsConnectError),
     #[error("timed out connecting to the L3 node")]

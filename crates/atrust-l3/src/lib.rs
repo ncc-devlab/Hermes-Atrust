@@ -32,8 +32,8 @@ pub use manager::{
 };
 pub use packet::{FLOW_KEY_ATYPE_IPV4, Ipv4Flow, PacketError, parse_ipv4_flow};
 pub use session::{
-    FlowAuthStats, HeartbeatStats, L3_HEARTBEAT_INTERVAL, L3AuthRetryConfig, L3CloseInfo,
-    L3CloseReason, L3Session, L3SessionConfig, L3SessionError,
+    FlowAuthStats, FlowPackets, HeartbeatStats, L3_HEARTBEAT_INTERVAL, L3AuthRetryConfig,
+    L3CloseInfo, L3CloseReason, L3Session, L3SessionConfig, L3SessionError,
 };
 
 /// Permit five reconnects after a closed L3 connection and one fresh-connection
