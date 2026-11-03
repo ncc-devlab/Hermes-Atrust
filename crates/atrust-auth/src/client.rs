@@ -41,6 +41,10 @@ impl fmt::Debug for AuthClient {
 }
 
 impl AuthClient {
+    pub fn gateway(&self) -> &GatewayEndpoint {
+        &self.endpoint
+    }
+
     pub fn new(endpoint: GatewayEndpoint, transport: Arc<dyn HttpTransport>) -> Self {
         Self {
             endpoint,

@@ -205,6 +205,8 @@ pub enum HermesEvent {
     SessionInvalidated {
         reason: String,
     },
+    /// A validated replacement session became authoritative for new operations.
+    SessionReplaced,
 
     // ---- Node group reconciliation -----------------------------------------
     NodeEndpointsUpdated {
@@ -239,6 +241,7 @@ impl HermesEvent {
             Self::ResourcePublished { .. } => "resource.published",
             Self::ResourceRefreshFailed { .. } => "resource.refresh_failed",
             Self::SessionInvalidated { .. } => "session.invalidated",
+            Self::SessionReplaced => "session.replaced",
             Self::NodeEndpointsUpdated { .. } => "node.endpoints_updated",
             Self::NodeGroupRetired { .. } => "node.group_retired",
         }
@@ -262,6 +265,7 @@ impl HermesEvent {
             | Self::SessionInvalidated { .. }
             | Self::NodeGroupRetired { .. } => EventSeverity::Warning,
             Self::L3SessionEstablished { .. }
+            | Self::SessionReplaced
             | Self::L3FlowAuthorized { .. }
             | Self::TcpTunnelOpened { .. }
             | Self::ResourcePublished { .. }
