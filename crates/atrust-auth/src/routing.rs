@@ -212,6 +212,18 @@ struct IndexedDomain {
 }
 
 impl ResourceIndex {
+    /// Host-only policy query for DNS/Fake IP. Dialing still checks port and
+    /// protocol; this method grants no permission to send a packet.
+    pub fn domain_resources_for_host(&self, host: &str) -> Vec<&DomainResource> {
+        let Some(host) = normalize_host(host) else {
+            return Vec::new();
+        };
+        self.domain
+            .iter()
+            .filter(|entry| entry.pattern.matches(&host))
+            .map(|entry| &entry.resource)
+            .collect()
+    }
     /// Builds the index once per `clientResource` fetch.
     ///
     /// Sorting is stable, so resources of equal specificity keep the order the

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use atrust_auth::{
     AuthClient, AuthConfiguration, AuthError, FlowProtocol, MatchedResource, ResourceCache,
@@ -34,6 +34,7 @@ pub struct AtrustClient {
     events: Arc<EventBus>,
     control: Mutex<()>,
     closed: AtomicBool,
+    session_epoch: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -135,6 +136,7 @@ impl AtrustClient {
             events,
             control: Mutex::new(()),
             closed: AtomicBool::new(false),
+            session_epoch: AtomicU64::new(1),
         }))
     }
 
@@ -225,6 +227,12 @@ impl AtrustClient {
             })),
             stop: watch::channel(false).0,
         }))
+    }
+
+    /// Changes after a successful session handover. Resolver and Fake IP
+    /// caches use this alongside the resource generation to reject stale state.
+    pub fn session_epoch(&self) -> u64 {
+        self.session_epoch.load(Ordering::Acquire)
     }
 
     // ---- Observation --------------------------------------------------------
@@ -655,6 +663,7 @@ impl AtrustClient {
         let previous = {
             let mut active = self.active.write().await;
             active.stop.send_replace(true);
+            self.session_epoch.fetch_add(1, Ordering::AcqRel);
             std::mem::replace(&mut *active, next)
         };
         previous.shutdown().await;

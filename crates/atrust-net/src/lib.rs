@@ -10,9 +10,12 @@ use atrust_auth::MatchedResource;
 use atrust_client::AtrustClient;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+mod dns_wire;
+mod resolve;
 #[cfg(test)]
 mod test_support;
 mod udp;
+pub use resolve::{DnsExchange, Resolver, ResolverConfig};
 pub use udp::AtrustUdp;
 
 pub trait ByteStream: AsyncRead + AsyncWrite + Unpin + Send + Debug {}
