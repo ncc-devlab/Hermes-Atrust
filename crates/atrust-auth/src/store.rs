@@ -14,6 +14,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write as _};
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hermes_model::{ConnectionId, DeviceId, GatewayEndpoint, SecretString, SessionId, SignKey};
@@ -176,11 +177,48 @@ impl StoredSession {
 
     /// Writes the session as a single JSON document with owner-only permissions.
     pub fn save(&self, path: &Path) -> Result<(), SessionStoreError> {
-        let file = open_private(path)?;
-        let mut writer = BufWriter::new(file);
-        serde_json::to_writer(&mut writer, self).map_err(SessionStoreError::Encode)?;
-        writer.write_all(b"\n").map_err(|error| io(path, error))?;
-        writer.flush().map_err(|error| io(path, error))
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let temporary = parent.join(format!(
+            ".hermes-session-{}-{stamp}-{}.tmp",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut created = false;
+        let result = (|| {
+            let file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&temporary)
+                .map_err(|error| io(path, error))?;
+            created = true;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| io(path, error))?;
+            let mut writer = BufWriter::new(file);
+            serde_json::to_writer(&mut writer, self).map_err(SessionStoreError::Encode)?;
+            writer.write_all(b"\n").map_err(|error| io(path, error))?;
+            writer.flush().map_err(|error| io(path, error))?;
+            writer
+                .get_ref()
+                .sync_all()
+                .map_err(|error| io(path, error))?;
+            std::fs::rename(&temporary, path).map_err(|error| io(path, error))?;
+            File::open(parent)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|error| io(path, error))
+        })();
+        if created && result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result
     }
 
     pub fn load(path: &Path) -> Result<Self, SessionStoreError> {
@@ -235,19 +273,6 @@ impl StoredSession {
             .map_err(MaterialError::Secret)
             .map_err(SessionStoreError::from)
     }
-}
-
-fn open_private(path: &Path) -> Result<File, SessionStoreError> {
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|error| io(path, error))?;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .map_err(|error| io(path, error))?;
-    Ok(file)
 }
 
 fn io(path: &Path, source: std::io::Error) -> SessionStoreError {
@@ -407,5 +432,34 @@ mod tests {
         ] {
             assert!(!debug.contains(secret), "debug leaked {secret}");
         }
+    }
+    #[test]
+    fn replacing_a_session_is_atomic_and_owner_only() {
+        let gateway = GatewayEndpoint::new("gateway.test", 443).unwrap();
+        let mut session = StoredSession::capture(
+            &gateway,
+            LoginMethod::Cas,
+            None,
+            &[cookie("sid", "sid-cookie-value")],
+            &material(),
+        );
+        let path = temp_path("atomic");
+        session.save(&path).unwrap();
+        // An already-open reader continues to see the complete old document.
+        let mut old = File::open(&path).unwrap();
+        session.sid = "new-sid".into();
+        session.save(&path).unwrap();
+        let mut bytes = String::new();
+        std::io::Read::read_to_string(&mut old, &mut bytes).unwrap();
+        assert_eq!(
+            serde_json::from_str::<StoredSession>(&bytes).unwrap().sid,
+            "sid-cookie-value"
+        );
+        assert_eq!(StoredSession::load(&path).unwrap().sid, "new-sid");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_file(path).unwrap();
     }
 }
