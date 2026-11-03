@@ -98,6 +98,18 @@ pub fn parse_ipv4_flow(packet: &[u8]) -> Result<Ipv4Flow, PacketError> {
         });
     }
 
+    // This layer has no fragment reassembler. Even the first fragment cannot
+    // be accepted independently: later fragments have no transport ports.
+    let flags_offset = u16::from_be_bytes([packet[6], packet[7]]);
+    let fragment_offset = flags_offset & 0x1fff;
+    let more_fragments = flags_offset & 0x2000 != 0;
+    if fragment_offset != 0 || more_fragments {
+        return Err(PacketError::Fragmented {
+            fragment_offset,
+            more_fragments,
+        });
+    }
+
     let protocol_number = packet[9];
     let protocol =
         L3IpProtocol::from_u8(protocol_number).ok_or(PacketError::UnsupportedProtocol {
@@ -135,6 +147,11 @@ pub fn parse_ipv4_flow(packet: &[u8]) -> Result<Ipv4Flow, PacketError> {
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum PacketError {
+    #[error("IPv4 fragments require reassembly (offset={fragment_offset}, more={more_fragments})")]
+    Fragmented {
+        fragment_offset: u16,
+        more_fragments: bool,
+    },
     #[error("IPv4 packet truncated: need {needed} bytes, got {got}")]
     Truncated { needed: usize, got: usize },
     #[error("not an IPv4 packet: version {version}")]
@@ -275,5 +292,21 @@ mod tests {
             flow.reverse_flow_key().as_str(),
             "4:6:10.0.0.1:40000-10.8.0.7:443"
         );
+    }
+    #[test]
+    fn rejects_first_and_later_fragments_but_accepts_df() {
+        for protocol in [1, 6, 17] {
+            for flags_offset in [1u16, 0x2000, 0x2001] {
+                let mut packet = ipv4_packet(protocol, &tcp_payload(50000, 443), 0);
+                packet[6..8].copy_from_slice(&flags_offset.to_be_bytes());
+                assert!(matches!(
+                    parse_ipv4_flow(&packet),
+                    Err(PacketError::Fragmented { .. })
+                ));
+            }
+            let mut packet = ipv4_packet(protocol, &tcp_payload(50000, 443), 0);
+            packet[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+            assert!(parse_ipv4_flow(&packet).is_ok());
+        }
     }
 }
