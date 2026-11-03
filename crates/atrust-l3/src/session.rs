@@ -44,9 +44,7 @@ use crate::auth::{
     AuthWireDisposition, FlowAuthError, L3AuthContext, apply_auth_wire_status,
     build_flow_auth_frame, classify_auth_wire_status,
 };
-use crate::conntrack::{
-    AuthOutcome, ConntrackTable, FlowKey, L3_AUTH_TIMEOUT, L3_CONNTRACK_CAPACITY,
-};
+use crate::conntrack::{AuthOutcome, ConntrackTable, L3_AUTH_TIMEOUT, L3_CONNTRACK_CAPACITY};
 use crate::get_ip::{GetIpv4Error, GetIpv4Response, request_ipv4};
 use crate::packet::{Ipv4Flow, PacketError, parse_ipv4_flow};
 
@@ -892,6 +890,27 @@ impl L3Session {
             // Retire idle flows on the same lock acquisition that adds one, so
             // the table stays bounded without a second task contending here.
             let prune = table.prune();
+            if let Some((old_id, in_flight)) = table
+                .get_by_key(&key)
+                .filter(|entry| entry.app_id != app_id || entry.node_group_id != node_group_id)
+                .map(|entry| (entry.auth_id, entry.auth_in_flight()))
+            {
+                // Late replies and cancelled callers must not settle or remove
+                // the replacement authorization for this same five-tuple.
+                table.evict_by_auth_id(old_id);
+                self.shared
+                    .waiters
+                    .lock()
+                    .expect("waiters mutex")
+                    .remove(&old_id);
+                if in_flight {
+                    let _ = self.shared.auth_in_flight.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |n| Some(n.saturating_sub(1)),
+                    );
+                }
+            }
             let entry = table.get_or_create(key.clone(), app_id, node_group_id);
             if let Some(outcome) = entry.outcome() {
                 return match outcome {
@@ -945,7 +964,7 @@ impl L3Session {
             let frame = match build_flow_auth_frame(ctx, app_id, auth_id, &flow.to_five_tuple()) {
                 Ok(frame) => frame,
                 Err(error) => {
-                    self.abandon_flow(&key, auth_id);
+                    self.abandon_flow(auth_id);
                     return Err(error.into());
                 }
             };
@@ -970,7 +989,7 @@ impl L3Session {
                 app_id
             );
             if self.write_frame(frame).await.is_err() {
-                self.abandon_flow(&key, auth_id);
+                self.abandon_flow(auth_id);
                 return Err(L3SessionError::Closed);
             }
             self.shared.record_auth_sent();
@@ -1002,7 +1021,7 @@ impl L3Session {
             }),
             Ok(Err(_)) => Err(L3SessionError::Closed),
             Err(_) => {
-                self.abandon_flow(&key, auth_id);
+                self.abandon_flow(auth_id);
                 if must_send {
                     self.shared.settle_auth(true);
                 }
@@ -1020,12 +1039,12 @@ impl L3Session {
     }
 
     /// Drops a flow and its waiters so the next attempt starts clean.
-    fn abandon_flow(&self, key: &FlowKey, auth_id: u64) {
+    fn abandon_flow(&self, auth_id: u64) {
         self.shared
             .conntrack
             .lock()
             .expect("conntrack mutex")
-            .evict(key);
+            .evict_by_auth_id(auth_id);
         self.shared
             .waiters
             .lock()
@@ -1758,7 +1777,7 @@ mod tests {
             Some(events),
             L3AuthRetryConfig::disabled(),
         ));
-        let flow = FlowKey::new(1, 6, "10.0.0.1", 1234, "192.0.2.1", 443);
+        let flow = crate::FlowKey::new(1, 6, "10.0.0.1", 1234, "192.0.2.1", 443);
         shared
             .conntrack
             .lock()

@@ -361,6 +361,15 @@ impl ConntrackTable {
         node_group_id: impl Into<String>,
         now: Instant,
     ) -> &mut ConntrackEntry {
+        let app_id = app_id.into();
+        let node_group_id = node_group_id.into();
+        if self
+            .by_key
+            .get(&key)
+            .is_some_and(|entry| entry.app_id != app_id || entry.node_group_id != node_group_id)
+        {
+            self.evict(&key);
+        }
         if let Some(entry) = self.by_key.get_mut(&key) {
             entry.last_used = now;
             return self.by_key.get_mut(&key).expect("key present");
@@ -369,8 +378,8 @@ impl ConntrackTable {
         let entry = ConntrackEntry {
             key: key.clone(),
             auth_id,
-            app_id: app_id.into(),
-            node_group_id: node_group_id.into(),
+            app_id,
+            node_group_id,
             auth_started: false,
             retries: 0,
             retry_scheduled: false,
@@ -708,5 +717,22 @@ mod tests {
         assert!(!table.touch_at(&unknown, now + Duration::from_secs(9)));
         assert_eq!(table.len(), 1);
         assert_eq!(table.prune_at(now + Duration::from_secs(11)).expired, 0);
+    }
+    #[test]
+    fn changed_resource_retires_token_and_auth_id() {
+        let mut table = ConntrackTable::new();
+        let key = flow(40000);
+        let old = table.get_or_create(key.clone(), "old-app", "group");
+        old.complete(AuthOutcome::Ready {
+            connect_token: "old-token".to_owned(),
+        });
+        let old_id = old.auth_id;
+        let new = table.get_or_create(key.clone(), "new-app", "group");
+        assert_eq!(new.app_id, "new-app");
+        assert!(new.outcome().is_none());
+        assert_ne!(new.auth_id, old_id);
+        assert!(table.get_by_auth_id(old_id).is_none());
+        assert!(table.evict_by_auth_id(old_id).is_none());
+        assert_eq!(table.get_by_key(&key).unwrap().app_id, "new-app");
     }
 }

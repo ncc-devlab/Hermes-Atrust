@@ -1390,3 +1390,34 @@ async fn unanswered_heartbeats_close_the_session() {
     session.close().await;
     drain.await.unwrap();
 }
+
+#[tokio::test]
+async fn changed_app_for_the_same_flow_reauthorizes_on_the_wire() {
+    let (session, stats, _peer) = session_with(
+        AuthBehaviour::Grant {
+            token: "t".repeat(32),
+        },
+        IDLE_HEARTBEAT,
+    )
+    .await;
+    let (device, connection, key, process) = auth_ids();
+    let session_id = sid();
+    let ctx = L3AuthContext {
+        sid: &session_id,
+        device_id: &device,
+        connection_id: &connection,
+        sign_key: &key,
+        process: &process,
+        lang: "en-US",
+    };
+    let flow = flow_of(&tcp_packet(40000, 443, b""));
+    for app in ["old-app", "old-app", "new-app", "new-app"] {
+        session
+            .authorize_flow(&ctx, app, "group", &flow)
+            .await
+            .unwrap();
+    }
+    assert_eq!(stats.auth_requests(), 2);
+    assert_eq!(session.conntrack_len(), 1);
+    session.close().await;
+}
