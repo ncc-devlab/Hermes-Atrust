@@ -3,6 +3,7 @@
 mod auth_config;
 mod cas;
 mod client;
+mod index;
 mod material;
 mod node_select;
 mod password;
