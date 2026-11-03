@@ -152,6 +152,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrust-net"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "atrust-auth",
+ "atrust-client",
+ "atrust-l3",
+ "hermes-model",
+ "hermes-transport",
+ "tokio",
+]
+
+[[package]]
 name = "atrust-probe"
 version = "0.1.0"
 dependencies = [

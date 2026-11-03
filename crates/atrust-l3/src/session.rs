@@ -206,6 +206,12 @@ pub struct L3SessionConfig<'a> {
     pub events: Option<Arc<EventBus>>,
 }
 
+#[derive(Debug)]
+struct PacketSubscription {
+    id: u64,
+    sender: mpsc::Sender<Vec<u8>>,
+}
+
 /// State shared between the caller and the session tasks.
 #[derive(Debug)]
 struct SessionShared {
@@ -217,7 +223,7 @@ struct SessionShared {
     /// Callers awaiting a `0x93` for a given auth id. A flow can have more than
     /// one waiter when several packets race into the same unauthorized flow.
     waiters: Mutex<HashMap<u64, Vec<oneshot::Sender<AuthOutcome>>>>,
-    packet_subscribers: Mutex<HashMap<FlowKey, (u64, mpsc::Sender<Vec<u8>>)>>,
+    packet_subscribers: Mutex<HashMap<FlowKey, PacketSubscription>>,
     next_subscriber: AtomicU64,
     closed: AtomicBool,
     close_info: Mutex<Option<L3CloseInfo>>,
@@ -523,7 +529,7 @@ impl Drop for FlowPackets {
                 .expect("packet subscribers mutex");
             if subscribers
                 .get(&self.key)
-                .is_some_and(|(id, _)| *id == self.id)
+                .is_some_and(|entry| entry.id == self.id)
             {
                 subscribers.remove(&self.key);
             }
@@ -553,7 +559,7 @@ impl L3Session {
         }
         let id = self.shared.next_subscriber.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel(64);
-        subscribers.insert(key.clone(), (id, sender));
+        subscribers.insert(key.clone(), PacketSubscription { id, sender });
         Ok(FlowPackets {
             shared: Arc::downgrade(&self.shared),
             key,
@@ -1444,7 +1450,7 @@ fn deliver(
             .lock()
             .expect("packet subscribers mutex")
             .get(&flow.reverse_flow_key())
-            .map(|(_, sender)| sender.clone())
+            .map(|entry| entry.sender.clone())
     });
     if let Some(sender) = subscriber {
         if sender.try_send(packet).is_err() {

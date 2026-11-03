@@ -3,6 +3,7 @@ members = [
     "apps/atrust-probe",
     "crates/atrust-auth",
     "crates/atrust-client",
+    "crates/atrust-net",
     "crates/atrust-browser",
     "crates/atrust-l3",
     "crates/atrust-protocol",
