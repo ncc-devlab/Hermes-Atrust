@@ -511,6 +511,7 @@ async fn e12_authorize(session: &L3Session) -> Result<String, L3SessionError> {
         sign_key: &key,
         process: &process,
         lang: "en-US",
+        domain: None,
     };
     session
         .authorize_flow(
@@ -847,6 +848,7 @@ async fn session_authorizes_a_flow_and_round_trips_a_packet() {
         sign_key: &key,
         process: &process,
         lang: "en-US",
+        domain: None,
     };
 
     let packet = tcp_packet(40000, 443, b"hello");
@@ -891,6 +893,7 @@ async fn authorized_flow_is_cached_and_never_reauthorized() {
         sign_key: &key,
         process: &process,
         lang: "en-US",
+        domain: None,
     };
     let flow = flow_of(&tcp_packet(40000, 443, b""));
 
@@ -940,6 +943,7 @@ async fn concurrent_callers_for_one_flow_send_a_single_auth() {
                 sign_key: &key,
                 process: &process,
                 lang: "en-US",
+                domain: None,
             };
             let flow = flow_of(&tcp_packet(40000, 443, b""));
             session
@@ -992,6 +996,7 @@ async fn concurrent_distinct_flows_are_in_flight_and_each_deduplicated() {
                     sign_key: &key,
                     process: &process,
                     lang: "en-US",
+                    domain: None,
                 };
                 let flow = flow_of(&tcp_packet(src_port, 443, b""));
                 barrier.wait().await;
@@ -1043,6 +1048,7 @@ async fn denied_flow_reports_the_server_message() {
         sign_key: &key,
         process: &process,
         lang: "en-US",
+        domain: None,
     };
     let flow = flow_of(&tcp_packet(40000, 443, b""));
 
@@ -1068,6 +1074,7 @@ async fn peer_disconnect_wakes_the_waiter_without_waiting_for_the_timeout() {
         sign_key: &key,
         process: &process,
         lang: "en-US",
+        domain: None,
     };
     let flow = flow_of(&tcp_packet(40000, 443, b""));
 
@@ -1101,6 +1108,7 @@ async fn unanswered_auth_times_out_and_frees_the_flow_for_one_retry() {
         sign_key: &key,
         process: &process,
         lang: "en-US",
+        domain: None,
     };
     let flow = flow_of(&tcp_packet(40000, 443, b""));
 
@@ -1409,6 +1417,7 @@ async fn changed_app_for_the_same_flow_reauthorizes_on_the_wire() {
         sign_key: &key,
         process: &process,
         lang: "en-US",
+        domain: None,
     };
     let flow = flow_of(&tcp_packet(40000, 443, b""));
     for app in ["old-app", "old-app", "new-app", "new-app"] {

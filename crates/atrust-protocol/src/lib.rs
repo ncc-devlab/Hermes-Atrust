@@ -12,7 +12,7 @@ mod tcp_init;
 pub use json::{ProtocolJsonError, to_wire_json};
 pub use l3_auth::{
     L3AuthError, L3AuthFiveTuple, L3AuthParams, L3AuthResponse, L3IpProtocol,
-    build_signed_l3_auth_json, parse_l3_auth_response,
+    build_signed_l3_auth_json, build_signed_l3_auth_json_for_domain, parse_l3_auth_response,
 };
 pub use l3_frame::{
     DataRespLayout, DataRespPackets, L3_HEARTBEAT_REQ, L3_HEARTBEAT_RESP_HEADER, L3_VERSION,

@@ -2,7 +2,7 @@
 
 use atrust_protocol::{
     L3AuthError, L3AuthFiveTuple, L3AuthParams, L3AuthResponse, ProcessIdentity,
-    build_signed_l3_auth_json, encode_l3_auth_req, parse_l3_auth_response,
+    build_signed_l3_auth_json_for_domain, encode_l3_auth_req, parse_l3_auth_response,
 };
 use hermes_model::{ConnectionId, DeviceId, SessionId, SignKey};
 use thiserror::Error;
@@ -38,6 +38,7 @@ pub struct L3AuthContext<'a> {
     pub sign_key: &'a SignKey,
     pub process: &'a ProcessIdentity,
     pub lang: &'a str,
+    pub domain: Option<&'a str>,
 }
 
 /// Builds a signed `0x13` frame for one conntrack entry.
@@ -57,7 +58,7 @@ pub fn build_flow_auth_frame(
         process: ctx.process,
         lang: ctx.lang,
     };
-    let json = build_signed_l3_auth_json(&params, ctx.sign_key)?;
+    let json = build_signed_l3_auth_json_for_domain(&params, ctx.sign_key, ctx.domain)?;
     Ok(encode_l3_auth_req(&json)?)
 }
 
@@ -158,6 +159,7 @@ mod tests {
             sign_key: &key,
             process: &process,
             lang: "en-US",
+            domain: None,
         };
         let five = L3AuthFiveTuple::ipv4(L3IpProtocol::Tcp, "10.8.0.1", 40000, "10.0.0.9", 443);
         let frame = build_flow_auth_frame(&ctx, "app-1", 3, &five).unwrap();
@@ -227,5 +229,37 @@ mod tests {
             };
             assert_eq!(classify_auth_wire_status(status), expected);
         }
+    }
+    #[test]
+    fn retained_domain_is_signed_without_changing_the_ip_tuple() {
+        let (sid, device, connection, process, key) = ctx_ids();
+        let ctx = L3AuthContext {
+            sid: &sid,
+            device_id: &device,
+            connection_id: &connection,
+            sign_key: &key,
+            process: &process,
+            lang: "en-US",
+            domain: Some("portal.test"),
+        };
+        let five = L3AuthFiveTuple::ipv4(L3IpProtocol::Udp, "10.8.0.1", 40000, "10.0.0.9", 53);
+        let frame = build_flow_auth_frame(&ctx, "app-1", 3, &five).unwrap();
+        let mut json: serde_json::Value = serde_json::from_slice(&frame[4..]).unwrap();
+        assert_eq!(json["domain"], "portal.test");
+        assert_eq!(json["ip"]["destAddr"], "10.0.0.9");
+        let signature = json["xRequestSig"].take();
+        assert!(signature.as_str().is_some_and(|s| !s.is_empty()));
+        let baseline = build_flow_auth_frame(
+            &L3AuthContext {
+                domain: None,
+                ..ctx
+            },
+            "app-1",
+            3,
+            &five,
+        )
+        .unwrap();
+        let baseline: serde_json::Value = serde_json::from_slice(&baseline[4..]).unwrap();
+        assert_ne!(signature, baseline["xRequestSig"]);
     }
 }

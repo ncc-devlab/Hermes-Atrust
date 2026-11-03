@@ -108,6 +108,16 @@ pub fn build_signed_l3_auth_json(
     params: &L3AuthParams<'_>,
     sign_key: &SignKey,
 ) -> Result<Vec<u8>, L3AuthError> {
+    build_signed_l3_auth_json_for_domain(params, sign_key, None)
+}
+
+/// Domain-aware authorization used when a resolver retains a policy hostname.
+/// Omitting the domain preserves the original wire bytes and signature.
+pub fn build_signed_l3_auth_json_for_domain(
+    params: &L3AuthParams<'_>,
+    sign_key: &SignKey,
+    domain: Option<&str>,
+) -> Result<Vec<u8>, L3AuthError> {
     if params.app_id.is_empty() {
         return Err(L3AuthError::EmptyAppId);
     }
@@ -160,6 +170,7 @@ pub fn build_signed_l3_auth_json(
             src_port: params.five_tuple.src_port,
         },
         proc_hash: &proc_hash,
+        domain,
         x_request_sig: "",
     };
 
@@ -227,6 +238,8 @@ struct L3AuthWire<'a> {
     ip: L3AuthIpWire<'a>,
     #[serde(rename = "procHash")]
     proc_hash: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    domain: Option<&'a str>,
     #[serde(rename = "xRequestSig")]
     x_request_sig: &'a str,
 }

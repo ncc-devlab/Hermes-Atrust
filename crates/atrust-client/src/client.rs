@@ -314,7 +314,17 @@ impl AtrustClient {
     /// **fail-closed**: a packet the resource table does not cover is rejected
     /// rather than sent to a default node group.
     pub async fn send_ipv4(&self, packet: &[u8]) -> Result<SentFlow, ClientError> {
-        self.dispatch(packet, true).await
+        self.dispatch(packet, true, None).await
+    }
+
+    /// Sends a packet using a retained policy hostname. The hostname is matched
+    /// against the current domain resources before any network operation.
+    pub async fn send_ipv4_for_domain(
+        &self,
+        packet: &[u8],
+        domain: &str,
+    ) -> Result<SentFlow, ClientError> {
+        self.dispatch(packet, true, Some(domain)).await
     }
 
     /// Authorizes the packet's flow without sending it.
@@ -323,10 +333,15 @@ impl AtrustClient {
     /// into two separately readable outcomes, which is what makes a live
     /// bring-up failure diagnosable.
     pub async fn authorize_ipv4(&self, packet: &[u8]) -> Result<SentFlow, ClientError> {
-        self.dispatch(packet, false).await
+        self.dispatch(packet, false, None).await
     }
 
-    async fn dispatch(&self, packet: &[u8], send: bool) -> Result<SentFlow, ClientError> {
+    async fn dispatch(
+        &self,
+        packet: &[u8],
+        send: bool,
+        domain: Option<&str>,
+    ) -> Result<SentFlow, ClientError> {
         let active = self.active.read().await.clone();
         active
             .run(async {
@@ -335,7 +350,7 @@ impl AtrustClient {
                 let route = snapshot
                     .routing()
                     .match_destination(
-                        &flow.dst_addr.to_string(),
+                        domain.unwrap_or(&flow.dst_addr.to_string()),
                         flow.dst_port,
                         flow_protocol(flow.protocol),
                     )
@@ -356,6 +371,7 @@ impl AtrustClient {
                     sign_key: &active.material.sign_key,
                     process: &process,
                     lang: &self.config.lang,
+                    domain,
                 };
 
                 let authorized = if send {
