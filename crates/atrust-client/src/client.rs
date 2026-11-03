@@ -70,6 +70,7 @@ impl ClientSession {
 
     async fn shutdown(&self) {
         self.stop.send_replace(true);
+        self.managers.retire();
         if let Some(mut background) = self.background.lock().await.take() {
             background.nodes.0.abort();
             let _ = (&mut background.nodes.0).await;
@@ -77,6 +78,21 @@ impl ClientSession {
             background.refresh.shutdown().await;
         }
         self.managers.close().await;
+    }
+}
+
+impl Drop for ClientSession {
+    fn drop(&mut self) {
+        self.stop.send_replace(true);
+        self.managers.retire();
+    }
+}
+
+impl Drop for AtrustClient {
+    fn drop(&mut self) {
+        let active = self.active.get_mut();
+        active.stop.send_replace(true);
+        active.managers.retire();
     }
 }
 

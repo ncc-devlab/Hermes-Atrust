@@ -1213,9 +1213,14 @@ impl L3Session {
     }
 
     /// Closes the connection and stops the reader, writer and heartbeat tasks.
-    pub async fn close(&self) {
+    pub fn request_close(&self) {
         self.shared
             .shutdown(L3CloseReason::Caller, "L3 session closed by caller");
+    }
+
+    /// Requests closure and joins the owned tasks within their shutdown budget.
+    pub async fn close(&self) {
+        self.request_close();
         let mut handles = self.tasks.lock().await;
         while let Some(handle) = handles.last_mut() {
             if timeout(CLOSE_TIMEOUT, &mut *handle).await.is_err() {
