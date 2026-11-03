@@ -32,7 +32,9 @@ use atrust_protocol::{
 };
 use hermes_events::{EventBus, HermesEvent, L3DataLayout, OptionalEventBus as _};
 use hermes_model::SessionId;
-use hermes_transport::{TlsConnectError, TlsPolicy, connect_tls};
+use hermes_transport::{
+    SystemUnderlay, TlsConnectError, TlsPolicy, UnderlayDialer, connect_tls_with_underlay,
+};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot, watch};
@@ -488,9 +490,21 @@ impl L3Session {
     /// Connects to a node, performs Get-IP, and starts the session on that
     /// same connection.
     pub async fn establish(config: L3SessionConfig<'_>) -> Result<Self, L3SessionError> {
+        Self::establish_with_underlay(config, &SystemUnderlay::default()).await
+    }
+
+    pub async fn establish_with_underlay(
+        config: L3SessionConfig<'_>,
+        underlay: &dyn UnderlayDialer,
+    ) -> Result<Self, L3SessionError> {
         let stream = timeout(
             config.connect_timeout,
-            connect_tls(config.node_host, config.node_port, config.tls_policy),
+            connect_tls_with_underlay(
+                config.node_host,
+                config.node_port,
+                config.tls_policy,
+                underlay,
+            ),
         )
         .await
         .map_err(|_| L3SessionError::ConnectTimeout)??;

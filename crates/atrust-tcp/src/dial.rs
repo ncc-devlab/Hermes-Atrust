@@ -7,7 +7,9 @@ use atrust_protocol::{
     parse_status_payload,
 };
 use hermes_model::{ConnectionId, DeviceId, SessionId, SignKey};
-use hermes_transport::{TlsConnectError, TlsPolicy, connect_tls};
+use hermes_transport::{
+    SystemUnderlay, TlsConnectError, TlsPolicy, UnderlayDialer, connect_tls_with_underlay,
+};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::time::timeout;
@@ -42,6 +44,13 @@ pub struct DialTcpRequest<'a> {
 
 /// Opens TLS to the node, completes aTrust TCP handshake, returns a framed tunnel.
 pub async fn dial_tcp(request: DialTcpRequest<'_>) -> Result<TcpTunnel, DialTcpError> {
+    dial_tcp_with_underlay(request, &SystemUnderlay::default()).await
+}
+
+pub async fn dial_tcp_with_underlay(
+    request: DialTcpRequest<'_>,
+    underlay: &dyn UnderlayDialer,
+) -> Result<TcpTunnel, DialTcpError> {
     validate_request(&request)?;
 
     let process = request
@@ -61,7 +70,12 @@ pub async fn dial_tcp(request: DialTcpRequest<'_>) -> Result<TcpTunnel, DialTcpE
 
     let stream = timeout(
         request.connect_timeout,
-        connect_tls(request.node_host, request.node_port, request.tls_policy),
+        connect_tls_with_underlay(
+            request.node_host,
+            request.node_port,
+            request.tls_policy,
+            underlay,
+        ),
     )
     .await
     .map_err(|_| DialTcpError::ConnectTimeout)?
@@ -92,9 +106,17 @@ pub async fn dial_tcp_with_retry(
     request: DialTcpRequest<'_>,
     max_retries: usize,
 ) -> Result<TcpTunnel, DialTcpError> {
+    dial_tcp_with_retry_and_underlay(request, max_retries, &SystemUnderlay::default()).await
+}
+
+pub async fn dial_tcp_with_retry_and_underlay(
+    request: DialTcpRequest<'_>,
+    max_retries: usize,
+    underlay: &dyn UnderlayDialer,
+) -> Result<TcpTunnel, DialTcpError> {
     let mut retries = 0_usize;
     loop {
-        match dial_tcp(request.clone()).await {
+        match dial_tcp_with_underlay(request.clone(), underlay).await {
             Ok(tunnel) => return Ok(tunnel),
             Err(error) if retries < max_retries && error.is_retryable() => {
                 retries += 1;

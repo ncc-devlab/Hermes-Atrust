@@ -9,7 +9,7 @@ mod target;
 
 pub use dial::{
     DialTcpError, DialTcpRequest, TCP_DIAL_RETRIES, TCP_DIAL_TIMEOUT, complete_handshake, dial_tcp,
-    dial_tcp_with_retry, ipv4_target,
+    dial_tcp_with_retry, dial_tcp_with_retry_and_underlay, dial_tcp_with_underlay, ipv4_target,
 };
 pub use stream::{TcpTunnel, TunnelError};
 pub use target::TunnelTarget;

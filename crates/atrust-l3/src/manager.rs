@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use hermes_events::{EventBus, HermesEvent, OptionalEventBus as _};
 use hermes_model::SessionId;
-use hermes_transport::TlsPolicy;
+use hermes_transport::{SystemUnderlay, TlsPolicy, UnderlayDialer};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -21,6 +21,7 @@ pub struct L3SessionManagerConfig {
     pub endpoints: Vec<L3NodeEndpoint>,
     pub node_group_id: String,
     pub tls_policy: TlsPolicy,
+    pub underlay: Arc<dyn UnderlayDialer>,
     pub sid: SessionId,
     pub connect_timeout: Duration,
     pub heartbeat_interval: Duration,
@@ -40,6 +41,7 @@ impl L3SessionManagerConfig {
             endpoints,
             node_group_id,
             tls_policy,
+            underlay: Arc::new(SystemUnderlay::default()),
             sid,
             connect_timeout,
             heartbeat_interval: L3_HEARTBEAT_INTERVAL,
@@ -177,16 +179,19 @@ impl L3SessionManager {
         for offset in 0..endpoints.len() {
             let index = (start + offset) % endpoints.len();
             let endpoint = &endpoints[index];
-            let result = L3Session::establish(L3SessionConfig {
-                node_host: &endpoint.host,
-                node_port: endpoint.port,
-                tls_policy: self.config.tls_policy,
-                sid: &self.config.sid,
-                connect_timeout: self.config.connect_timeout,
-                heartbeat_interval: self.config.heartbeat_interval,
-                node_group_id: Some(&self.config.node_group_id),
-                events: self.config.events.clone(),
-            })
+            let result = L3Session::establish_with_underlay(
+                L3SessionConfig {
+                    node_host: &endpoint.host,
+                    node_port: endpoint.port,
+                    tls_policy: self.config.tls_policy,
+                    sid: &self.config.sid,
+                    connect_timeout: self.config.connect_timeout,
+                    heartbeat_interval: self.config.heartbeat_interval,
+                    node_group_id: Some(&self.config.node_group_id),
+                    events: self.config.events.clone(),
+                },
+                self.config.underlay.as_ref(),
+            )
             .await;
             match result {
                 Ok(session) => {
@@ -426,6 +431,7 @@ fn establishment_is_retryable(error: &L3SessionError) -> bool {
 #[derive(Debug)]
 pub struct L3SessionManagerCache {
     tls_policy: TlsPolicy,
+    underlay: Arc<dyn UnderlayDialer>,
     sid: SessionId,
     connect_timeout: Duration,
     heartbeat_interval: Duration,
@@ -447,6 +453,7 @@ impl L3SessionManagerCache {
     ) -> Self {
         Self {
             tls_policy,
+            underlay: Arc::new(SystemUnderlay::default()),
             sid,
             connect_timeout,
             heartbeat_interval: L3_HEARTBEAT_INTERVAL,
@@ -458,6 +465,12 @@ impl L3SessionManagerCache {
     #[must_use]
     pub fn with_heartbeat_interval(mut self, heartbeat_interval: Duration) -> Self {
         self.heartbeat_interval = heartbeat_interval;
+        self
+    }
+
+    #[must_use]
+    pub fn with_underlay(mut self, underlay: Arc<dyn UnderlayDialer>) -> Self {
+        self.underlay = underlay;
         self
     }
 
@@ -495,6 +508,7 @@ impl L3SessionManagerCache {
                     endpoints: endpoints.clone(),
                     node_group_id: node_group_id.to_owned(),
                     tls_policy: self.tls_policy,
+                    underlay: Arc::clone(&self.underlay),
                     sid: self.sid.clone(),
                     connect_timeout: self.connect_timeout,
                     heartbeat_interval: self.heartbeat_interval,

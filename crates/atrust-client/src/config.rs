@@ -1,8 +1,9 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use atrust_l3::{L3_HEARTBEAT_INTERVAL, L3NodeEndpoint};
 use hermes_model::GatewayEndpoint;
-use hermes_transport::TlsPolicy;
+use hermes_transport::{SystemUnderlay, TlsPolicy, UnderlayDialer};
 
 /// Everything the runtime needs that is a deployment choice rather than a
 /// protocol constant.
@@ -16,6 +17,7 @@ pub struct AtrustClientConfig {
     /// Applies to data-plane node connections. Xidian's nodes present a
     /// self-signed `CN=sdp`, so live use there requires a relaxed policy.
     pub tls_policy: TlsPolicy,
+    pub underlay: Arc<dyn UnderlayDialer>,
     /// Budget for TCP + TLS + Get-IP on one node connection.
     pub connect_timeout: Duration,
     pub heartbeat_interval: Duration,
@@ -53,6 +55,7 @@ impl AtrustClientConfig {
         Self {
             gateway,
             tls_policy,
+            underlay: Arc::new(SystemUnderlay::default()),
             connect_timeout: Duration::from_secs(20),
             heartbeat_interval: L3_HEARTBEAT_INTERVAL,
             tcp_handshake_timeout: Duration::from_secs(20),
@@ -61,6 +64,12 @@ impl AtrustClientConfig {
             endpoint_override_node_group_id: None,
             lang: "en-US".to_owned(),
         }
+    }
+
+    #[must_use]
+    pub fn with_underlay(mut self, underlay: Arc<dyn UnderlayDialer>) -> Self {
+        self.underlay = underlay;
+        self
     }
 
     #[must_use]

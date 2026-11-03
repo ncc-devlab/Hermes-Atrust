@@ -12,7 +12,8 @@ use atrust_l3::{
     L3SessionManagerCache, L3SessionManagerError, PacketError, ProcessIdentity, parse_ipv4_flow,
 };
 use atrust_tcp::{
-    DialTcpError, DialTcpRequest, TCP_DIAL_RETRIES, TcpTunnel, TunnelTarget, dial_tcp_with_retry,
+    DialTcpError, DialTcpRequest, TCP_DIAL_RETRIES, TcpTunnel, TunnelTarget,
+    dial_tcp_with_retry_and_underlay,
 };
 use hermes_events::{EventBus, EventStream, HermesEvent};
 use thiserror::Error;
@@ -142,6 +143,7 @@ impl AtrustClient {
                 material.sid.clone(),
                 config.connect_timeout,
             )
+            .with_underlay(Arc::clone(&config.underlay))
             .with_heartbeat_interval(config.heartbeat_interval)
             .with_events(Some(Arc::clone(&events))),
         );
@@ -471,7 +473,13 @@ impl AtrustClient {
                         connect_timeout: self.config.connect_timeout,
                         handshake_timeout: self.config.tcp_handshake_timeout,
                     };
-                    match dial_tcp_with_retry(request, TCP_DIAL_RETRIES).await {
+                    match dial_tcp_with_retry_and_underlay(
+                        request,
+                        TCP_DIAL_RETRIES,
+                        self.config.underlay.as_ref(),
+                    )
+                    .await
+                    {
                         Ok(tunnel) => {
                             info!(
                                 event = "atrust_client.tcp_tunnel_opened",
@@ -1138,5 +1146,33 @@ mod tests {
                 .await,
             Err(ClientError::Closed)
         ));
+    }
+    #[derive(Debug, Default)]
+    struct RefusingUnderlay(std::sync::atomic::AtomicUsize);
+    #[async_trait]
+    impl hermes_transport::UnderlayDialer for RefusingUnderlay {
+        async fn connect(&self, _host: &str, _port: u16) -> std::io::Result<tokio::net::TcpStream> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Err(std::io::ErrorKind::ConnectionRefused.into())
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_and_l3_use_the_injected_underlay() {
+        let underlay = Arc::new(RefusingUnderlay::default());
+        let auth = replacement_auth(vec![resource_response()]);
+        let config = AtrustClientConfig::new(
+            GatewayEndpoint::new("gateway.test", 443).unwrap(),
+            TlsPolicy::Verify,
+        )
+        .with_underlay(underlay.clone());
+        let client = AtrustClient::start(auth, configuration(), material(), config)
+            .await
+            .unwrap();
+        assert!(client.dial_tcp("10.9.0.7", 80).await.is_err());
+        assert_eq!(underlay.0.load(Ordering::Relaxed), TCP_DIAL_RETRIES + 1);
+        assert!(client.connect_node_group("group-1").await.is_err());
+        assert_eq!(underlay.0.load(Ordering::Relaxed), TCP_DIAL_RETRIES + 2);
+        client.shutdown().await;
     }
 }

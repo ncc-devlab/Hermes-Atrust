@@ -200,6 +200,13 @@ impl std::fmt::Debug for ReqwestTransport {
 
 impl ReqwestTransport {
     pub fn new(config: &ReqwestTransportConfig) -> Result<Self, HttpTransportError> {
+        Self::new_with_underlay(config, &crate::UnderlayOptions::default())
+    }
+
+    pub fn new_with_underlay(
+        config: &ReqwestTransportConfig,
+        underlay: &crate::UnderlayOptions,
+    ) -> Result<Self, HttpTransportError> {
         if config.max_response_body == 0 {
             return Err(HttpTransportError::InvalidConfiguration(
                 "max_response_body must be greater than zero",
@@ -212,13 +219,45 @@ impl ReqwestTransport {
         }
 
         let jar = Arc::new(Jar::default());
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .cookie_provider(jar.clone())
             .redirect(Policy::none())
             .timeout(config.timeout)
             .danger_accept_invalid_certs(dangerous_tls)
-            .build()
-            .map_err(HttpTransportError::BuildClient)?;
+            .local_address(underlay.local_address);
+        if let Some(interface) = &underlay.interface {
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "android",
+                target_os = "fuchsia",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "illumos",
+                target_os = "solaris",
+                target_os = "tvos",
+                target_os = "visionos",
+                target_os = "watchos"
+            ))]
+            {
+                builder = builder.interface(interface);
+            }
+            #[cfg(not(any(
+                target_os = "linux",
+                target_os = "android",
+                target_os = "fuchsia",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "illumos",
+                target_os = "solaris",
+                target_os = "tvos",
+                target_os = "visionos",
+                target_os = "watchos"
+            )))]
+            return Err(HttpTransportError::InvalidConfiguration(
+                "HTTP interface binding is unsupported",
+            ));
+        }
+        let client = builder.build().map_err(HttpTransportError::BuildClient)?;
 
         Ok(Self {
             client,
