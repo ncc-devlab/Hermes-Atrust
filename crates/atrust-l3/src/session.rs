@@ -984,7 +984,7 @@ impl L3Session {
             let mut table = self.shared.conntrack.lock().expect("conntrack mutex");
             // Retire idle flows on the same lock acquisition that adds one, so
             // the table stays bounded without a second task contending here.
-            let prune = table.prune();
+            let prune = table.maintain_for_flow(&key);
             if let Some((old_id, in_flight)) = table
                 .get_by_key(&key)
                 .filter(|entry| entry.app_id != app_id || entry.node_group_id != node_group_id)

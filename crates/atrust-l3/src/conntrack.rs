@@ -220,6 +220,7 @@ pub struct ConntrackTable {
     by_id: HashMap<u64, FlowKey>,
     idle_ttl: Duration,
     capacity: usize,
+    last_sweep: Instant,
 }
 
 impl Default for ConntrackTable {
@@ -278,6 +279,7 @@ impl ConntrackTable {
             by_id: HashMap::new(),
             idle_ttl,
             capacity: capacity.max(1),
+            last_sweep: Instant::now(),
         }
     }
 
@@ -300,8 +302,35 @@ impl ConntrackTable {
         self.prune_at(Instant::now())
     }
 
+    /// Packet fast path: full expiry scans run at most once per second unless
+    /// the addressed flow expired or a new flow needs space at capacity.
+    pub fn maintain_for_flow(&mut self, key: &FlowKey) -> PruneOutcome {
+        let now = Instant::now();
+        let entry = self.by_key.get(key);
+        let expired = entry.is_some_and(|entry| {
+            !entry.auth_in_flight()
+                && now.saturating_duration_since(entry.last_used) >= self.idle_ttl
+        });
+        let reserve = entry.is_none();
+        if !expired
+            && now.saturating_duration_since(self.last_sweep) < Duration::from_secs(1)
+            && (!reserve || self.len() < self.capacity)
+        {
+            return PruneOutcome {
+                entries: self.len(),
+                ..PruneOutcome::default()
+            };
+        }
+        self.last_sweep = now;
+        self.prune_at_with_room(now, reserve)
+    }
+
     /// [`Self::prune`] against a caller-supplied clock.
     pub fn prune_at(&mut self, now: Instant) -> PruneOutcome {
+        self.prune_at_with_room(now, true)
+    }
+
+    fn prune_at_with_room(&mut self, now: Instant, reserve: bool) -> PruneOutcome {
         let mut outcome = PruneOutcome::default();
 
         let expired: Vec<FlowKey> = self
@@ -322,7 +351,7 @@ impl ConntrackTable {
         // clears itself within the 8s timeout, so a table that is briefly all
         // in-flight is self-limiting; refusing to track a new flow there would
         // turn a transient burst into dropped traffic.
-        while self.by_key.len() >= self.capacity {
+        while self.by_key.len() > self.capacity || (reserve && self.by_key.len() == self.capacity) {
             let Some(victim) = self
                 .by_key
                 .values()
@@ -734,5 +763,21 @@ mod tests {
         assert!(table.get_by_auth_id(old_id).is_none());
         assert!(table.evict_by_auth_id(old_id).is_none());
         assert_eq!(table.get_by_key(&key).unwrap().app_id, "new-app");
+    }
+    #[test]
+    fn active_flows_at_capacity_do_not_evict_each_other_during_maintenance() {
+        let mut table = table(2);
+        let now = Instant::now();
+        for port in [1000, 1001] {
+            table
+                .get_or_create(flow(port), "app", "g")
+                .complete(AuthOutcome::Ready {
+                    connect_token: "token".into(),
+                });
+        }
+        table.last_sweep = now - Duration::from_secs(2);
+        assert_eq!(table.maintain_for_flow(&flow(1000)).evicted_for_capacity, 0);
+        assert_eq!(table.len(), 2);
+        assert_eq!(table.maintain_for_flow(&flow(1002)).evicted_for_capacity, 1);
     }
 }
