@@ -1486,3 +1486,48 @@ async fn queued_but_unwritten_probes_do_not_count_as_missed_acknowledgements() {
     session.close().await;
     assert!(matches!(send.await.unwrap(), Err(L3SessionError::Closed)));
 }
+
+#[tokio::test]
+async fn resource_change_during_auth_does_not_look_like_a_disconnected_tunnel() {
+    let (session, stats, _peer) = session_with(
+        AuthBehaviour::BatchGrant {
+            token: "t".repeat(32),
+            batch_size: 2,
+        },
+        IDLE_HEARTBEAT,
+    )
+    .await;
+    let session = Arc::new(session);
+    let authorize = |session: Arc<L3Session>, app: &'static str| async move {
+        let (device, connection, key, process) = auth_ids();
+        let sid = sid();
+        let ctx = L3AuthContext {
+            sid: &sid,
+            device_id: &device,
+            connection_id: &connection,
+            sign_key: &key,
+            process: &process,
+            lang: "en-US",
+            domain: None,
+        };
+        session
+            .authorize_flow(&ctx, app, "group", &flow_of(&tcp_packet(40000, 443, b"")))
+            .await
+    };
+    let old = tokio::spawn(authorize(session.clone(), "old-app"));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while stats.auth_requests() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    authorize(session.clone(), "new-app").await.unwrap();
+    assert!(
+        matches!(old.await.unwrap(),Err(L3SessionError::FlowAuth(atrust_l3::FlowAuthError::AuthFailed(message))) if message.contains("resource changed"))
+    );
+    assert!(!session.is_closed());
+    authorize(session.clone(), "new-app").await.unwrap();
+    assert_eq!(stats.auth_requests(), 2);
+    session.close().await;
+}

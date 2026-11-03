@@ -998,11 +998,12 @@ impl L3Session {
                 // Late replies and cancelled callers must not settle or remove
                 // the replacement authorization for this same five-tuple.
                 table.evict_by_auth_id(old_id);
-                self.shared
-                    .waiters
-                    .lock()
-                    .expect("waiters mutex")
-                    .remove(&old_id);
+                self.shared.notify(
+                    old_id,
+                    &AuthOutcome::Failed {
+                        message: "flow resource changed during authorization".to_owned(),
+                    },
+                );
                 if in_flight {
                     let _ = self.shared.auth_in_flight.fetch_update(
                         Ordering::Relaxed,
