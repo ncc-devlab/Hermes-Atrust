@@ -8,6 +8,8 @@ rust-version.workspace = true
 [dependencies]
 atrust-auth = { path = "../../crates/atrust-auth" }
 atrust-client = { path = "../../crates/atrust-client" }
+atrust-net = { path = "../../crates/atrust-net" }
+hermes-proxy = { path = "../../crates/hermes-proxy" }
 atrust-browser = { path = "../../crates/atrust-browser" }
 atrust-l3 = { path = "../../crates/atrust-l3" }
 atrust-tcp = { path = "../../crates/atrust-tcp" }

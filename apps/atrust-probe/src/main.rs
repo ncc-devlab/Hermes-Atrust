@@ -85,8 +85,41 @@ impl From<TargetTlsProfileArg> for TargetTlsProfile {
     }
 }
 
+#[derive(Debug, clap::Args)]
+struct ServeArgs {
+    #[arg(long)]
+    session_file: PathBuf,
+    #[arg(long, default_value = "127.0.0.1:1080")]
+    socks_bind: std::net::SocketAddr,
+    #[arg(long, default_value = "127.0.0.1:1081")]
+    http_bind: std::net::SocketAddr,
+    #[arg(long)]
+    no_http: bool,
+    /// Optional local UDP/TCP DNS listener with domain-aware Fake IP.
+    #[arg(long)]
+    dns_bind: Option<std::net::SocketAddr>,
+    /// Override advertised DNS servers, as comma-separated IPv4:port values.
+    #[arg(long, value_delimiter = ',')]
+    remote_dns: Vec<std::net::SocketAddrV4>,
+    /// Relax TLS verification for data nodes independently of gateway TLS.
+    #[arg(long)]
+    insecure_node_tls: bool,
+    #[arg(long)]
+    bind_interface: Option<String>,
+    #[arg(long)]
+    bind_address: Option<std::net::IpAddr>,
+    /// Require HERMES_PROXY_USERNAME and HERMES_PROXY_PASSWORD for both proxies.
+    #[arg(long)]
+    proxy_auth: bool,
+    /// Watch for a newly authenticated session file; this does not renew SID TTL.
+    #[arg(long, default_value_t = 5)]
+    session_poll_seconds: u64,
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Serve local proxies from an authenticated session; reload changed credentials.
+    Serve(ServeArgs),
     /// Fetch authentication methods without logging in.
     AuthConfig {
         #[arg(long)]
@@ -710,11 +743,22 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     };
     let http_timeout = Duration::from_secs(cli.http_timeout_seconds.max(1));
     let max_response_body = cli.max_response_body.max(1);
-    let transport = Arc::new(ReqwestTransport::new(&ReqwestTransportConfig {
+    let underlay_options = match &cli.command {
+        Command::Serve(args) => hermes_transport::UnderlayOptions {
+            local_address: args.bind_address,
+            interface: args.bind_interface.clone(),
+        },
+        _ => hermes_transport::UnderlayOptions::default(),
+    };
+    let transport_config = ReqwestTransportConfig {
         tls_policy,
         timeout: http_timeout,
         max_response_body,
-    })?);
+    };
+    let transport = Arc::new(ReqwestTransport::new_with_underlay(
+        &transport_config,
+        &underlay_options,
+    )?);
     info!(
         event = "probe.transport_ready",
         timeout_ms = http_timeout.as_millis(),
@@ -723,6 +767,39 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let client = Arc::new(AuthClient::new(endpoint.clone(), transport.clone()));
 
     match cli.command {
+        Command::Serve(args) => {
+            let initial_session_file = session_fingerprint(&args.session_file).ok();
+            let session =
+                restore_session(&client, transport.as_ref(), &endpoint, &args.session_file).await?;
+            let node_tls = if args.insecure_node_tls {
+                TlsPolicy::DangerousAcceptInvalidCertificates
+            } else {
+                TlsPolicy::Verify
+            };
+            let runtime = atrust_client::AtrustClient::start(
+                client.clone(),
+                session.configuration,
+                session.material,
+                atrust_client::AtrustClientConfig::new(endpoint.clone(), node_tls).with_underlay(
+                    Arc::new(hermes_transport::SystemUnderlay::new(
+                        underlay_options.clone(),
+                    )),
+                ),
+            )
+            .await?;
+            let result = serve_proxies(
+                runtime.clone(),
+                &endpoint,
+                &args,
+                &transport_config,
+                &underlay_options,
+                initial_session_file,
+            )
+            .await;
+            runtime.shutdown().await;
+            result?;
+        }
+
         Command::AuthConfig {
             modified,
             need_ticket,
@@ -2243,6 +2320,137 @@ struct HttpProbeStats {
     looks_like_http: bool,
     status_code: Option<u16>,
     clean_eof: bool,
+}
+
+fn session_fingerprint(path: &Path) -> std::io::Result<(SystemTime, u64)> {
+    let metadata = std::fs::metadata(path)?;
+    Ok((metadata.modified()?, metadata.len()))
+}
+
+async fn proxy_shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! { result = tokio::signal::ctrl_c() => result, _ = terminate.recv() => Ok(()) }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
+}
+
+async fn serve_proxies(
+    runtime: Arc<atrust_client::AtrustClient>,
+    endpoint: &GatewayEndpoint,
+    args: &ServeArgs,
+    transport_config: &ReqwestTransportConfig,
+    underlay: &hermes_transport::UnderlayOptions,
+    mut seen: Option<(SystemTime, u64)>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stack = Arc::new(atrust_net::AtrustStack::new(runtime.clone()));
+    let dialer = Arc::new(atrust_net::ProxyDialer::new(
+        runtime.clone(),
+        stack,
+        atrust_net::ResolverConfig {
+            servers: args.remote_dns.clone(),
+            ..atrust_net::ResolverConfig::default()
+        },
+    ));
+    let credentials = if args.proxy_auth {
+        Some(hermes_proxy::Credentials {
+            username: env::var("HERMES_PROXY_USERNAME")
+                .map_err(|_| "HERMES_PROXY_USERNAME is required with --proxy-auth")?,
+            password: env::var("HERMES_PROXY_PASSWORD")
+                .map_err(|_| "HERMES_PROXY_PASSWORD is required with --proxy-auth")?,
+        })
+    } else {
+        None
+    };
+    let proxy_config = hermes_proxy::ProxyConfig {
+        credentials,
+        ..hermes_proxy::ProxyConfig::default()
+    };
+    let socks = hermes_proxy::ProxyServer::bind(
+        args.socks_bind,
+        hermes_proxy::Protocol::Socks5,
+        dialer.clone(),
+        proxy_config.clone(),
+    )
+    .await?;
+    eprintln!("SOCKS5 listening on {}", socks.local_addr());
+    let http = if args.no_http {
+        None
+    } else {
+        let server = hermes_proxy::ProxyServer::bind(
+            args.http_bind,
+            hermes_proxy::Protocol::Http,
+            dialer.clone(),
+            proxy_config,
+        )
+        .await?;
+        eprintln!("HTTP proxy listening on {}", server.local_addr());
+        Some(server)
+    };
+    let dns = if let Some(address) = args.dns_bind {
+        let server = hermes_proxy::DnsServer::bind(
+            address,
+            Arc::new(hermes_proxy::PolicyDns {
+                dialer,
+                max_ttl: Duration::from_secs(60),
+            }),
+        )
+        .await?;
+        eprintln!("DNS listening on {} (UDP/TCP)", server.local_addr());
+        Some(server)
+    } else {
+        None
+    };
+    let mut poll = tokio::time::interval(Duration::from_secs(args.session_poll_seconds.max(1)));
+    poll.tick().await;
+    let mut events = runtime.events();
+    let stop = proxy_shutdown_signal();
+    tokio::pin!(stop);
+    loop {
+        tokio::select! {
+            result = &mut stop => { result?; break; },
+            event = events.recv() => {
+                if let Some(atrust_client::EventDelivery::Event(event)) = event
+                    && matches!(*event,atrust_client::HermesEvent::SessionInvalidated { .. }) {
+                    warn!(event = "proxy.authentication_required", note = "complete login and replace the session file to resume");
+                }
+            }
+            _ = poll.tick() => {
+                let current = session_fingerprint(&args.session_file).ok();
+                if current == seen || current.is_none() { continue; }
+                seen = current;
+                // Each attempt gets an independent cookie jar. Rejected input
+                // cannot mutate the active control-plane session.
+                let replacement = tokio::select! {
+                    result = &mut stop => { result?; break; },
+                    result = async {
+                    let transport = Arc::new(ReqwestTransport::new_with_underlay(transport_config,underlay)?);
+                    let auth = Arc::new(AuthClient::new(endpoint.clone(),transport.clone()));
+                    let session = restore_session(&auth,&transport,endpoint,&args.session_file).await?;
+                    runtime.replace_session(auth,session.configuration,session.material).await?;
+                    Ok::<(),Box<dyn std::error::Error>>(())
+                    } => result,
+                };
+                match replacement {
+                    Ok(()) => info!(event = "proxy.session_reloaded"),
+                    Err(error) => warn!(event = "proxy.session_reload_rejected", %error),
+                }
+            }
+        }
+    }
+    socks.shutdown().await?;
+    if let Some(http) = http {
+        http.shutdown().await?;
+    }
+    if let Some(dns) = dns {
+        dns.shutdown().await?;
+    }
+    Ok(())
 }
 
 async fn probe_https_stream<S>(

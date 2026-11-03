@@ -61,13 +61,13 @@ pub(super) async fn serve(
         {
             return Err(invalid("invalid HTTP header"));
         }
-        if name.eq_ignore_ascii_case("proxy-authorization") {
-            if authorization.replace(value.trim()).is_some() {
-                return Err(invalid("duplicate proxy authorization"));
-            }
+        if name.eq_ignore_ascii_case("proxy-authorization")
+            && authorization.replace(value.trim()).is_some()
+        {
+            return Err(invalid("duplicate proxy authorization"));
         }
-        if name.eq_ignore_ascii_case("content-length") {
-            if length
+        if name.eq_ignore_ascii_case("content-length")
+            && length
                 .replace(
                     value
                         .trim()
@@ -75,9 +75,8 @@ pub(super) async fn serve(
                         .map_err(|_| invalid("invalid content length"))?,
                 )
                 .is_some()
-            {
-                return Err(invalid("duplicate content length"));
-            }
+        {
+            return Err(invalid("duplicate content length"));
         }
         if name.eq_ignore_ascii_case("transfer-encoding") {
             chunked = true;
