@@ -1316,6 +1316,12 @@ async fn v2_foreign_version_fails_closed_without_packets() {
 }
 
 async fn stalled_write_session() -> (Arc<L3Session>, DuplexStream) {
+    stalled_write_session_with_heartbeat(IDLE_HEARTBEAT).await
+}
+
+async fn stalled_write_session_with_heartbeat(
+    heartbeat: Duration,
+) -> (Arc<L3Session>, DuplexStream) {
     let (client, mut peer) = tokio::io::duplex(128);
     let handshake = tokio::spawn(async move {
         read_get_ip(&mut peer).await;
@@ -1324,7 +1330,7 @@ async fn stalled_write_session() -> (Arc<L3Session>, DuplexStream) {
             .unwrap();
         peer
     });
-    let session = L3Session::start(client, &sid(), IDLE_HEARTBEAT, GET_IP_TIMEOUT, None, None)
+    let session = L3Session::start(client, &sid(), heartbeat, GET_IP_TIMEOUT, None, None)
         .await
         .unwrap();
     (Arc::new(session), handshake.await.unwrap())
@@ -1457,4 +1463,26 @@ async fn flow_receivers_demultiplex_replies_and_close_with_the_session() {
     let mut replies = session.subscribe_flow(&flow).unwrap();
     session.close().await;
     assert!(replies.recv().await.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn queued_but_unwritten_probes_do_not_count_as_missed_acknowledgements() {
+    let (session, _peer) = stalled_write_session_with_heartbeat(Duration::from_secs(1)).await;
+    let sending = session.clone();
+    let send = tokio::spawn(async move {
+        sending
+            .send_packet(&"t".repeat(32), &tcp_packet(40000, 443, &[0; 4000]))
+            .await
+    });
+    tokio::task::yield_now().await;
+    for _ in 0..5 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+    }
+    assert_eq!(session.heartbeat_stats().requests_sent, 0);
+    assert!(!session.is_closed(), "probes have not reached the peer yet");
+    session.close().await;
+    assert!(matches!(send.await.unwrap(), Err(L3SessionError::Closed)));
 }

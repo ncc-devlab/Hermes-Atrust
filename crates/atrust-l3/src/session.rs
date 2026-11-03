@@ -245,6 +245,7 @@ struct SessionShared {
     heartbeat_acks_received: AtomicU64,
     last_heartbeat_ack: Mutex<Option<(SystemTime, Instant)>>,
     last_heartbeat_ack_monotonic: Mutex<Option<tokio::time::Instant>>,
+    first_heartbeat_written: Mutex<Option<tokio::time::Instant>>,
     /// Broadcast stop signal. Every task selects on it, so closing a session
     /// does not have to wait for a task's own timer to fire.
     stop_tx: watch::Sender<bool>,
@@ -295,6 +296,7 @@ impl SessionShared {
             heartbeat_acks_received: AtomicU64::new(0),
             last_heartbeat_ack: Mutex::new(None),
             last_heartbeat_ack_monotonic: Mutex::new(None),
+            first_heartbeat_written: Mutex::new(None),
             stop_tx: watch::channel(false).0,
             events,
             seen_length_prefixed: AtomicBool::new(false),
@@ -701,6 +703,8 @@ impl L3Session {
                             let _ = written.send(Ok(()));
                         }
                         if frame.heartbeat {
+                            writer_shared.first_heartbeat_written.lock().expect("heartbeat clock mutex")
+                                .get_or_insert_with(tokio::time::Instant::now);
                             writer_shared
                                 .heartbeat_requests_sent
                                 .fetch_add(1, Ordering::Relaxed);
@@ -738,7 +742,6 @@ impl L3Session {
             // The first tick fires immediately; skip it so establishing a
             // session does not put a heartbeat ahead of the caller's first auth.
             ticker.tick().await;
-            let mut first_probe_at = None;
             loop {
                 tokio::select! {
                     biased;
@@ -747,7 +750,10 @@ impl L3Session {
                         let now = tokio::time::Instant::now();
                         let last_ack = *heartbeat_shared.last_heartbeat_ack_monotonic
                             .lock().expect("heartbeat clock mutex");
-                        if first_probe_at.is_some_and(|first| {
+                        let first_probe_at = *heartbeat_shared.first_heartbeat_written.lock().expect("heartbeat clock mutex");
+                        let unanswered = heartbeat_shared.heartbeat_requests_sent.load(Ordering::Relaxed)
+                            .saturating_sub(heartbeat_shared.heartbeat_acks_received.load(Ordering::Relaxed));
+                        if unanswered >= L3_HEARTBEAT_MISS_LIMIT && first_probe_at.is_some_and(|first| {
                             now.saturating_duration_since(last_ack.unwrap_or(first))
                                 >= heartbeat_interval.saturating_mul(L3_HEARTBEAT_MISS_LIMIT as u32)
                         }) {
@@ -755,7 +761,6 @@ impl L3Session {
                                 "L3 peer did not acknowledge heartbeat probes");
                             break;
                         }
-                        first_probe_at.get_or_insert(now);
                         if heartbeat_tx.send(OutboundFrame {
                             bytes: encode_l3_heartbeat_req().to_vec(),
                             written: None,
