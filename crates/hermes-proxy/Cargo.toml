@@ -1,0 +1,16 @@
+[package]
+name = "hermes-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+atrust-net = { path = "../atrust-net" }
+base64.workspace = true
+tokio = { workspace = true, features = ["io-util", "sync"] }
+url.workspace = true
+
+[lints]
+workspace = true

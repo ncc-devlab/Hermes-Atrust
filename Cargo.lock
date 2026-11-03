@@ -621,6 +621,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hermes-proxy"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "atrust-net",
+ "base64",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "hermes-transport"
 version = "0.1.0"
 dependencies = [

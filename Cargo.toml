@@ -4,6 +4,7 @@ members = [
     "crates/atrust-auth",
     "crates/atrust-client",
     "crates/atrust-net",
+    "crates/hermes-proxy",
     "crates/atrust-browser",
     "crates/atrust-l3",
     "crates/atrust-protocol",

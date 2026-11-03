@@ -93,6 +93,46 @@ fn name(bytes: &[u8], offset: &mut usize) -> io::Result<String> {
     Err(bad())
 }
 
+pub(crate) fn question(request: &[u8]) -> io::Result<(String, u16, usize)> {
+    if request.len() < 12
+        || request.len() > 4096
+        || word(request, 2)? & 0xf800 != 0
+        || word(request, 4)? != 1
+        || word(request, 6)? != 0
+        || word(request, 8)? != 0
+    {
+        return Err(bad());
+    }
+    let mut end = 12;
+    let host = normalize(&name(request, &mut end)?)?;
+    let kind = word(request, end)?;
+    if word(request, end + 2)? != 1 {
+        return Err(bad());
+    }
+    Ok((host, kind, end + 4))
+}
+
+pub(crate) fn reply(
+    request: &[u8],
+    question_end: usize,
+    ip: Option<Ipv4Addr>,
+    ttl: Duration,
+    rcode: u8,
+) -> Vec<u8> {
+    let mut reply = request[..question_end].to_vec();
+    reply[2] = 0x80 | (request[2] & 1);
+    reply[3] = 0x80 | rcode;
+    reply[6..12].fill(0);
+    reply[7] = u8::from(ip.is_some());
+    if let Some(ip) = ip {
+        reply.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1]);
+        reply.extend_from_slice(&(ttl.as_secs().min(u32::MAX as u64) as u32).to_be_bytes());
+        reply.extend_from_slice(&[0, 4]);
+        reply.extend_from_slice(&ip.octets());
+    }
+    reply
+}
+
 pub(crate) fn parse(bytes: &[u8], host: &str, id: u16) -> io::Result<Answer> {
     if bytes.len() < 12
         || word(bytes, 0)? != id

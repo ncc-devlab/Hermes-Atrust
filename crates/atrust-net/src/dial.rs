@@ -26,6 +26,18 @@ pub struct ProxyDialer {
     pool: Mutex<FakeIpPool>,
 }
 impl ProxyDialer {
+    /// IPv4 DNS service, including policy-aware Fake IP. Other query types
+    /// return NODATA. Malformed queries never cause an upstream request.
+    pub async fn answer_dns(&self, request: &[u8], max_ttl: Duration) -> io::Result<Vec<u8>> {
+        let (host, kind, end) = dns_wire::question(request)?;
+        if kind != 1 {
+            return Ok(dns_wire::reply(request, end, None, Duration::ZERO, 0));
+        }
+        match self.dns_record(&host, max_ttl).await {
+            Ok((ip, ttl)) => Ok(dns_wire::reply(request, end, Some(ip), ttl, 0)),
+            Err(_) => Ok(dns_wire::reply(request, end, None, Duration::ZERO, 2)),
+        }
+    }
     pub fn new(
         client: Arc<AtrustClient>,
         stack: Arc<dyn NetworkStack>,
