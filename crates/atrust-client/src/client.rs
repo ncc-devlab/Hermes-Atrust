@@ -476,6 +476,9 @@ impl AtrustClient {
                         protocol: "tcp",
                     })?;
                 let target = tunnel_target(host, port, &route.app_id);
+                if route.tcp_prefers_l3 {
+                    return Err(ClientError::L3StackRequired);
+                }
 
                 let endpoints = active
                     .nodes
@@ -749,6 +752,8 @@ fn tunnel_target(host: &str, port: u16, app_id: &str) -> TunnelTarget {
 
 #[derive(Debug, Error)]
 pub enum ClientError {
+    #[error("resource requires TCP over L3; use a packet network stack")]
+    L3StackRequired,
     #[error("client session has been closed or replaced")]
     Closed,
     #[error("replacement session belongs to a different gateway")]
@@ -1233,6 +1238,24 @@ mod tests {
         let updated = client.refresh_resources().await.unwrap();
         active.nodes.endpoints(&updated, "group-1").await;
         assert_eq!(underlay.0.load(Ordering::Relaxed), 5);
+        client.shutdown().await;
+    }
+    #[tokio::test]
+    async fn tcp_tunnel_refuses_resources_that_require_l3() {
+        let mut resource = resource_response();
+        resource.body = String::from_utf8(resource.body)
+            .unwrap()
+            .replace(
+                "\"id\":\"app-1\"",
+                "\"enableTCPPrefL3\":true,\"id\":\"app-1\"",
+            )
+            .into_bytes();
+        let client = client_with(vec![resource]).await;
+        assert!(matches!(
+            client.dial_tcp("10.9.0.7", 80).await,
+            Err(ClientError::L3StackRequired)
+        ));
+        assert!(client.node_health().await.is_empty());
         client.shutdown().await;
     }
 }

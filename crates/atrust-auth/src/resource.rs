@@ -247,6 +247,8 @@ pub struct IpResource {
     pub protocol: ResourceProtocol,
     pub app_id: String,
     pub node_group_id: String,
+    pub tcp_prefers_l3: bool,
+    pub addr_pretend: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -257,6 +259,8 @@ pub struct DomainResource {
     pub protocol: ResourceProtocol,
     pub app_id: String,
     pub node_group_id: String,
+    pub tcp_prefers_l3: bool,
+    pub addr_pretend: bool,
     pub resolved_ips: Vec<Ipv4Addr>,
 }
 
@@ -346,6 +350,10 @@ struct AppInfoGroup {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AppItem {
+    #[serde(default, rename = "enableTCPPrefL3", alias = "EnableTCPPrefL3")]
+    tcp_prefers_l3: bool,
+    #[serde(default, alias = "AddrPretend")]
+    addr_pretend: Option<Value>,
     #[serde(default, alias = "ID", alias = "Id")]
     id: String,
     #[serde(default, alias = "NodeGroupID", alias = "NodeGroupId")]
@@ -522,6 +530,12 @@ impl ClientResources {
                             protocol,
                             app_id: app.id.clone(),
                             node_group_id: app.node_group_id.clone(),
+                            tcp_prefers_l3: app.tcp_prefers_l3,
+                            addr_pretend: app
+                                .addr_pretend
+                                .as_ref()
+                                .and_then(Value::as_bool)
+                                .unwrap_or(true),
                         }),
                         HostKind::Cidr { min, max } => ip_resources.push(IpResource {
                             ip_min: min,
@@ -531,6 +545,12 @@ impl ClientResources {
                             protocol,
                             app_id: app.id.clone(),
                             node_group_id: app.node_group_id.clone(),
+                            tcp_prefers_l3: app.tcp_prefers_l3,
+                            addr_pretend: app
+                                .addr_pretend
+                                .as_ref()
+                                .and_then(Value::as_bool)
+                                .unwrap_or(true),
                         }),
                         HostKind::Range { min, max } => ip_resources.push(IpResource {
                             ip_min: min,
@@ -540,6 +560,12 @@ impl ClientResources {
                             protocol,
                             app_id: app.id.clone(),
                             node_group_id: app.node_group_id.clone(),
+                            tcp_prefers_l3: app.tcp_prefers_l3,
+                            addr_pretend: app
+                                .addr_pretend
+                                .as_ref()
+                                .and_then(Value::as_bool)
+                                .unwrap_or(true),
                         }),
                         HostKind::Domain => {
                             let mut resolved_ips = Vec::new();
@@ -555,6 +581,12 @@ impl ClientResources {
                                 protocol,
                                 app_id: app.id.clone(),
                                 node_group_id: app.node_group_id.clone(),
+                                tcp_prefers_l3: app.tcp_prefers_l3,
+                                addr_pretend: app
+                                    .addr_pretend
+                                    .as_ref()
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(true),
                                 resolved_ips,
                             });
                         }
@@ -965,5 +997,20 @@ mod tests {
         let (host, port) = split_host_port("[2001:db8::2]", DEFAULT_NODE_PORT).unwrap();
         assert_eq!(host, "2001:db8::2");
         assert_eq!(port, DEFAULT_NODE_PORT);
+    }
+    #[test]
+    fn preserves_transport_and_address_policy_flags() {
+        let resources = ClientResources::from_json_bytes(br#"{"code":0,"data":{"appList":{"data":{"appInfo":[{"apps":[{"id":"a","nodeGroupId":"g","enableTCPPrefL3":true,"addrPretend":false,"addressList":[{"protocol":"tcp","port":"443","host":"10.0.0.1"},{"protocol":"tcp","port":"443","host":"portal.test"}]}]}]}}}}"#).unwrap();
+        assert!(resources.ip_resources[0].tcp_prefers_l3);
+        assert!(!resources.ip_resources[0].addr_pretend);
+        assert!(resources.domain_resources[0].tcp_prefers_l3);
+        assert!(!resources.domain_resources[0].addr_pretend);
+        let decision = resources
+            .routing_index()
+            .match_destination("portal.test", 443, crate::FlowProtocol::Tcp)
+            .unwrap()
+            .to_matched_resource();
+        assert!(decision.tcp_prefers_l3);
+        assert!(!decision.addr_pretend);
     }
 }

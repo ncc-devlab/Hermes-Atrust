@@ -138,6 +138,8 @@ pub enum Destination<'a> {
 pub struct MatchedResource {
     pub app_id: String,
     pub node_group_id: String,
+    pub tcp_prefers_l3: bool,
+    pub addr_pretend: bool,
 }
 
 impl Destination<'_> {
@@ -181,6 +183,14 @@ impl Destination<'_> {
         MatchedResource {
             app_id: self.app_id().to_owned(),
             node_group_id: self.node_group_id().to_owned(),
+            tcp_prefers_l3: match self {
+                Self::Ip(r) => r.tcp_prefers_l3,
+                Self::Domain(r) => r.tcp_prefers_l3,
+            },
+            addr_pretend: match self {
+                Self::Ip(r) => r.addr_pretend,
+                Self::Domain(r) => r.addr_pretend,
+            },
         }
     }
 }
@@ -485,6 +495,8 @@ mod tests {
             protocol,
             app_id: app_id.to_owned(),
             node_group_id: format!("ng-{app_id}"),
+            tcp_prefers_l3: false,
+            addr_pretend: true,
         }
     }
 
@@ -501,6 +513,8 @@ mod tests {
             protocol,
             app_id: app_id.to_owned(),
             node_group_id: format!("ng-{app_id}"),
+            tcp_prefers_l3: false,
+            addr_pretend: true,
             resolved_ips: Vec::new(),
         }
     }
@@ -944,6 +958,8 @@ mod tests {
             MatchedResource {
                 app_id: "byip".to_owned(),
                 node_group_id: "ng-byip".to_owned(),
+                tcp_prefers_l3: false,
+                addr_pretend: true,
             }
         );
 
@@ -1143,6 +1159,8 @@ mod tests {
             protocol: ResourceProtocol::Icmp,
             app_id: "app-icmp".to_owned(),
             node_group_id: "ng".to_owned(),
+            tcp_prefers_l3: false,
+            addr_pretend: true,
         };
         let target = Ipv4Addr::new(10, 0, 0, 1);
         assert!(ip_resource_matches(&resource, FlowKey::icmp(target)));
